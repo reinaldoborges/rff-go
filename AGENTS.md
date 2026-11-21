@@ -9,14 +9,15 @@ then follow the design revisions and acceptance criteria pinned by the home issu
 Link implementation PRs to the home issue and relevant decisions. Raise missing
 or conflicting design decisions in the home issue before affected work proceeds.
 
-Run the applicable issue-specific checks and the repository baseline:
+Run the applicable issue-specific checks and the repository baseline from the
+repository root:
 
 ```sh
-test -z "$(gofmt -l .)"
-go vet ./...
-go test ./...
-go test -race ./...
+./scripts/check.sh
 ```
+
+The script checks Go formatting, runs `go vet ./...`, `go test ./...`, and
+`go test -race ./...`.
 
 Report checks that cannot run. Documentation-only changes need applicable
 documentation checks rather than unrelated Go checks.
