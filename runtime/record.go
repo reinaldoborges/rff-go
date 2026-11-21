@@ -121,7 +121,8 @@ type AcceptanceDecisionFunc[EntityID comparable, StateID comparable] func(Accept
 // reservation must commit atomically before success is returned. A nil
 // decision is valid only when Existing is present. A new execution is valid
 // only without an existing mapping or active reservation, with matching
-// entity and key and a unique nonempty execution ID. Invalid decisions return
+// entity and key, a unique nonempty execution ID, the current schema version,
+// and Waiting status. Invalid decisions return
 // ErrInvalidDecision. A callback error must leave no writes. A storage error
 // after commit may have an unknown outcome; a retry must reconcile against the
 // original key. Records and byte slices must not alias stored data.

@@ -1,6 +1,7 @@
 # Implementation guidance
 
-Use Go 1.27.3. Race detection also requires a supported C compiler.
+Use Go 1.27.3 with CGO enabled and a supported C compiler for the SQLite adapter
+and race detection.
 
 For implementation work, read the home repository's
 [architecture baseline](https://github.com/reinaldoborges/rff-home/blob/main/docs/architecture.md)

@@ -1,0 +1,67 @@
+package sqlite_test
+
+import (
+	"bytes"
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/reinaldoborges/rff-go/adapters/sqlite"
+)
+
+func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{"future adapter version", `UPDATE rff_schema_version SET version = 99`},
+		{"incomplete tables", `DROP TABLE rff_active`},
+		{"missing unique constraint", `DROP TABLE rff_executions; CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL)`},
+		{"unreadable record", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', X'ff')`},
+		{"future record version", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":99,"ID":"id","Key":"key"}')`},
+		{"dangling reservation", `INSERT INTO rff_active (entity, execution_id) VALUES (X'65', 'missing')`},
+		{"missing reservation", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":1,"ID":"id","Entity":"ZQ==","Key":"key","Status":"Waiting"}')`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema.db")
+			store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tt.sql); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+			if !errors.Is(err, sqlite.ErrUnsupportedSchema) {
+				if err == nil {
+					store.Close()
+				}
+				t.Fatalf("expected unsupported schema, got %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("opening an unsupported store changed its database")
+			}
+		})
+	}
+}
