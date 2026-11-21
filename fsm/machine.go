@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"reflect"
 	"slices"
 	"time"
+
+	"github.com/reinaldoborges/rff-go/internal/nilcheck"
 )
 
 // ErrInvalidMachine indicates that a machine configuration is incomplete.
@@ -121,15 +122,8 @@ func NewMachine[EntityID comparable, StateID comparable, Event, Input any](confi
 		return nil, fmt.Errorf("%w: both selectors are required", ErrInvalidMachine)
 	}
 	for _, handler := range config.Handlers {
-		if handler == nil {
+		if nilcheck.IsNil(handler) {
 			return nil, fmt.Errorf("%w: state handler is nil", ErrInvalidMachine)
-		}
-		value := reflect.ValueOf(handler)
-		switch value.Kind() {
-		case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
-			if value.IsNil() {
-				return nil, fmt.Errorf("%w: state handler is nil", ErrInvalidMachine)
-			}
 		}
 	}
 	for _, initial := range config.InitialStates {
