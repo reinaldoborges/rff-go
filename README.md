@@ -43,9 +43,10 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. No schema migration is provided yet.
-It currently implements acceptance only, not worker execution, domain commits,
-or notifications.
+without writes for unsupported schemas. It migrates version 1 acceptance stores
+to version 2 transactionally, preserving accepted records and reservations.
+It currently implements acceptance and transition leases only, not worker
+execution, domain commits, or notifications.
 
 ```sh
 go test ./adapters/sqlite

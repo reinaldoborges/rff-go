@@ -7,15 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
 const (
-	adapterSchemaVersion = 1
+	adapterSchemaVersion = 2
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
+	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -29,25 +31,27 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists bool
+	var schemaExists, recordsExist, activeExists, leasesExist bool
 	for name, exists := range map[string]*bool{
-		"rff_schema_version": &schemaExists,
-		"rff_executions":     &recordsExist,
-		"rff_active":         &activeExists,
+		"rff_schema_version":    &schemaExists,
+		"rff_executions":        &recordsExist,
+		"rff_active":            &activeExists,
+		"rff_transition_leases": &leasesExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists {
+		if recordsExist || activeExists || leasesExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (1)`,
+			`INSERT INTO rff_schema_version (version) VALUES (2)`,
 			executionsDDL,
 			activeDDL,
+			leasesDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -76,13 +80,15 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			return fmt.Errorf("%w: read adapter version: %w", ErrUnsupportedSchema, err)
 		}
 		count := 0
+		var schemaVersion int
 		for rows.Next() {
 			var version int
 			if err := rows.Scan(&version); err != nil {
 				return fmt.Errorf("%w: read adapter version: %w", ErrUnsupportedSchema, errors.Join(err, rows.Close()))
 			}
 			count++
-			if version != adapterSchemaVersion {
+			schemaVersion = version
+			if version != 1 && version != adapterSchemaVersion {
 				return errors.Join(fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, version), rows.Close())
 			}
 		}
@@ -95,9 +101,63 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		if err := validateRecords(ctx, tx); err != nil {
 			return err
 		}
+		if schemaVersion == 1 {
+			if leasesExist {
+				return fmt.Errorf("%w: unexpected transition leases", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, leasesDDL); err != nil {
+				return fmt.Errorf("migrate transition leases: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 2`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		} else {
+			var definition string
+			if !leasesExist {
+				return fmt.Errorf("%w: transition leases table missing", ErrUnsupportedSchema)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_transition_leases'`).Scan(&definition); err != nil {
+				return fmt.Errorf("%w: inspect transition leases: %w", ErrUnsupportedSchema, err)
+			}
+			if definition != leasesDDL {
+				return fmt.Errorf("%w: incompatible transition leases table", ErrUnsupportedSchema)
+			}
+			if err := validateLeases(ctx, tx); err != nil {
+				return err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema initialization: %w", err)
+	}
+	return nil
+}
+
+func validateLeases(ctx context.Context, tx *sql.Tx) (err error) {
+	rows, err := tx.QueryContext(ctx, `SELECT l.entity, l.execution_id, l.owner, l.generation, l.expires_at, e.entity
+		FROM rff_transition_leases AS l LEFT JOIN rff_executions AS e ON e.id = l.execution_id`)
+	if err != nil {
+		return fmt.Errorf("%w: read transition leases: %w", ErrUnsupportedSchema, err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close lease query: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var entity, executionEntity []byte
+		var executionID, owner, expiry string
+		var generation int64
+		if err := rows.Scan(&entity, &executionID, &owner, &generation, &expiry, &executionEntity); err != nil {
+			return fmt.Errorf("%w: read transition lease: %w", ErrUnsupportedSchema, err)
+		}
+		_, parseErr := time.Parse(time.RFC3339Nano, expiry)
+		if executionID == "" || owner == "" || generation <= 0 || parseErr != nil || executionEntity == nil || !bytes.Equal(entity, executionEntity) {
+			return fmt.Errorf("%w: invalid transition lease", ErrUnsupportedSchema)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: read transition leases: %w", ErrUnsupportedSchema, err)
 	}
 	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"slices"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/reinaldoborges/rff-go/internal/nilcheck"
@@ -66,20 +65,9 @@ func (s *Store[EntityID, StateID]) Accept(
 	if key == "" || decide == nil {
 		return result, false, transition.ErrInvalidDecision
 	}
-	encodedEntity, err := s.entityCodec.Encode(entity)
+	encodedEntity, err := s.encodeEntity(entity)
 	if err != nil {
-		return result, false, fmt.Errorf("encode entity: %w", err)
-	}
-	encodedEntity = slices.Clone(encodedEntity)
-	if encodedEntity == nil {
-		encodedEntity = []byte{}
-	}
-	decodedEntity, err := s.entityCodec.Decode(slices.Clone(encodedEntity))
-	if err != nil {
-		return result, false, fmt.Errorf("decode entity: %w", err)
-	}
-	if decodedEntity != entity {
-		return result, false, errors.New("entity codec does not round-trip")
+		return result, false, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
