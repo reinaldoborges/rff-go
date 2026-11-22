@@ -162,6 +162,9 @@ func (i *InputIngress[Value]) process(ctx context.Context, record InputRecord) (
 	}
 	codec, err := resolveCodec(i.resolve, record.Value.Codec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return InputOutcome{}, ctx.Err()
+		}
 		return InputOutcome{}, err
 	}
 	value, err := codec.Decode(ctx, slices.Clone(record.Value.Data))
