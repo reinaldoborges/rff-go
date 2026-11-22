@@ -37,6 +37,9 @@ func (c *timerClock) advance(d time.Duration) {
 // RunTimerCompatibility checks isolation and restoration through timer ports.
 func RunTimerCompatibility(t *testing.T, newStore func(*testing.T) TimerStore) {
 	t.Helper()
+	t.Run("timer delivery", func(t *testing.T) {
+		RunTimerDelivery(t, newStore)
+	})
 	store := newStore(t)
 	ctx := context.Background()
 	available := true
