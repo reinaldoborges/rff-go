@@ -148,4 +148,51 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 			t.Fatalf("changed transfer replay did not conflict: %v", err)
 		}
 	})
+	t.Run("invalid recipients preserve ownership", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		activeMember(t, fixture, now)
+		if err := fixture.SeedUsers(ctx, "invitee"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.CreateGroup(ctx, "outsider", "other-group", "outsider-membership"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "invited-membership", "invite-new", now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for _, test := range []struct {
+			recipient, key string
+		}{{"invitee", "invited"}, {"outsider", "cross-group"}, {"owner", "self"}} {
+			receipt, err := fixture.TransferOwnership(ctx, "owner", "group", test.recipient, test.key)
+			if !errors.Is(err, taskmanager.ErrConflict) || receipt != (taskmanager.OwnershipTransfer{}) {
+				t.Fatalf("invalid recipient %q produced a transfer: %+v, %v", test.recipient, receipt, err)
+			}
+		}
+		if _, err := fixture.RemoveMember(ctx, "owner", "member-membership", "remove"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if receipt, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "removed"); !errors.Is(err, taskmanager.ErrConflict) ||
+			receipt != (taskmanager.OwnershipTransfer{}) {
+			t.Fatalf("removed recipient produced a transfer: %+v, %v", receipt, err)
+		}
+		group, err := fixture.Group(ctx, "owner", "group")
+		if err != nil || group.Owner != "owner" {
+			t.Fatalf("invalid transfers changed ownership: %+v, %v", group, err)
+		}
+		if err := fixture.CloseGroup(ctx, "owner", "group"); err != nil {
+			t.Fatal(err)
+		}
+		if receipt, err := fixture.TransferOwnership(ctx, "owner", "group", "invitee", "closed"); !errors.Is(err, taskmanager.ErrDenied) ||
+			receipt != (taskmanager.OwnershipTransfer{}) {
+			t.Fatalf("closed group produced a transfer: %+v, %v", receipt, err)
+		}
+	})
 }
