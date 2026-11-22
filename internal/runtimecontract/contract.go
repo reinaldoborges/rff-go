@@ -38,6 +38,9 @@ func (h handler) Enter(_ context.Context, input fsm.ExecutionContext[string, str
 	if input.Input() != "payload" {
 		return errors.New("wrong rehydrated input")
 	}
+	if _, ok := input.Previous(); ok {
+		return errors.New("initial entry received a previous state")
+	}
 	*h.calls++
 	return nil
 }
