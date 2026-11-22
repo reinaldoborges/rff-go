@@ -28,6 +28,10 @@ The hook runner rehydrates pinned machine and codec versions and invokes state
 hooks without rerunning selection. It does not schedule work, fence attempts, or
 persist hook outcomes.
 
+`HookWorker` claims hook activities through a host-injected activity store,
+renews their leases while working and reporting, and supports draining. The
+SQLite adapter does not implement that activity store yet.
+
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
 in-memory test fake exercises that contract without claiming durability:
