@@ -179,6 +179,7 @@ Run the CLI and fixture checks, including a real subprocess recovery test, with:
 ```sh
 go test ./cmd/taskmanager ./internal/taskmanager
 go test ./internal/taskmanager -run TestFixtureRecoversExpiryAndNotificationAcrossProcessRestart
+go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLoss
 ./scripts/check.sh
 ```
 
