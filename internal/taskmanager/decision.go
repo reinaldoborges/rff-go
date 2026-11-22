@@ -22,7 +22,7 @@ const (
 
 type decisionAcceptanceStore struct {
 	fixture *Fixture
-	input   membershipInput
+	input   fixtureInput
 }
 
 func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
@@ -70,11 +70,11 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 		})
 }
 
-func (f *Fixture) decisionIngress() (*transition.InputIngress[membershipInput], error) {
-	return transition.NewInputIngress[membershipInput](f.store, "taskmanager-decisions", resolveMembershipInput, f.acceptDecision)
+func (f *Fixture) decisionIngress() (*transition.InputIngress[fixtureInput], error) {
+	return transition.NewInputIngress[fixtureInput](f.store, "taskmanager-decisions", resolveMembershipInput, f.acceptDecision)
 }
 
-func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputDelivery[membershipInput]) (transition.InputOutcome, error) {
+func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputDelivery[fixtureInput]) (transition.InputOutcome, error) {
 	input := delivery.Value
 	if delivery.WorkflowID != input.MembershipID || (delivery.Kind != transition.HumanDecision && delivery.Kind != transition.ExternalEvent) {
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
@@ -84,13 +84,13 @@ func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputD
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
 	}
 	store := decisionAcceptanceStore{fixture: f, input: input}
-	acceptor, err := transition.NewAcceptor[string, string, string, membershipInput](
+	acceptor, err := transition.NewAcceptor[string, string, string, fixtureInput](
 		store, &f.machines, resolveMembershipInput, resolveMembershipEvent, newExecutionID, f.clock,
 	)
 	if err != nil {
 		return transition.InputOutcome{}, err
 	}
-	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, membershipInput]{
+	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, fixtureInput]{
 		Entity: input.MembershipID, Key: delivery.ID, Operation: transition.Transition, MachineID: "taskmanager-membership", MachineVersion: "1",
 		HasPrevious: true, Previous: string(Invited), HasEvent: true, Event: string(input.Event), EventCodec: membershipEventCodec,
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,
@@ -124,7 +124,7 @@ func (f *Fixture) Decide(ctx context.Context, actor, membershipID, key string, d
 	if !known {
 		return "", ErrDenied
 	}
-	var input membershipInput
+	var input fixtureInput
 	var deadline sql.NullString
 	err := f.db.QueryRowContext(ctx, `SELECT group_id, user_id, deadline FROM tm_memberships WHERE id = ?`, membershipID).
 		Scan(&input.GroupID, &input.UserID, &deadline)
@@ -154,7 +154,7 @@ func (f *Fixture) Decide(ctx context.Context, actor, membershipID, key string, d
 	if err != nil {
 		return "", err
 	}
-	outcome, err := ingress.Submit(ctx, transition.InputRequest[membershipInput]{
+	outcome, err := ingress.Submit(ctx, transition.InputRequest[fixtureInput]{
 		ID: id, WorkflowID: membershipID, Kind: kind, Codec: membershipInputCodec, Value: input,
 	})
 	if errors.Is(err, transition.ErrConflict) {

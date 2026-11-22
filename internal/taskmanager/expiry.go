@@ -70,7 +70,7 @@ func (f *Fixture) deliverExpiry(ctx context.Context, delivery transition.TimerDe
 	if delivery.ID != expiryTimerID(delivery.WorkflowID) || delivery.Event != delivery.WorkflowID {
 		return transition.ErrInvalidRequest
 	}
-	var input membershipInput
+	var input fixtureInput
 	var deadline sql.NullString
 	var status MembershipStatus
 	err := f.db.QueryRowContext(ctx, `SELECT group_id, user_id, status, deadline FROM tm_memberships WHERE id = ?`, delivery.WorkflowID).
@@ -99,7 +99,7 @@ func (f *Fixture) deliverExpiry(ctx context.Context, delivery transition.TimerDe
 	if err != nil {
 		return err
 	}
-	outcome, err := ingress.Submit(ctx, transition.InputRequest[membershipInput]{
+	outcome, err := ingress.Submit(ctx, transition.InputRequest[fixtureInput]{
 		ID: delivery.ID, WorkflowID: input.MembershipID, Kind: transition.ExternalEvent, Codec: membershipInputCodec, Value: input,
 	})
 	if err != nil {

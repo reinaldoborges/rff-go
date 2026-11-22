@@ -35,13 +35,14 @@ type Membership struct {
 	Reason   string
 }
 
-type membershipInput struct {
+type fixtureInput struct {
 	Actor        string
 	GroupID      string
 	UserID       string
 	MembershipID string
 	Deadline     time.Time
 	Event        InvitationDecision
+	Task         *taskInput `json:",omitempty"`
 }
 
 type jsonCodec[T any] struct{}
@@ -62,16 +63,18 @@ func (c jsonCodec[T]) Equal(ctx context.Context, data []byte, incoming T) (bool,
 
 var membershipInputCodec = transition.CodecVersion{Name: "taskmanager-membership-input", Version: "1"}
 var membershipEventCodec = transition.CodecVersion{Name: "taskmanager-membership-event", Version: "1"}
+var taskInputCodec = transition.CodecVersion{Name: "taskmanager-task-input", Version: "1"}
+var taskEventCodec = transition.CodecVersion{Name: "taskmanager-task-event", Version: "1"}
 
-func resolveMembershipInput(version transition.CodecVersion) (transition.Codec[membershipInput], error) {
-	if version != membershipInputCodec {
+func resolveMembershipInput(version transition.CodecVersion) (transition.Codec[fixtureInput], error) {
+	if version != membershipInputCodec && version != taskInputCodec {
 		return nil, errors.New("unknown membership input codec")
 	}
-	return jsonCodec[membershipInput]{}, nil
+	return jsonCodec[fixtureInput]{}, nil
 }
 
 func resolveMembershipEvent(version transition.CodecVersion) (transition.Codec[string], error) {
-	if version != membershipEventCodec {
+	if version != membershipEventCodec && version != taskEventCodec {
 		return nil, errors.New("unknown membership event codec")
 	}
 	return jsonCodec[string]{}, nil
@@ -79,19 +82,19 @@ func resolveMembershipEvent(version transition.CodecVersion) (transition.Codec[s
 
 func (f *Fixture) initializeMembershipRuntime() error {
 	policy := fsm.Policy{MaxAttempts: 3, AttemptTimeout: time.Minute, OverallTimeout: time.Hour, RetryDelays: []time.Duration{time.Second}}
-	handler := fsm.NoopHandler[string, string, string, membershipInput]{}
-	machine, err := fsm.NewMachine(fsm.Config[string, string, string, membershipInput]{
+	handler := fsm.NoopHandler[string, string, string, fixtureInput]{}
+	machine, err := fsm.NewMachine(fsm.Config[string, string, string, fixtureInput]{
 		ID: "taskmanager-membership", Version: "1",
 		InitialStates:  []string{string(Invited)},
 		TerminalStates: []string{string(Declined), string(Expired), string(Revoked), string(Removed)},
-		Handlers: map[string]fsm.Handler[string, string, string, membershipInput]{
+		Handlers: map[string]fsm.Handler[string, string, string, fixtureInput]{
 			string(Invited): handler, string(Active): handler, string(Declined): handler,
 			string(Expired): handler, string(Revoked): handler, string(Removed): handler,
 		},
-		SelectInitial: func(membershipInput) (fsm.Selection[string], error) {
+		SelectInitial: func(fixtureInput) (fsm.Selection[string], error) {
 			return fsm.Selection[string]{Target: string(Invited), Policy: policy, Notify: true}, nil
 		},
-		SelectTransition: func(source, event string, input membershipInput) (fsm.Selection[string], error) {
+		SelectTransition: func(source, event string, input fixtureInput) (fsm.Selection[string], error) {
 			if source != string(Invited) || event != string(input.Event) {
 				return fsm.Selection[string]{}, ErrConflict
 			}
@@ -120,13 +123,16 @@ func (f *Fixture) initializeMembershipRuntime() error {
 	if err := f.machines.Register(machine); err != nil {
 		return err
 	}
-	f.runner, err = transition.NewHookRunner[string, string, string, membershipInput](&f.machines, resolveMembershipInput, resolveMembershipEvent)
+	if err := f.registerTaskMachine(policy); err != nil {
+		return err
+	}
+	f.runner, err = transition.NewHookRunner[string, string, string, fixtureInput](&f.machines, resolveMembershipInput, resolveMembershipEvent)
 	return err
 }
 
 type invitationAcceptanceStore struct {
 	fixture *Fixture
-	input   membershipInput
+	input   fixtureInput
 }
 
 func (s invitationAcceptanceStore) Accept(ctx context.Context, entity, key string,
@@ -172,19 +178,19 @@ func newExecutionID() (string, error) {
 	return "membership:" + hex.EncodeToString(id[:]), nil
 }
 
-func (f *Fixture) acceptInvitation(ctx context.Context, delivery transition.InputDelivery[membershipInput]) (transition.InputOutcome, error) {
+func (f *Fixture) acceptInvitation(ctx context.Context, delivery transition.InputDelivery[fixtureInput]) (transition.InputOutcome, error) {
 	input := delivery.Value
 	if delivery.Kind != transition.Command || delivery.WorkflowID != input.MembershipID {
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
 	}
 	store := invitationAcceptanceStore{fixture: f, input: input}
-	acceptor, err := transition.NewAcceptor[string, string, string, membershipInput](
+	acceptor, err := transition.NewAcceptor[string, string, string, fixtureInput](
 		store, &f.machines, resolveMembershipInput, resolveMembershipEvent, newExecutionID, f.clock,
 	)
 	if err != nil {
 		return transition.InputOutcome{}, err
 	}
-	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, membershipInput]{
+	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, fixtureInput]{
 		Entity: input.MembershipID, Key: delivery.ID, Operation: transition.Initialize,
 		MachineID: "taskmanager-membership", MachineVersion: "1",
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,

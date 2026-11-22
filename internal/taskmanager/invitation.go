@@ -22,8 +22,8 @@ func inputID(actor, group, key string) (string, error) {
 	return "taskmanager:" + hex.EncodeToString(sum[:]), nil
 }
 
-func (f *Fixture) invitationIngress() (*transition.InputIngress[membershipInput], error) {
-	return transition.NewInputIngress[membershipInput](f.store, "taskmanager-invitations", resolveMembershipInput, f.acceptInvitation)
+func (f *Fixture) invitationIngress() (*transition.InputIngress[fixtureInput], error) {
+	return transition.NewInputIngress[fixtureInput](f.store, "taskmanager-invitations", resolveMembershipInput, f.acceptInvitation)
 }
 
 // Invite durably accepts an owner-authorized invitation initialization.
@@ -46,9 +46,9 @@ func (f *Fixture) Invite(ctx context.Context, actor, groupID, userID, membership
 	if err != nil {
 		return "", err
 	}
-	outcome, err := ingress.Submit(ctx, transition.InputRequest[membershipInput]{
+	outcome, err := ingress.Submit(ctx, transition.InputRequest[fixtureInput]{
 		ID: id, WorkflowID: membershipID, Kind: transition.Command, Codec: membershipInputCodec,
-		Value: membershipInput{Actor: actor, GroupID: groupID, UserID: userID, MembershipID: membershipID, Deadline: deadline.UTC()},
+		Value: fixtureInput{Actor: actor, GroupID: groupID, UserID: userID, MembershipID: membershipID, Deadline: deadline.UTC()},
 	})
 	if errors.Is(err, transition.ErrConflict) {
 		return "", ErrConflict

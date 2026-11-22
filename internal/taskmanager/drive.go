@@ -30,9 +30,12 @@ func (h membershipCommitHost) Commit(ctx context.Context, lease transition.Trans
 		execution transition.Execution[string, string],
 	) (transition.CommitReceipt, error) {
 		receipt := transition.CommitReceipt{ExecutionID: execution.ID, OperationID: execution.CommitOperationID}
-		input, err := (jsonCodec[membershipInput]{}).Decode(ctx, execution.Input.Data)
+		input, err := (jsonCodec[fixtureInput]{}).Decode(ctx, execution.Input.Data)
 		if err != nil {
 			return transition.CommitReceipt{}, fmt.Errorf("decode membership commit input: %w", err)
+		}
+		if execution.MachineID == "taskmanager-task" {
+			return commitTask(ctx, tx, execution, input, receipt)
 		}
 		if execution.Entity != input.MembershipID {
 			return transition.CommitReceipt{}, transition.ErrInvalidDecision
@@ -105,6 +108,13 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err := ingress.Reconcile(ctx); err != nil {
 		return err
 	}
+	tasks, err := f.taskIngress()
+	if err != nil {
+		return err
+	}
+	if err := tasks.Reconcile(ctx); err != nil {
+		return err
+	}
 	decisions, err := f.decisionIngress()
 	if err != nil {
 		return err
@@ -115,7 +125,7 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	worker, err := transition.NewHookWorker[string, string, string, membershipInput](f.store, f.runner, transition.WorkerConfig{
+	worker, err := transition.NewHookWorker[string, string, string, fixtureInput](f.store, f.runner, transition.WorkerConfig{
 		ID: "taskmanager-hook", Capacity: 1, LeaseTTL: time.Minute, RenewalInterval: 10 * time.Second, Clock: fixtureClock{now: f.clock},
 	})
 	if err != nil {

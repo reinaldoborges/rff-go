@@ -35,8 +35,8 @@ type Fixture struct {
 	db       *sql.DB
 	clock    func() time.Time
 	store    *sqlite.Store[string, string]
-	machines fsm.Registry[string, string, string, membershipInput]
-	runner   *transition.HookRunner[string, string, string, membershipInput]
+	machines fsm.Registry[string, string, string, fixtureInput]
+	runner   *transition.HookRunner[string, string, string, fixtureInput]
 	sinkMu   sync.RWMutex
 	sink     func(context.Context, InvitationNotification) error
 }
@@ -70,6 +70,8 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 			`CREATE TABLE IF NOT EXISTS tm_operator_audit (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, execution_id TEXT NOT NULL, allowed INTEGER NOT NULL, occurred_at TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_groups (id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL REFERENCES tm_users(id), closed INTEGER NOT NULL CHECK (closed IN (0, 1)))`,
 			`CREATE TABLE IF NOT EXISTS tm_memberships (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), user_id TEXT NOT NULL REFERENCES tm_users(id), status TEXT NOT NULL, deadline TEXT, reason TEXT NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS tm_tasks (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), title TEXT NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS tm_task_assignments (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tm_tasks(id), membership_id TEXT NOT NULL REFERENCES tm_memberships(id), assigned_at TEXT NOT NULL)`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS tm_live_membership ON tm_memberships (group_id, user_id) WHERE status IN ('Invited', 'Active')`,
 			`CREATE TABLE IF NOT EXISTS tm_ownership_transfers (group_id TEXT NOT NULL REFERENCES tm_groups(id), actor_id TEXT NOT NULL REFERENCES tm_users(id), request_key TEXT NOT NULL, former_owner TEXT NOT NULL, new_owner TEXT NOT NULL, occurred_at TEXT NOT NULL, PRIMARY KEY (group_id, actor_id, request_key))`,
 		} {
