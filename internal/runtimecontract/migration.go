@@ -15,11 +15,85 @@ type MigrationStore interface {
 	Store
 	transition.MigrationStore[string, string]
 	transition.CompatibilityStore[string, string]
+	transition.CheckedHookControlStore[string, string]
 }
 
 // RunMigration checks domain verification, fencing, and original request replay.
 func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	t.Helper()
+	t.Run("abort recovery rejects migration", func(t *testing.T) {
+		ctx := context.Background()
+		store := newStore(t)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		clock := func() time.Time { return now }
+		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
+					MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
+				},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReportHook(ctx, claim, transition.HookResult{
+			Failure: fsm.Failure{Code: "failed"}, Disposition: fsm.DispositionIntervention,
+		}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ApplyCheckedHookControl(ctx, lease, clock,
+			transition.HookControl{ID: "abort", Action: transition.AbortIntervention},
+			func(transition.Execution[string, string], transition.HookCall) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		before, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || before.Status != transition.Aborting || !before.RecoveryStarted {
+			t.Fatalf("abort did not enter recovery: %+v, %v", before, err)
+		}
+		calls := 0
+		_, err = store.ApplyExecutionMigration(ctx, lease, clock,
+			transition.MigrationRequest{ID: "migration", MachineID: "machine", MachineVersion: "2"},
+			func(context.Context, transition.MigrationSource[string]) (transition.MigrationSnapshot[string], error) {
+				calls++
+				return transition.MigrationSnapshot[string]{}, nil
+			}, func(context.Context, transition.MigrationSource[string], transition.MigrationSnapshot[string], transition.Execution[string, string], transition.HookCall) error {
+				t.Fatal("migration validation ran during abort recovery")
+				return nil
+			})
+		if !errors.Is(err, transition.ErrInvalidHook) || calls != 0 {
+			t.Fatalf("abort recovery allowed migration: conversions=%d error=%v", calls, err)
+		}
+		after, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || after.Status != before.Status || after.RecoveryStarted != before.RecoveryStarted ||
+			!after.EffectiveDeadline().Equal(before.EffectiveDeadline()) {
+			t.Fatalf("rejected migration changed abort recovery: %+v, %v", after, err)
+		}
+	})
 	store := newStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
