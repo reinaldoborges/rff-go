@@ -24,6 +24,10 @@ store. Applications supply versioned codecs, an execution-ID generator, and a
 clock. Codecs must preserve semantic equality and report when it cannot be
 verified.
 
+The hook runner rehydrates pinned machine and codec versions and invokes state
+hooks without rerunning selection. It does not schedule work, fence attempts, or
+persist hook outcomes.
+
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
 in-memory test fake exercises that contract without claiming durability:
