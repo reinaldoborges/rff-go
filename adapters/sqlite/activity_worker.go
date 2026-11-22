@@ -172,10 +172,11 @@ func (s *Store[EntityID, StateID]) StartHook(ctx context.Context, lease transiti
 			(work.Progress.Dispatch.Kind != transition.HookRecover && execution.Status != transition.Waiting && execution.Status != transition.Running) {
 			return transition.ErrInvalidHook
 		}
-		if execution.Policy.MaxAttempts == 0 || execution.Policy.AttemptTimeout <= 0 || execution.Policy.OverallTimeout <= 0 || execution.Deadline.IsZero() {
+		deadline := execution.effectiveDeadline()
+		if execution.Policy.MaxAttempts == 0 || execution.Policy.AttemptTimeout <= 0 || execution.Policy.OverallTimeout <= 0 || deadline.IsZero() {
 			return fmt.Errorf("%w: invalid execution timing", transition.ErrCompatibility)
 		}
-		if !now.Before(execution.Deadline) {
+		if !now.Before(deadline) {
 			return transition.ErrTransitionDeadline
 		}
 		if work.BudgetUsed >= execution.Policy.MaxAttempts {

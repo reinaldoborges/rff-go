@@ -89,4 +89,28 @@ func TestCoordinatorEntersInterventionWhenRetryConsumesLastAttempt(t *testing.T)
 	if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
 		t.Fatalf("work was dispatched after budget exhaustion: %v", err)
 	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err = transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := store.StartHook(ctx, resumed, clock)
+	if err != nil || started.Attempt.Number != 3 {
+		t.Fatalf("authorized retry did not reset budget and preserve numbering: attempt=%+v error=%v", started, err)
+	}
 }

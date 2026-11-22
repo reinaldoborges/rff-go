@@ -28,8 +28,11 @@ type diskRecord struct {
 	Policy               fsm.Policy
 	AcceptedAt           time.Time
 	Deadline             time.Time
+	CycleDeadline        time.Time
+	Controls             []transition.HookControlReceipt
 	Status               transition.Status
 	CommitOperationID    string
+	RecoveryStarted      bool
 	Failure              *fsm.Failure
 	FailureDisposition   fsm.Disposition
 }
@@ -52,7 +55,8 @@ func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[Enti
 		Previous: previous, HasPrevious: record.HasPrevious, Target: target,
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
-		Deadline: record.Deadline, Status: record.Status, CommitOperationID: record.CommitOperationID,
+		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
+		Status: record.Status, CommitOperationID: record.CommitOperationID, RecoveryStarted: record.RecoveryStarted,
 		Failure: record.Failure, FailureDisposition: record.FailureDisposition,
 	})
 }
@@ -86,9 +90,17 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 		Previous: previous, HasPrevious: record.HasPrevious, Target: target,
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
-		Deadline: record.Deadline, Status: record.Status, CommitOperationID: record.CommitOperationID,
+		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
+		Status: record.Status, CommitOperationID: record.CommitOperationID, RecoveryStarted: record.RecoveryStarted,
 		Failure: record.Failure, FailureDisposition: record.FailureDisposition,
 	}, nil
+}
+
+func (r diskRecord) effectiveDeadline() time.Time {
+	if !r.CycleDeadline.IsZero() {
+		return r.CycleDeadline
+	}
+	return r.Deadline
 }
 
 func (s *Store[EntityID, StateID]) encodeState(value StateID) ([]byte, error) {

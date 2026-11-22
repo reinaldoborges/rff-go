@@ -56,11 +56,15 @@ without writes for unsupported schemas. It migrates version 1 and 2 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
-and record a commit-pending work-success marker. Abort recovery, domain commits,
-operator controls, compatibility migration, and notifications are not yet
-implemented.
+record a commit-pending work-success marker, and finish authorized abort
+recovery. Low-level hook controls must be authorized and audited by the host;
+the typed ingress and authorization integration are not yet implemented.
+Domain commits, automatic rejection recovery, compatibility migration, and
+notifications are not yet implemented.
 
 ```sh
 go test ./adapters/sqlite
 go test ./adapters/sqlite -run TestAcceptanceStoreContract
+go test ./adapters/sqlite -run 'TestCoordinator|TestAbortRecovery|TestRecoveryDeadline|TestAuthorizedRetry|TestSQLiteWorker'
+go test ./runtime
 ```

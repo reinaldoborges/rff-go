@@ -103,10 +103,22 @@ type Execution[EntityID comparable, StateID comparable] struct {
 	Policy               fsm.Policy
 	AcceptedAt           time.Time
 	Deadline             time.Time
+	CycleDeadline        time.Time
+	Controls             []HookControlReceipt
 	Status               Status
 	CommitOperationID    string
+	RecoveryStarted      bool
 	Failure              *fsm.Failure
 	FailureDisposition   fsm.Disposition
+}
+
+// EffectiveDeadline is the current control-cycle deadline, or the original
+// accepted deadline before any authorized control cycle.
+func (e Execution[EntityID, StateID]) EffectiveDeadline() time.Time {
+	if !e.CycleDeadline.IsZero() {
+		return e.CycleDeadline
+	}
+	return e.Deadline
 }
 
 // AcceptanceView is read atomically for one entity and idempotency key.

@@ -181,10 +181,11 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	if err != nil {
 		return err
 	}
-	if execution.Policy.AttemptTimeout <= 0 || execution.Deadline.IsZero() {
+	deadline := execution.EffectiveDeadline()
+	if execution.Policy.AttemptTimeout <= 0 || deadline.IsZero() {
 		return fmt.Errorf("%w: invalid execution timing", ErrCompatibility)
 	}
-	if !w.config.Clock.Now().Before(execution.Deadline) {
+	if !w.config.Clock.Now().Before(deadline) {
 		return ErrTransitionDeadline
 	}
 	started, err := w.store.StartHook(claimCtx, lease, w.config.Clock.Now)
@@ -214,7 +215,7 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 		return ErrStaleActivityLease
 	}
 	timeout := execution.Policy.AttemptTimeout - now.Sub(started.StartedAt)
-	remaining := execution.Deadline.Sub(now)
+	remaining := deadline.Sub(now)
 	if remaining < timeout {
 		timeout = remaining
 	}

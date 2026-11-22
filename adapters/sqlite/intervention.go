@@ -24,7 +24,8 @@ func (s *Store[EntityID, StateID]) EnterHookIntervention(ctx context.Context, le
 		if execution.Status == transition.NeedsIntervention {
 			return nil
 		}
-		if execution.CommitOperationID != "" || execution.Status != transition.Waiting && execution.Status != transition.Running {
+		if execution.Status != transition.Aborting &&
+			(execution.CommitOperationID != "" || execution.Status != transition.Waiting && execution.Status != transition.Running) {
 			return transition.ErrInvalidHook
 		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)
@@ -49,10 +50,10 @@ func (s *Store[EntityID, StateID]) EnterHookIntervention(ctx context.Context, le
 			return transition.ErrInvalidHook
 		}
 		if work.Progress.Result.Success {
-			if work.BudgetUsed < execution.Policy.MaxAttempts && now.Before(execution.Deadline) {
+			if work.BudgetUsed < execution.Policy.MaxAttempts && now.Before(execution.effectiveDeadline()) {
 				return transition.ErrInvalidHook
 			}
-		} else if _, err := retryDelay(execution.Policy, work); err == nil && now.Before(execution.Deadline) {
+		} else if _, err := retryDelay(execution.Policy, work); err == nil && now.Before(execution.effectiveDeadline()) {
 			return transition.ErrInvalidHook
 		} else if err != nil && !errors.Is(err, transition.ErrAttemptBudget) && !errors.Is(err, transition.ErrRetryIntervention) {
 			return err

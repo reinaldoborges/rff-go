@@ -17,15 +17,16 @@ import (
 )
 
 type hookWork struct {
-	Version      int
-	Progress     transition.HookProgress
-	History      []hookDispatchHistory
-	Redeliveries []hookRedelivery
-	Owner        string
-	Generation   int64
-	ExpiresAt    time.Time
-	Started      bool
-	BudgetUsed   uint
+	Version           int
+	Progress          transition.HookProgress
+	History           []hookDispatchHistory
+	Redeliveries      []hookRedelivery
+	AuthorizedRetries []hookAttemptRef
+	Owner             string
+	Generation        int64
+	ExpiresAt         time.Time
+	Started           bool
+	BudgetUsed        uint
 }
 
 type hookDispatchHistory struct {
@@ -37,6 +38,15 @@ type hookRedelivery struct {
 	ActivityID  string
 	Generation  uint64
 	AvailableAt time.Time
+}
+
+type hookAttemptRef struct {
+	ActivityID string
+	Generation uint64
+}
+
+func hookAttemptKey(id string, generation uint64) string {
+	return id + ":" + strconv.FormatUint(generation, 10)
 }
 
 func hookID(executionID string, dispatch transition.HookDispatch) string {
@@ -84,13 +94,14 @@ func validateWork(executionID string, work hookWork) error {
 	}
 	redeliveries := make(map[string]bool)
 	for _, prior := range work.Redeliveries {
-		key := prior.ActivityID + ":" + strconv.FormatUint(prior.Generation, 10)
+		key := hookAttemptKey(prior.ActivityID, prior.Generation)
 		if !seen[prior.ActivityID] || prior.Generation == 0 || prior.AvailableAt.IsZero() || redeliveries[key] {
 			return fmt.Errorf("%w: invalid hook redelivery history", ErrUnsupportedSchema)
 		}
 		redeliveries[key] = true
 	}
 	retryableAttempts := make(map[string]bool)
+	interventionAttempts := make(map[string]bool)
 	for i, attempt := range progress.Attempts {
 		if attempt.Metadata.ExecutionID != executionID || attempt.Metadata.Number != uint(i+1) ||
 			attempt.Metadata.ActivityID == "" || attempt.Metadata.ActivityIdempotencyKey == "" ||
@@ -110,12 +121,22 @@ func validateWork(executionID string, work hookWork) error {
 			return fmt.Errorf("%w: invalid hook kind in history", ErrUnsupportedSchema)
 		}
 		if attempt.Result != nil && !attempt.Result.Success && attempt.Result.Disposition == fsm.DispositionRetry {
-			key := attempt.Metadata.ActivityID + ":" + strconv.FormatUint(attempt.Metadata.LeaseGeneration, 10)
+			key := hookAttemptKey(attempt.Metadata.ActivityID, attempt.Metadata.LeaseGeneration)
 			retryableAttempts[key] = true
 		}
+		if attempt.Result != nil && !attempt.Result.Success && attempt.Result.Disposition == fsm.DispositionIntervention {
+			interventionAttempts[hookAttemptKey(attempt.Metadata.ActivityID, attempt.Metadata.LeaseGeneration)] = true
+		}
+	}
+	for _, prior := range work.AuthorizedRetries {
+		key := hookAttemptKey(prior.ActivityID, prior.Generation)
+		if !interventionAttempts[key] || retryableAttempts[key] {
+			return fmt.Errorf("%w: invalid authorized retry history", ErrUnsupportedSchema)
+		}
+		retryableAttempts[key] = true
 	}
 	for _, prior := range work.Redeliveries {
-		key := prior.ActivityID + ":" + strconv.FormatUint(prior.Generation, 10)
+		key := hookAttemptKey(prior.ActivityID, prior.Generation)
 		if !retryableAttempts[key] {
 			return fmt.Errorf("%w: redelivery has no retryable attempt", ErrUnsupportedSchema)
 		}
@@ -519,7 +540,17 @@ func (s *Store[EntityID, StateID]) RedeliverHook(
 				break
 			}
 		}
-		if failed == nil || failed.Result == nil || failed.Result.Success || failed.Result.Disposition != fsm.DispositionRetry {
+		if failed == nil || failed.Result == nil || failed.Result.Success {
+			return transition.ErrInvalidHook
+		}
+		authorized := false
+		for _, prior := range work.AuthorizedRetries {
+			if prior.ActivityID == activityID && prior.Generation == generation {
+				authorized = true
+				break
+			}
+		}
+		if failed.Result.Disposition != fsm.DispositionRetry && !authorized {
 			return transition.ErrInvalidHook
 		}
 		var data []byte
@@ -536,7 +567,8 @@ func (s *Store[EntityID, StateID]) RedeliverHook(
 		if work.BudgetUsed >= execution.Policy.MaxAttempts {
 			return transition.ErrAttemptBudget
 		}
-		if execution.Deadline.IsZero() || !now.Before(execution.Deadline) || !availableAt.Before(execution.Deadline) {
+		deadline := execution.effectiveDeadline()
+		if deadline.IsZero() || !now.Before(deadline) || !availableAt.Before(deadline) {
 			return transition.ErrTransitionDeadline
 		}
 		last := work.Progress.Attempts[len(work.Progress.Attempts)-1]

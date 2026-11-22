@@ -30,8 +30,9 @@ func (s *Store[EntityID, StateID]) EnterDeadlineIntervention(
 			}
 			return transition.ErrConflict
 		}
-		if execution.CommitOperationID != "" || execution.Status != transition.Waiting && execution.Status != transition.Running ||
-			execution.Deadline.IsZero() || now.Before(execution.Deadline) {
+		if (execution.Status != transition.Aborting &&
+			(execution.CommitOperationID != "" || execution.Status != transition.Waiting && execution.Status != transition.Running)) ||
+			execution.effectiveDeadline().IsZero() || now.Before(execution.effectiveDeadline()) {
 			return transition.ErrInvalidHook
 		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)

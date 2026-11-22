@@ -17,6 +17,7 @@ type CoordinatorStore[EntityID comparable, StateID comparable] interface {
 	HookDispatcher[EntityID]
 	WorkSuccessStore[EntityID]
 	InterventionStore[EntityID]
+	AbortStore[EntityID]
 }
 
 // HookFailureClassifier resolves the application's pinned failure classifier.
@@ -72,7 +73,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 	if err != nil {
 		return err
 	}
-	if execution.CommitOperationID != "" || execution.Status != Waiting && execution.Status != Running {
+	if !reconcilable(execution) {
 		return nil
 	}
 	lease, err := c.store.AcquireTransitionLease(ctx, execution.Entity, id, c.config.ID, c.config.Clock, c.config.LeaseTTL)
@@ -87,12 +88,15 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 	if err != nil {
 		return err
 	}
-	if execution.CommitOperationID != "" || execution.Status != Waiting && execution.Status != Running {
+	if !reconcilable(execution) {
 		return nil
 	}
 	progress, err := c.store.ReadHookProgress(ctx, id)
 	if errors.Is(err, ErrNoHookActivity) {
-		if !c.config.Clock().Before(execution.Deadline) {
+		if execution.Status == Aborting {
+			return ErrInvalidHook
+		}
+		if !c.config.Clock().Before(execution.EffectiveDeadline()) {
 			return c.enterDeadlineIntervention(ctx, lease, execution)
 		}
 		kind := HookEnter
@@ -121,7 +125,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 			}
 			return err
 		}
-		if !progress.Started && !c.config.Clock().Before(execution.Deadline) {
+		if !progress.Started && !c.config.Clock().Before(execution.EffectiveDeadline()) {
 			return c.enterDeadlineIntervention(ctx, lease, execution)
 		}
 		return nil
@@ -148,10 +152,10 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 		}
 		last := progress.Attempts[len(progress.Attempts)-1]
 		due := last.CompletedAt.Add(delay)
-		if !c.config.Clock().Before(execution.Deadline) {
+		if !c.config.Clock().Before(execution.EffectiveDeadline()) {
 			return c.enterDeadlineIntervention(ctx, lease, execution)
 		}
-		if !due.Before(execution.Deadline) {
+		if !due.Before(execution.EffectiveDeadline()) {
 			return nil
 		}
 		switch progress.Dispatch.Kind {
@@ -177,7 +181,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 		if progress.BudgetUsed >= execution.Policy.MaxAttempts {
 			return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
 		}
-		if !c.config.Clock().Before(execution.Deadline) {
+		if !c.config.Clock().Before(execution.EffectiveDeadline()) {
 			return c.enterDeadlineIntervention(ctx, lease, execution)
 		}
 		last := progress.Attempts[len(progress.Attempts)-1]
@@ -197,11 +201,21 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 
 		return ErrInvalidHook
 	}
+	if progress.Dispatch.Kind == HookRecover && execution.Status == Aborting {
+		return c.store.FinishAbort(ctx, lease, c.config.Clock)
+	}
 	if progress.Dispatch.Kind != HookEnter && progress.Dispatch.Kind != HookTransition {
 		return ErrInvalidHook
 	}
 	_, err = c.store.MarkWorkSuccess(ctx, lease, c.config.Clock)
 	return err
+}
+
+func reconcilable[EntityID comparable, StateID comparable](execution Execution[EntityID, StateID]) bool {
+	if execution.Status == Aborting {
+		return execution.RecoveryStarted
+	}
+	return execution.CommitOperationID == "" && (execution.Status == Waiting || execution.Status == Running)
 }
 
 func (c *Coordinator[EntityID, StateID]) enterDeadlineIntervention(

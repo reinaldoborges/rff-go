@@ -55,6 +55,10 @@ func TestCoordinatorSettlesExpiredUnstartedWorkWithoutWorker(t *testing.T) {
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
+	oldClaim, err := store.ClaimHook(ctx, "lost-worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	now = now.Add(time.Second)
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
@@ -66,5 +70,44 @@ func TestCoordinatorSettlesExpiredUnstartedWorkWithoutWorker(t *testing.T) {
 	}
 	if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
 		t.Fatalf("expired work was claimable after intervention: %v", err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := transition.HookControl{ID: "retry-control", Action: transition.RetryIntervention}
+	receipt, err := store.ApplyHookControl(ctx, fence, clock, control)
+	if err != nil || !receipt.Deadline.Equal(now.Add(time.Second)) {
+		t.Fatalf("retry did not get a fresh deadline: receipt=%+v error=%v", receipt, err)
+	}
+	now = now.Add(500 * time.Millisecond)
+	replay, err := store.ApplyHookControl(ctx, fence, clock, control)
+	if err != nil || !replay.Deadline.Equal(receipt.Deadline) {
+		t.Fatalf("control replay changed deadline: receipt=%+v error=%v", replay, err)
+	}
+	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: control.ID, Action: transition.AbortIntervention}); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("changed control replay did not conflict: %v", err)
+	}
+	stale := fence
+	stale.Generation++
+	if _, err := store.ApplyHookControl(ctx, stale, clock, control); err != nil {
+		t.Fatalf("recorded control could not replay under a stale fence: %v", err)
+	}
+	if _, err := store.ApplyHookControl(ctx, stale, clock, transition.HookControl{ID: "different", Action: transition.RetryIntervention}); !errors.Is(err, transition.ErrStaleLease) {
+		t.Fatalf("stale fence accepted a new control: %v", err)
+	}
+	if _, err := store.StartHook(ctx, oldClaim, clock); !errors.Is(err, transition.ErrStaleActivityLease) {
+		t.Fatalf("old unstarted claim survived intervention: %v", err)
+	}
+	execution, err = store.ReadActiveExecution(ctx, "execution")
+	if err != nil || !execution.Deadline.Equal(now.Add(-500*time.Millisecond)) || !execution.CycleDeadline.Equal(receipt.Deadline) {
+		t.Fatalf("retry did not preserve original and current deadlines: execution=%+v error=%v", execution, err)
+	}
+	lease, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, lease, clock); err != nil {
+		t.Fatalf("worker could not start within renewed control deadline: %v", err)
 	}
 }

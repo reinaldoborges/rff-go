@@ -77,6 +77,47 @@ func TestCoordinatorStopsWhenPolicyCannotRetry(t *testing.T) {
 			if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
 				t.Fatalf("policy-blocked work was claimable: %v", err)
 			}
+			fence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+				t.Fatal(err)
+			}
+			if err := coordinator.Reconcile(ctx); err != nil {
+				t.Fatal(err)
+			}
+			retry, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, call, err := store.InspectHook(ctx, retry, clock)
+			if err != nil || call.Kind != transition.HookRetry || call.Failure == nil || *call.Failure != failure {
+				t.Fatalf("authorized retry did not resume with Retry hook: call=%+v error=%v", call, err)
+			}
+			started, err := store.StartHook(ctx, retry, clock)
+			if err != nil || started.Attempt.Number != 2 {
+				t.Fatalf("authorized retry did not use fresh budget: attempt=%+v error=%v", started, err)
+			}
+			if err := store.ReportHook(ctx, retry, transition.HookResult{
+				Failure: fsm.Failure{Code: "retry-failed"}, Disposition: fsm.DispositionIntervention,
+			}, clock); err != nil {
+				t.Fatal(err)
+			}
+			if err := coordinator.Reconcile(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-again", Action: transition.RetryIntervention}); err != nil {
+				t.Fatal(err)
+			}
+			retried, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+			if err != nil || retried.ActivityID != retry.ActivityID {
+				t.Fatalf("authorized retry nested a new Retry hook: lease=%+v error=%v", retried, err)
+			}
+			started, err = store.StartHook(ctx, retried, clock)
+			if err != nil || started.Attempt.Number != 3 {
+				t.Fatalf("retry of Retry did not retain attempt history: attempt=%+v error=%v", started, err)
+			}
 		})
 	}
 }
