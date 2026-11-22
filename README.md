@@ -75,10 +75,13 @@ recovery. Low-level hook controls must be authorized and audited by the host;
 the typed ingress and authorization integration are not yet implemented.
 The host provides domain commits; automatic rejection recovery is supported.
 `sqlite.NewNotificationOutbox` provides fenced local handoff and durable delivery
-claims, including recovery after claim expiry. The current commit and handoff
-interfaces reconcile separate transactions and do not yet provide the required
-same-store atomic commit and outbox operation. Compatibility migration is not
-yet implemented.
+claims, including recovery after claim expiry. For domain data stored in the
+same SQLite file, `Store.CommitAtomic` lets the host check and update its domain
+tables in the adapter transaction, atomically recording the receipt and enabled
+notification intent. Its callback must use only the provided transaction and
+must not control or retain it. Rejection discards callback writes. Separate
+stores use the host commit and handoff reconciliation interfaces instead.
+Compatibility migration is not yet implemented.
 
 ```sh
 go test ./adapters/sqlite
@@ -86,6 +89,7 @@ go test ./adapters/sqlite -run TestAcceptanceStoreContract
 go test ./adapters/sqlite -run 'TestCoordinator|TestAbortRecovery|TestRecoveryDeadline|TestAuthorizedRetry|TestSQLiteWorker'
 go test ./adapters/sqlite -run 'TestNotificationHandoff|TestNotificationRepair'
 go test ./adapters/sqlite -run TestNotificationDelivery
+go test ./adapters/sqlite -run TestAtomicCommit
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
 ```

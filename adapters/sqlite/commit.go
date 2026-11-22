@@ -24,20 +24,24 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 		return transition.ErrInvalidHook
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		stored, err := s.readControlExecution(ctx, tx, lease)
 		if err != nil {
 			return err
 		}
-		if receipt.ExecutionID != execution.ID || receipt.OperationID != execution.CommitOperationID {
+		if receipt.ExecutionID != stored.ID || receipt.OperationID != stored.CommitOperationID {
 			return transition.ErrConflict
 		}
-		if execution.CommitReceipt != nil {
-			prior := execution.CommitReceipt
+		if stored.CommitReceipt != nil {
+			prior := stored.CommitReceipt
 			if prior.ExecutionID == receipt.ExecutionID && prior.OperationID == receipt.OperationID && prior.Outcome == receipt.Outcome &&
 				(prior.Failure == nil && receipt.Failure == nil || prior.Failure != nil && receipt.Failure != nil && *prior.Failure == *receipt.Failure) {
 				return nil
 			}
 			return transition.ErrConflict
+		}
+		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		if err != nil {
+			return err
 		}
 		if execution.Status != transition.Running || execution.RecoveryStarted {
 			return transition.ErrInvalidHook
@@ -48,12 +52,12 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			execution.Status = transition.CommitRejected
 		case transition.CommitSucceeded:
 			if execution.Notify {
-				sum := sha256.Sum256([]byte("rff-notification:" + execution.ID))
-				execution.NotificationIntentID = "rff-notification:" + hex.EncodeToString(sum[:])
+				execution.NotificationIntentID = notificationID(execution.ID)
 				execution.Status = transition.Notifying
 			} else {
 				execution.Status = transition.Complete
 			}
+
 		}
 		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return err
@@ -63,4 +67,9 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 		}
 		return nil
 	})
+}
+
+func notificationID(executionID string) string {
+	sum := sha256.Sum256([]byte("rff-notification:" + executionID))
+	return "rff-notification:" + hex.EncodeToString(sum[:])
 }
