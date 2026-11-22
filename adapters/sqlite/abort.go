@@ -17,7 +17,7 @@ func (s *Store[EntityID, StateID]) FinishAbort(
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, execution, err := s.interventionExecution(ctx, tx, lease, clock)
+		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -32,7 +32,7 @@ func (s *Store[EntityID, StateID]) FinishAbort(
 			return transition.ErrInvalidHook
 		}
 		execution.Status = transition.Aborted
-		if err := saveIntervention(ctx, tx, lease.ExecutionID, execution); err != nil {
+		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return err
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM rff_active WHERE execution_id = ?`, lease.ExecutionID)

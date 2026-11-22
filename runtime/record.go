@@ -86,30 +86,32 @@ type Request[EntityID comparable, StateID comparable, Event, Input any] struct {
 
 // Execution is the durable accepted transition snapshot.
 type Execution[EntityID comparable, StateID comparable] struct {
-	SchemaVersion        uint
-	ID                   string
-	Entity               EntityID
-	Key                  string
-	Operation            Operation
-	MachineID            string
-	MachineVersion       string
-	Previous             StateID
-	HasPrevious          bool
-	Target               StateID
-	Event                EncodedValue
-	Input                EncodedValue
-	NotificationOverride NotificationOverride
-	Notify               bool
-	Policy               fsm.Policy
-	AcceptedAt           time.Time
-	Deadline             time.Time
-	CycleDeadline        time.Time
-	Controls             []HookControlReceipt
-	Status               Status
-	CommitOperationID    string
-	RecoveryStarted      bool
-	Failure              *fsm.Failure
-	FailureDisposition   fsm.Disposition
+	SchemaVersion             uint
+	ID                        string
+	Entity                    EntityID
+	Key                       string
+	Operation                 Operation
+	MachineID                 string
+	MachineVersion            string
+	Previous                  StateID
+	HasPrevious               bool
+	Target                    StateID
+	Event                     EncodedValue
+	Input                     EncodedValue
+	NotificationOverride      NotificationOverride
+	Notify                    bool
+	Policy                    fsm.Policy
+	AcceptedAt                time.Time
+	Deadline                  time.Time
+	CycleDeadline             time.Time
+	Controls                  []HookControlReceipt
+	Status                    Status
+	CommitOperationID         string
+	CommitReceipt             *CommitReceipt
+	RecoveryStarted           bool
+	RejectionRecoveryDeadline time.Time
+	Failure                   *fsm.Failure
+	FailureDisposition        fsm.Disposition
 }
 
 // EffectiveDeadline is the current control-cycle deadline, or the original

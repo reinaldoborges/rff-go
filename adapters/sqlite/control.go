@@ -52,7 +52,7 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 				return nil
 			}
 		}
-		now, execution, err := s.interventionExecution(ctx, tx, lease, clock)
+		now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -71,24 +71,7 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 			if hasWork && work.Started && !work.Progress.Completed {
 				return transition.ErrBusy
 			}
-			if hasWork {
-				work.History = append(work.History, hookDispatchHistory{
-					ActivityID: work.Progress.ActivityID, Dispatch: work.Progress.Dispatch,
-				})
-			} else {
-				work.Version = 1
-			}
-			failure := *execution.Failure
-			dispatch := transition.HookDispatch{Kind: transition.HookRecover, DueAt: now.UTC(), Failure: &failure}
-			work.Progress.ActivityID = hookID(lease.ExecutionID, dispatch)
-			work.Progress.Dispatch = dispatch
-			work.Progress.AvailableAt = dispatch.DueAt
-			work.Progress.Completed = false
-			work.Progress.Result = transition.HookResult{}
-			work.Started = false
-			work.Owner = ""
-			work.ExpiresAt = time.Time{}
-			work.BudgetUsed = 0
+			prepareRecovery(lease.ExecutionID, &work, hasWork, now, *execution.Failure)
 			if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 				return err
 			}
@@ -137,7 +120,7 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 		} else {
 			execution.Status = transition.Waiting
 		}
-		return saveIntervention(ctx, tx, lease.ExecutionID, execution)
+		return saveExecution(ctx, tx, lease.ExecutionID, execution)
 	})
 	if err != nil {
 		return transition.HookControlReceipt{}, err

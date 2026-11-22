@@ -12,6 +12,7 @@ func resumeFailedHook(executionID string, work *hookWork, now time.Time) error {
 	if last.Result == nil {
 		return transition.ErrInvalidHook
 	}
+
 	if last.Result.Disposition == fsm.DispositionIntervention &&
 		(last.Unknown || last.Kind == transition.HookRetry || last.Kind == transition.HookRecover) {
 		work.AuthorizedRetries = append(work.AuthorizedRetries, hookAttemptRef{

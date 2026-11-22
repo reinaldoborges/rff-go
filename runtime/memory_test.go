@@ -55,8 +55,8 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 	}
 	if next == nil || view.Active || next.Entity != entity || next.Key != key || next.ID == "" || s.ids[next.ID] ||
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
-		next.CommitOperationID != "" || next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
-		!next.CycleDeadline.IsZero() || len(next.Controls) != 0 {
+		next.CommitOperationID != "" || next.CommitReceipt != nil || next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
+		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
 	}
 	if s.fail {
@@ -74,6 +74,14 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.CommitReceipt != nil {
+		receipt := *record.CommitReceipt
+		if receipt.Failure != nil {
+			failure := *receipt.Failure
+			receipt.Failure = &failure
+		}
+		record.CommitReceipt = &receipt
+	}
 	if record.Failure != nil {
 		failure := *record.Failure
 		record.Failure = &failure

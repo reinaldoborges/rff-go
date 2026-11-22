@@ -20,7 +20,7 @@ func (s *Store[EntityID, StateID]) EnterDeadlineIntervention(
 		return transition.ErrInvalidHook
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		now, execution, err := s.interventionExecution(ctx, tx, lease, clock)
+		now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -52,6 +52,6 @@ func (s *Store[EntityID, StateID]) EnterDeadlineIntervention(
 		execution.Failure = &failure
 		execution.FailureDisposition = result.Disposition
 		execution.Status = transition.NeedsIntervention
-		return saveIntervention(ctx, tx, lease.ExecutionID, execution)
+		return saveExecution(ctx, tx, lease.ExecutionID, execution)
 	})
 }

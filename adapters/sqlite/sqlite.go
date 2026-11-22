@@ -120,8 +120,8 @@ func (s *Store[EntityID, StateID]) Accept(
 	}
 	if next == nil || active || next.Entity != entity || next.Key != key || next.ID == "" ||
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
-		next.CommitOperationID != "" || next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
-		!next.CycleDeadline.IsZero() || len(next.Controls) != 0 {
+		next.CommitOperationID != "" || next.CommitReceipt != nil || next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
+		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return result, false, transition.ErrInvalidDecision
 	}
 	var idExists bool

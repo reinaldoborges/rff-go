@@ -11,30 +11,32 @@ import (
 )
 
 type diskRecord struct {
-	SchemaVersion        uint
-	ID                   string
-	Entity               []byte
-	Key                  string
-	Operation            transition.Operation
-	MachineID            string
-	MachineVersion       string
-	Previous             []byte
-	HasPrevious          bool
-	Target               []byte
-	Event                transition.EncodedValue
-	Input                transition.EncodedValue
-	NotificationOverride transition.NotificationOverride
-	Notify               bool
-	Policy               fsm.Policy
-	AcceptedAt           time.Time
-	Deadline             time.Time
-	CycleDeadline        time.Time
-	Controls             []transition.HookControlReceipt
-	Status               transition.Status
-	CommitOperationID    string
-	RecoveryStarted      bool
-	Failure              *fsm.Failure
-	FailureDisposition   fsm.Disposition
+	SchemaVersion             uint
+	ID                        string
+	Entity                    []byte
+	Key                       string
+	Operation                 transition.Operation
+	MachineID                 string
+	MachineVersion            string
+	Previous                  []byte
+	HasPrevious               bool
+	Target                    []byte
+	Event                     transition.EncodedValue
+	Input                     transition.EncodedValue
+	NotificationOverride      transition.NotificationOverride
+	Notify                    bool
+	Policy                    fsm.Policy
+	AcceptedAt                time.Time
+	Deadline                  time.Time
+	CycleDeadline             time.Time
+	Controls                  []transition.HookControlReceipt
+	Status                    transition.Status
+	CommitOperationID         string
+	CommitReceipt             *transition.CommitReceipt
+	RecoveryStarted           bool
+	RejectionRecoveryDeadline time.Time
+	Failure                   *fsm.Failure
+	FailureDisposition        fsm.Disposition
 }
 
 func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[EntityID, StateID], entity []byte) ([]byte, error) {
@@ -56,8 +58,9 @@ func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[Enti
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
 		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
-		Status: record.Status, CommitOperationID: record.CommitOperationID, RecoveryStarted: record.RecoveryStarted,
-		Failure: record.Failure, FailureDisposition: record.FailureDisposition,
+		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
+		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
+		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	})
 }
 
@@ -91,8 +94,9 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
 		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
-		Status: record.Status, CommitOperationID: record.CommitOperationID, RecoveryStarted: record.RecoveryStarted,
-		Failure: record.Failure, FailureDisposition: record.FailureDisposition,
+		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
+		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
+		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	}, nil
 }
 

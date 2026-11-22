@@ -33,6 +33,11 @@ renews their leases while working and reporting, and supports draining.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
 `Coordinator.Status` reports the last scan separately from worker capacity.
+`CommitCoordinator` separately scans commit-pending work against a host-owned
+commit boundary. The host must enforce transition fences and atomically persist
+its final receipt with domain state or definitive rejection; errors leave the
+outcome unknown for later reconciliation. Use the same coordinator owner when
+driving both scans in one process.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -60,8 +65,8 @@ The coordinator can reconcile expired attempts, retry hooks, enter intervention,
 record a commit-pending work-success marker, and finish authorized abort
 recovery. Low-level hook controls must be authorized and audited by the host;
 the typed ingress and authorization integration are not yet implemented.
-Domain commits, automatic rejection recovery, compatibility migration, and
-notifications are not yet implemented.
+The host provides domain commits; automatic rejection recovery is supported.
+Compatibility migration and notifications are not yet implemented.
 
 ```sh
 go test ./adapters/sqlite

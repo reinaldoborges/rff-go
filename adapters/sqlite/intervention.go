@@ -17,7 +17,7 @@ func (s *Store[EntityID, StateID]) EnterHookIntervention(ctx context.Context, le
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		now, execution, err := s.interventionExecution(ctx, tx, lease, clock)
+		now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -62,11 +62,11 @@ func (s *Store[EntityID, StateID]) EnterHookIntervention(ctx context.Context, le
 		execution.Failure = &failure
 		execution.FailureDisposition = lastFailure.Disposition
 		execution.Status = transition.NeedsIntervention
-		return saveIntervention(ctx, tx, lease.ExecutionID, execution)
+		return saveExecution(ctx, tx, lease.ExecutionID, execution)
 	})
 }
 
-func (s *Store[EntityID, StateID]) interventionExecution(
+func (s *Store[EntityID, StateID]) fencedExecution(
 	ctx context.Context, tx *sql.Tx, lease transition.TransitionLease[EntityID], clock func() time.Time,
 ) (time.Time, diskRecord, error) {
 	now := clock()
@@ -79,24 +79,24 @@ func (s *Store[EntityID, StateID]) interventionExecution(
 	}
 	var data []byte
 	if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, lease.ExecutionID).Scan(&data); err != nil {
-		return now, execution, fmt.Errorf("read intervention execution: %w", err)
+		return now, execution, fmt.Errorf("read fenced execution: %w", err)
 	}
 	if err := json.Unmarshal(data, &execution); err != nil {
-		return now, execution, fmt.Errorf("%w: decode intervention execution: %w", ErrUnsupportedSchema, err)
+		return now, execution, fmt.Errorf("%w: decode fenced execution: %w", ErrUnsupportedSchema, err)
 	}
 	if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
-		return now, execution, fmt.Errorf("%w: invalid intervention execution", ErrUnsupportedSchema)
+		return now, execution, fmt.Errorf("%w: invalid fenced execution", ErrUnsupportedSchema)
 	}
 	return now, execution, nil
 }
 
-func saveIntervention(ctx context.Context, tx *sql.Tx, id string, execution diskRecord) error {
+func saveExecution(ctx context.Context, tx *sql.Tx, id string, execution diskRecord) error {
 	data, err := json.Marshal(execution)
 	if err != nil {
-		return fmt.Errorf("encode intervention execution: %w", err)
+		return fmt.Errorf("encode execution: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE rff_executions SET record = ? WHERE id = ?`, data, id); err != nil {
-		return fmt.Errorf("record hook intervention: %w", err)
+		return fmt.Errorf("save execution: %w", err)
 	}
 	return nil
 }
