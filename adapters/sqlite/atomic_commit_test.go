@@ -259,6 +259,21 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 	if _, err := expiringHost.Commit(ctx, fence, transition.Execution[string, string]{}); !errors.Is(err, transition.ErrStaleLease) {
 		t.Fatalf("expired fence committed: %v", err)
 	}
+	commitTime = now
+	rejectingHost := &localCommitHost{
+		store: store, clock: func() time.Time { return commitTime }, deny: true,
+		afterWrite: func() { commitTime = now.Add(time.Hour) },
+	}
+	if _, err := rejectingHost.Commit(ctx, stale, transition.Execution[string, string]{}); !errors.Is(err, transition.ErrStaleLease) || rejectingHost.calls != 0 {
+		t.Fatalf("stale fence reached rejection decision: calls=%d error=%v", rejectingHost.calls, err)
+	}
+	if _, err := rejectingHost.Commit(ctx, fence, transition.Execution[string, string]{}); !errors.Is(err, transition.ErrStaleLease) || rejectingHost.calls != 1 {
+		t.Fatalf("expired fence recorded a rejection: calls=%d error=%v", rejectingHost.calls, err)
+	}
+	pending, err := store.ReadActiveExecution(ctx, "execution")
+	if err != nil || pending.CommitReceipt != nil || pending.Status != transition.Running {
+		t.Fatalf("stale rejection changed the execution: %+v, %v", pending, err)
+	}
 	host.fail = false
 	host.loseReply = true
 	if err := coordinator.Reconcile(ctx); err == nil {
