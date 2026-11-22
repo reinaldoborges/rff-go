@@ -113,6 +113,26 @@ func Run(t *testing.T, newStore func(*testing.T) Store) {
 		if err != nil || !created {
 			t.Fatalf("accept: created=%v error=%v", created, err)
 		}
+		changedOperation := request
+		changedOperation.Operation = transition.Transition
+		changedOperation.Previous, changedOperation.HasPrevious = "open", true
+		changedOperation.Event, changedOperation.HasEvent, changedOperation.EventCodec = "start", true, ref
+		changedVersion := request
+		changedVersion.MachineVersion = "2"
+		changedNotification := request
+		changedNotification.Notification = transition.NotifyEnable
+		for name, changed := range map[string]transition.Request[string, string, string, string]{
+			"operation": changedOperation, "version": changedVersion, "notification": changedNotification,
+		} {
+			if _, _, err := acceptor.Accept(ctx, changed); !errors.Is(err, transition.ErrConflict) {
+				t.Fatalf("changed %s did not conflict: %v", name, err)
+			}
+		}
+		competing := request
+		competing.Key = "other"
+		if _, _, err := acceptor.Accept(ctx, competing); !errors.Is(err, transition.ErrBusy) {
+			t.Fatalf("different active request was not busy: %v", err)
+		}
 		runner, err := transition.NewHookRunner[string, string, string, string](&machines, codecs.Resolve, codecs.Resolve)
 		if err != nil {
 			t.Fatal(err)
