@@ -251,7 +251,9 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 			}
 		}
 		if id == "" {
-			unavailable = errors.Join(transition.ErrNoNotificationActivity, unavailable)
+			if unavailable == nil {
+				unavailable = transition.ErrNoNotificationActivity
+			}
 			return nil
 		}
 		if work.Generation == math.MaxUint64 {

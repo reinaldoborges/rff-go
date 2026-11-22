@@ -100,8 +100,9 @@ func TestIncompatibleNotificationDoesNotBlockOtherDeliveries(t *testing.T) {
 	if err := outbox.CompleteNotification(ctx, delivery.Lease, clock); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := outbox.ClaimNotification(ctx, "delivery", clock, time.Minute); !errors.Is(err, transition.ErrCompatibility) {
-		t.Fatalf("unavailable notification was not reported: %v", err)
+	if _, err := outbox.ClaimNotification(ctx, "delivery", clock, time.Minute); !errors.Is(err, transition.ErrCompatibility) ||
+		errors.Is(err, transition.ErrNoNotificationActivity) {
+		t.Fatalf("unavailable notification was not distinguishable from an empty queue: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
