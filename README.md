@@ -229,3 +229,9 @@ go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLo
 
 These are local checks, not a claim that the full acceptance matrix or CI gate
 has passed.
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+See [third-party notices](THIRD_PARTY_NOTICES.md) when redistributing builds
+that include the SQLite adapter.
