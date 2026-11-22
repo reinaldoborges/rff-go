@@ -197,12 +197,13 @@ original Membership identity after unassignment or removal.
 
 `internal/fixturecontract` provides reusable typed-API checks for invitation,
 membership history, expiry, closure, access, task progression, removal,
-ownership transfer, and operator controls against a fixture implementation.
+ownership transfer, accepted-work invariants, and operator controls against a
+fixture implementation.
 
 Run the CLI and fixture checks, including a real subprocess recovery test, with:
 
 ```sh
-go test ./internal/taskmanager -run 'Test(Domain|Membership|Governance|Operator)FixtureContract'
+go test ./internal/taskmanager -run 'Test.*FixtureContract'
 go test ./cmd/taskmanager ./internal/taskmanager
 go test ./internal/taskmanager -run TestFixtureRecoversExpiryAndNotificationAcrossProcessRestart
 go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLoss
