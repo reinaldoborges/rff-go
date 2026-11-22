@@ -13,6 +13,9 @@ import (
 // RunRetryBudget checks unstarted claim loss and the shared hook-attempt budget.
 func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 	t.Helper()
+	t.Run("failed work and retry preserve selection", func(t *testing.T) {
+		RunRetrySelection(t, newStore)
+	})
 	t.Run("retry schedule exhaustion", func(t *testing.T) {
 		ctx := context.Background()
 		store := newStore(t)
