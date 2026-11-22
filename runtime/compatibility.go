@@ -130,7 +130,8 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 	if err != nil || execution.Compatibility == nil {
 		return err
 	}
-	if execution.CommitOperationID != "" || execution.Status == Notifying || execution.Status == NotificationRepair {
+	if !execution.RecoveryStarted && (execution.CommitOperationID != "" ||
+		execution.Status == Notifying || execution.Status == NotificationRepair) {
 		return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, nil)
 	}
 	progress, err := c.store.ReadHookProgress(ctx, id)

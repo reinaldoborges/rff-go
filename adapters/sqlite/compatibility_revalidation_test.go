@@ -19,6 +19,7 @@ func TestIncompatibleExecutionBlocksWithoutStoppingOthersAndRecovers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Error(err)
@@ -203,4 +204,129 @@ func TestIncompatibleExecutionBlocksWithoutStoppingOthersAndRecovers(t *testing.
 			t.Fatalf("unknown attempt was not counted: progress=%+v error=%v", progress, err)
 		}
 	})
+}
+
+func TestRejectedCommitRecoveryRetainsCompatibilityBlockUntilBehaviorReturns(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "rejected-compatibility.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	now := time.Now().UTC()
+	clock := fixedClock(now)
+	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+			Operation: transition.Initialize, MachineID: "task", MachineVersion: "1", Target: "open",
+			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "string", Version: "1"}, Data: []byte("payload")},
+			Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, claim, clock); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, clock); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.MarkWorkSuccess(ctx, fence, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := fsm.Failure{Code: "rejected"}
+	if err := store.RecordCommitReceipt(ctx, fence, clock, transition.CommitReceipt{
+		ExecutionID: "execution", OperationID: operation, Outcome: transition.CommitDenied, Failure: &failure,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartRejectedRecovery(ctx, fence, clock); err != nil {
+		t.Fatal(err)
+	}
+	var registry fsm.Registry[string, string, string, string]
+	resolve := func(transition.CodecVersion) (transition.Codec[string], error) { return stringValueCodec{}, nil }
+	runner, err := transition.NewHookRunner[string, string, string, string](&registry, resolve, resolve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := transition.NewHookWorker[string, string, string, string](store, runner, transition.WorkerConfig{
+		ID: "worker", Capacity: 1, LeaseTTL: time.Minute, RenewalInterval: time.Second, Clock: transition.SystemWorkerClock{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RunOne(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("missing recovery behavior was not reported: %v", err)
+	}
+	before, err := store.ReadActiveExecution(ctx, "execution")
+	if err != nil || before.Compatibility == nil || before.Compatibility.Component != transition.CompatibilityMachine {
+		t.Fatalf("missing recovery behavior was not recorded: %+v, %v", before, err)
+	}
+	manager, err := transition.NewCompatibilityCoordinator[string, string, string, string](store, runner, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := store.ReadActiveExecution(ctx, "execution")
+	if err != nil || blocked.Compatibility == nil || blocked.Status != transition.Aborting ||
+		!blocked.CycleDeadline.Equal(before.CycleDeadline) {
+		t.Fatalf("missing recovery behavior cleared the block or changed the phase: %+v, %v", blocked, err)
+	}
+	machine, err := fsm.NewMachine(fsm.Config[string, string, string, string]{
+		ID: "task", Version: "1", InitialStates: []string{"open"},
+		Handlers:         map[string]fsm.Handler[string, string, string, string]{"open": fsm.NoopHandler[string, string, string, string]{}},
+		SelectInitial:    func(string) (fsm.Selection[string], error) { return fsm.Selection[string]{}, nil },
+		SelectTransition: func(string, string, string) (fsm.Selection[string], error) { return fsm.Selection[string]{}, nil },
+		ClassifyFailure: func(error) (fsm.Failure, fsm.Disposition) {
+			return fsm.Failure{Code: "failed"}, fsm.DispositionIntervention
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(machine); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RunOne(ctx); err != nil {
+		t.Fatalf("restored recovery could not run: %v", err)
+	}
+	coordinator, err := transition.NewCoordinator[string, string](store, runner, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectExecution(ctx, "execution")
+	if err != nil || inspection.Status != transition.Aborted || inspection.CommitReceipt == nil ||
+		inspection.CommitReceipt.Outcome != transition.CommitDenied {
+		t.Fatalf("recovered rejection did not settle as aborted: %+v, %v", inspection, err)
+	}
 }
