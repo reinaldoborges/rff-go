@@ -103,10 +103,16 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) match(ctx context.Context, e
 	}
 	input, err := resolveCodec(a.inputCodec, original.Input.Codec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	}
 	equal, err := input.Equal(ctx, slices.Clone(original.Input.Data), request.Input)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("%w: input equality: %w", ErrCompatibility, err)
 	}
 	if !equal {
@@ -115,10 +121,16 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) match(ctx context.Context, e
 	if request.Operation == Transition {
 		event, err := resolveCodec(a.eventCodec, original.Event.Codec)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		equal, err = event.Equal(ctx, slices.Clone(original.Event.Data), request.Event)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("%w: event equality: %w", ErrCompatibility, err)
 		}
 		if !equal {
@@ -135,6 +147,9 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 	}
 	inputCodec, err := resolveCodec(a.inputCodec, request.InputCodec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	inputData, err := inputCodec.Encode(ctx, request.Input)
@@ -148,6 +163,9 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 	} else {
 		eventCodec, codecErr := resolveCodec(a.eventCodec, request.EventCodec)
 		if codecErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, codecErr
 		}
 

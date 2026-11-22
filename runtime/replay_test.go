@@ -22,6 +22,40 @@ type acceptanceFixture struct {
 	codecNil    atomic.Bool
 }
 
+type canceledReplayInput struct {
+	intCodec
+	cancel context.CancelFunc
+}
+
+func (c canceledReplayInput) Equal(ctx context.Context, _ []byte, _ int) (bool, error) {
+	c.cancel()
+	return false, ctx.Err()
+}
+
+func TestAcceptanceReplayCancellationIsNotIncompatibility(t *testing.T) {
+	f := newAcceptanceFixture(t)
+	if _, _, err := f.acceptor.Accept(context.Background(), f.request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var registry fsm.Registry[string, state, string, int]
+	acceptor, err := transition.NewAcceptor[string, state, string, int](
+		f.store, &registry,
+		func(transition.CodecVersion) (transition.Codec[int], error) {
+			return canceledReplayInput{cancel: cancel}, nil
+		},
+		func(transition.CodecVersion) (transition.Codec[string], error) { return stringCodec{}, nil },
+		func() (string, error) { return "unexpected", nil }, time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := acceptor.Accept(ctx, f.request); !errors.Is(err, context.Canceled) || errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("canceled replay was reported as incompatibility: %v", err)
+	}
+}
+
 var errInputCodecUnavailable = errors.New("input codec unavailable")
 
 func newAcceptanceFixture(t *testing.T) *acceptanceFixture {
