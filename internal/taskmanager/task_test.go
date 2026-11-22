@@ -503,8 +503,19 @@ func TestTaskAndMembershipWithOverlappingIdentifiersAreIndependent(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
+			var notifications []taskmanager.InvitationNotification
+			if err := fixture.SetNotificationSink(func(_ context.Context, notification taskmanager.InvitationNotification) error {
+				notifications = append(notifications, notification)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
 			if err := fixture.Drive(ctx); err != nil {
 				t.Fatal(err)
+			}
+			if len(notifications) != 1 || notifications[0].MembershipID != "taskmanager-task:task" ||
+				notifications[0].GroupID != "group" || notifications[0].UserID != "invitee" {
+				t.Fatalf("invitation notification lost the membership identity: %+v", notifications)
 			}
 			if replay, err := fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour)); err != nil || replay != invitation {
 				t.Fatalf("invitation replay: %q, %v", replay, err)

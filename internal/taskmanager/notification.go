@@ -2,7 +2,9 @@ package taskmanager
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/reinaldoborges/rff-go/adapters/sqlite"
@@ -43,7 +45,14 @@ func (f *Fixture) driveNotifications(ctx context.Context) error {
 	}
 	worker, err := transition.NewNotificationWorker[string, string](outbox,
 		func(ctx context.Context, delivery transition.NotificationDelivery[string, string]) error {
-			membership, _, _, err := f.readMembership(ctx, delivery.Intent.Entity)
+			// Pre-mapping notification intents retain the original membership ID.
+			membershipID := delivery.Intent.Entity
+			err := f.db.QueryRowContext(ctx, `SELECT domain_id FROM tm_runtime_entities WHERE kind = ? AND entity = ?`,
+				membershipEntityKind, delivery.Intent.Entity).Scan(&membershipID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("resolve notification membership: %w", err)
+			}
+			membership, _, _, err := f.readMembership(ctx, membershipID)
 			if err != nil {
 				return err
 			}

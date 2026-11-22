@@ -2,6 +2,7 @@ package taskmanager_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -75,5 +76,74 @@ func TestInvitationNotificationFailureDoesNotStopExpiryAndRecoversAfterRestart(t
 	}
 	if len(seen) != 2 || seen[0].ID == "" || seen[0].ID != seen[1].ID || seen[1].MembershipID != "membership" {
 		t.Fatalf("notification intent was not redelivered with stable identity: %+v", seen)
+	}
+}
+
+func TestLegacyNotificationSurvivesMembershipIdentityRemapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "legacy-notification.db")
+	fixture, err := taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if fixture != nil {
+			if err := fixture.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture = nil
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE tm_runtime_entities`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture, err = taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Decide(ctx, "invitee", "taskmanager-task:task", "accept", taskmanager.AcceptInvitation); err != nil {
+		t.Fatal(err)
+	}
+	var seen []taskmanager.InvitationNotification
+	if err := fixture.SetNotificationSink(func(_ context.Context, notification taskmanager.InvitationNotification) error {
+		seen = append(seen, notification)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 || seen[0].MembershipID != "taskmanager-task:task" || seen[0].UserID != "invitee" {
+		t.Fatalf("legacy notification did not retain membership identity: %+v", seen)
 	}
 }
