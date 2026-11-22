@@ -79,7 +79,7 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 				return err
 			}
 			if hasWork {
-				fenceMigrationWork(&work, blockTime)
+				fenceHook(&work, blockTime)
 				if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 					return err
 				}
@@ -164,7 +164,7 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 			return err
 		}
 		if hasWork {
-			fenceMigrationWork(&work, decisionTime)
+			fenceHook(&work, decisionTime)
 			if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 				return err
 			}
@@ -184,7 +184,7 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 	return receipt, nil
 }
 
-func fenceMigrationWork(work *hookWork, now time.Time) {
+func fenceHook(work *hookWork, now time.Time) {
 	if work.Started {
 		if !work.Progress.Completed {
 			work.Progress.Attempts[len(work.Progress.Attempts)-1].Unknown = true

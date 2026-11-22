@@ -93,11 +93,16 @@ func (s *Store[EntityID, StateID]) BlockHookCompatibility(
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		work, err := loadClaim(ctx, tx, lease, clock())
+		now := clock()
+		work, err := loadClaim(ctx, tx, lease, now)
 		if err != nil {
 			return err
 		}
-		if work.Started || work.Progress.Completed {
+		if work.Progress.Completed {
+			return transition.ErrInvalidHook
+		}
+		if work.Started && diagnostic.Check != transition.CompatibilityUnknownAttempt ||
+			!work.Started && diagnostic.Check != "" {
 			return transition.ErrInvalidHook
 		}
 		var data []byte
@@ -112,7 +117,7 @@ func (s *Store[EntityID, StateID]) BlockHookCompatibility(
 			return transition.ErrInvalidHook
 		}
 		record.Compatibility = &diagnostic
-		work.Owner, work.ExpiresAt = "", time.Time{}
+		fenceHook(&work, now)
 		if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 			return err
 		}

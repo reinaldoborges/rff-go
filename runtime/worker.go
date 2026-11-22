@@ -277,14 +277,25 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	if err == nil && workCtx.Err() == nil {
 		reportErr = w.store.ReportHook(workCtx, lease, result, w.config.Clock.Now)
 		reported = reportErr == nil
+	} else if workCtx.Err() == nil {
+		var compatibility *CompatibilityError
+		if errors.As(err, &compatibility) {
+			diagnostic := compatibility.Diagnostic
+			diagnostic.Check = CompatibilityUnknownAttempt
+			reportErr = w.store.BlockHookCompatibility(workCtx, lease, diagnostic, w.config.Clock.Now)
+			reported = reportErr == nil
+		}
 	}
 	stopRenewal()
 	renewalErr := <-renewed
 	if reported {
-		return nil
+		return err
 	}
 	if renewalErr != nil {
 		return fmt.Errorf("renew hook lease: %w", renewalErr)
+	}
+	if reportErr != nil {
+		return errors.Join(err, fmt.Errorf("report hook outcome: %w", reportErr))
 	}
 	if err != nil {
 		return err
