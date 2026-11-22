@@ -50,7 +50,14 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 			t.Fatal(err)
 		}
 	}
-	resolve := func(transition.CodecVersion) (transition.Codec[string], error) { return stringCodec{}, nil }
+	originalAvailable := true
+	resolve := func(version transition.CodecVersion) (transition.Codec[string], error) {
+		if version.Name != "input" || version.Version != "1" && version.Version != "2" ||
+			version.Version == "1" && !originalAvailable {
+			return nil, transition.ErrCodecNotFound
+		}
+		return stringCodec{}, nil
+	}
 	ref := transition.CodecVersion{Name: "input", Version: "1"}
 	acceptor, err := transition.NewAcceptor[string, string, string, string](
 		store, &registry, resolve, resolve, func() (string, error) { return "execution", nil }, clock)
@@ -88,7 +95,7 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 			conversions++
 			return transition.MigrationSnapshot[string]{
 				MachineID: "machine", MachineVersion: "2", Target: "open",
-				Input: transition.EncodedValue{Codec: source.Input.Codec, Data: []byte("converted")},
+				Input: transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "2"}, Data: []byte("converted")},
 				Event: source.Event, Policy: source.Policy,
 			}, nil
 		}, func(context.Context, transition.MigrationSource[string], transition.MigrationSnapshot[string]) error {
@@ -161,6 +168,12 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	if _, _, err := acceptor.Accept(ctx, request); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed original request did not conflict: %v", err)
 	}
+	request.Input = "original"
+	originalAvailable = false
+	if _, _, err := acceptor.Accept(ctx, request); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("active replay did not report unavailable original codec: %v", err)
+	}
+	originalAvailable = true
 	allowed = false
 	if _, err := authorized.Migrate(ctx, lease, clock, migration); !errors.Is(err, denied) {
 		t.Fatalf("migration replay bypassed authorization: %v", err)
@@ -172,5 +185,43 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	migration.Parameters = []byte("different")
 	if _, err := authorized.Migrate(ctx, lease, clock, migration); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed migration replay did not conflict: %v", err)
+	}
+	claim, err = store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, claim, clock); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, clock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkWorkSuccess(ctx, lease, clock); err != nil {
+		t.Fatal(err)
+	}
+	config := transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Hour, Clock: clock}
+	commits, err := transition.NewCommitCoordinator[string, string](store, &host{}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commits.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notifications, err := transition.NewNotificationCoordinator[string, string](store, &repairHandoff{available: true}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := notifications.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	request.Input = "original"
+	originalAvailable = false
+	if _, _, err := acceptor.Accept(ctx, request); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("terminal replay did not report unavailable original codec: %v", err)
+	}
+	originalAvailable = true
+	terminal, created, err := acceptor.Accept(ctx, request)
+	if err != nil || created || terminal.ID != original.ID || terminal.Status != transition.Complete || selections != 1 {
+		t.Fatalf("terminal original identity was not preserved: %+v created=%v error=%v", terminal, created, err)
 	}
 }
