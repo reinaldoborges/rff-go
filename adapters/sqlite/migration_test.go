@@ -107,7 +107,26 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	migration := transition.MigrationRequest{ID: "migration", MachineID: "task", MachineVersion: "2", Parameters: []byte("conversion")}
-	if _, err := migrator.Migrate(ctx, fence, clock, migration); !errors.Is(err, verificationFailure) {
+	denied := errors.New("not authorized")
+	allowed := false
+	authorizedMigrator, err := transition.NewAuthorizedMigration[string](migrator, func(_ context.Context, request transition.ControlAuthorization) error {
+		if request.ExecutionID != accepted.ID || request.Action != transition.ControlMigrate ||
+			request.Migration == nil || request.Migration.MachineVersion != "2" {
+			t.Fatalf("incorrect migration authorization: %+v", request)
+		}
+		if !allowed {
+			return denied
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorizedMigrator.Migrate(ctx, fence, clock, migration); !errors.Is(err, denied) || calls != 0 {
+		t.Fatalf("unauthorized migration was not denied: calls=%d error=%v", calls, err)
+	}
+	allowed = true
+	if _, err := authorizedMigrator.Migrate(ctx, fence, clock, migration); !errors.Is(err, verificationFailure) {
 		t.Fatalf("failed domain verification was not reported: %v", err)
 	}
 	blocked, err := store.ReadActiveExecution(ctx, accepted.ID)
@@ -129,7 +148,7 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 		t.Fatalf("revalidation cleared a failed migration without domain verification: execution=%+v error=%v", blocked, err)
 	}
 	verificationBlocked = false
-	receipt, err := migrator.Migrate(ctx, fence, clock, migration)
+	receipt, err := authorizedMigrator.Migrate(ctx, fence, clock, migration)
 	if err != nil || receipt.Request.ID != migration.ID {
 		t.Fatalf("migration failed: receipt=%+v error=%v", receipt, err)
 	}
@@ -149,7 +168,12 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 	if _, _, err := acceptor.Accept(ctx, changed); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed original request did not conflict: %v", err)
 	}
-	if _, err := migrator.Migrate(ctx, fence, clock, migration); err != nil || calls != 2 {
+	allowed = false
+	if _, err := authorizedMigrator.Migrate(ctx, fence, clock, migration); !errors.Is(err, denied) {
+		t.Fatalf("migration replay bypassed authorization: %v", err)
+	}
+	allowed = true
+	if _, err := authorizedMigrator.Migrate(ctx, fence, clock, migration); err != nil || calls != 2 {
 		t.Fatalf("migration replay reran conversion: calls=%d error=%v", calls, err)
 	}
 	migration.Parameters = []byte("different")

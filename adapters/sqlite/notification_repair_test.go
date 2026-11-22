@@ -78,7 +78,21 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 				t.Fatal(err)
 			}
 			control := transition.NotificationControl{ID: "repair", Action: action}
-			if err := store.ApplyNotificationControl(ctx, fence, clock, control); !errors.Is(err, transition.ErrInvalidHook) {
+			denied := errors.New("not authorized")
+			allowed := true
+			controls, err := transition.NewAuthorizedControls[string](store, func(_ context.Context, request transition.ControlAuthorization) error {
+				if request.ExecutionID != "execution" || request.RequestID != control.ID {
+					t.Fatalf("incorrect authorization request: %+v", request)
+				}
+				if !allowed {
+					return denied
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := controls.Notification(ctx, fence, clock, control); !errors.Is(err, transition.ErrInvalidHook) {
 				t.Fatalf("control before repair should be rejected: %v", err)
 			}
 			host := &repairHandoff{}
@@ -98,10 +112,19 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 			}
 			stale := fence
 			stale.Generation++
-			if err := store.ApplyNotificationControl(ctx, stale, clock, control); !errors.Is(err, transition.ErrStaleLease) {
+			if err := controls.Notification(ctx, stale, clock, control); !errors.Is(err, transition.ErrStaleLease) {
 				t.Fatalf("stale repair control should be rejected: %v", err)
 			}
-			if err := store.ApplyNotificationControl(ctx, fence, clock, control); err != nil {
+			allowed = false
+			if err := controls.Notification(ctx, fence, clock, control); !errors.Is(err, denied) {
+				t.Fatalf("unauthorized repair control should be rejected: %v", err)
+			}
+			afterDenial, err := store.InspectExecution(ctx, "execution")
+			if err != nil || afterDenial.Status != transition.NotificationRepair || len(afterDenial.NotificationControls) != 0 {
+				t.Fatalf("denied repair control changed the execution: inspection=%+v error=%v", afterDenial, err)
+			}
+			allowed = true
+			if err := controls.Notification(ctx, fence, clock, control); err != nil {
 				t.Fatal(err)
 			}
 			host.available = true
@@ -122,10 +145,24 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.ApplyNotificationControl(ctx, fence, clock, control); err != nil {
+			controls, err = transition.NewAuthorizedControls[string](store, func(context.Context, transition.ControlAuthorization) error {
+				if !allowed {
+					return denied
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed = false
+			if err := controls.Notification(ctx, fence, clock, control); !errors.Is(err, denied) {
+				t.Fatalf("settled notification replay bypassed authorization: %v", err)
+			}
+			allowed = true
+			if err := controls.Notification(ctx, fence, clock, control); err != nil {
 				t.Fatalf("settled notification control did not replay: %v", err)
 			}
-			if err := store.ApplyNotificationControl(ctx, fence, clock, transition.NotificationControl{ID: control.ID, Action: transition.WaiveNotification}); action == transition.RetryNotification && !errors.Is(err, transition.ErrConflict) {
+			if err := controls.Notification(ctx, fence, clock, transition.NotificationControl{ID: control.ID, Action: transition.WaiveNotification}); action == transition.RetryNotification && !errors.Is(err, transition.ErrConflict) {
 				t.Fatalf("changed control replay did not conflict: %v", err)
 			}
 		})

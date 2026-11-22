@@ -86,8 +86,10 @@ transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
 record a commit-pending work-success marker, and finish authorized abort
-recovery. Low-level hook controls must be authorized and audited by the host;
-the typed ingress and authorization integration are not yet implemented.
+recovery. `AuthorizedControls` and `AuthorizedMigration` call host authorization
+for every request, including replay; hosts own actor attribution and audit.
+The host may use low-level control stores directly only after authorization.
+Typed external-input ingress is not yet implemented.
 The host provides domain commits; automatic rejection recovery is supported.
 `sqlite.NewNotificationOutbox` provides fenced local handoff and durable delivery
 claims, including recovery after claim expiry. Incompatible delivery records
