@@ -540,6 +540,72 @@ func TestTaskAndMembershipWithOverlappingIdentifiersAreIndependent(t *testing.T)
 			if err != nil || membership.Status != taskmanager.Active {
 				t.Fatalf("membership status: %+v, %v", membership, err)
 			}
+			if err := fixture.AssignTask(ctx, "owner", "task", membership.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.RemoveMember(ctx, "owner", membership.ID, "remove-assigned"); !errors.Is(err, taskmanager.ErrConflict) {
+				t.Fatalf("assigned membership removal did not conflict: %v", err)
+			}
+			if err := fixture.AssignTask(ctx, "owner", "task", ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.RemoveMember(ctx, "owner", membership.ID, "remove"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			membership, err = fixture.Membership(ctx, "owner", membership.ID)
+			if err != nil || membership.Status != taskmanager.Removed {
+				t.Fatalf("unassigned membership was not removed: %+v, %v", membership, err)
+			}
 		})
+	}
+}
+
+func TestConcurrentOverlappingTaskAndMembershipAcceptance(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fixture, err := taskmanager.Open(filepath.Join(t.TempDir(), "concurrent.db"), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fixture.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour))
+		results <- err
+	}()
+	go func() {
+		<-start
+		_, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+		results <- err
+	}()
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("independent concurrent acceptance failed: %v", err)
+		}
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Task(ctx, "owner", "task"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Membership(ctx, "owner", "taskmanager-task:task"); err != nil {
+		t.Fatal(err)
 	}
 }
