@@ -184,6 +184,63 @@ func TestIncompatibleTimerDoesNotDelayIndependentExpiry(t *testing.T) {
 	}
 }
 
+func TestIncompatibleTimerReplayDoesNotStopIndependentExpiry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "incompatible-timer-replay.db")
+	fixture, err := taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fixture.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "first", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := now.Add(time.Hour)
+	for _, item := range []struct{ user, membership string }{{"first", "a"}, {"second", "b"}} {
+		if _, err := fixture.Invite(ctx, "owner", "group", item.user, item.membership, "invite-"+item.membership, deadline); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.ScheduleTimer(ctx, "taskmanager-expiry:a", func(*transition.TimerRecord) (*transition.TimerRecord, error) {
+		return &transition.TimerRecord{
+			SchemaVersion: transition.CurrentTimerSchemaVersion,
+			TimerReceipt:  transition.TimerReceipt{ID: "taskmanager-expiry:a", WorkflowID: "a", Deadline: deadline},
+			Event:         transition.EncodedValue{Codec: transition.CodecVersion{Name: "older-event", Version: "1"}, Data: []byte("a")},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("unavailable timer replay was not reported: %v", err)
+	}
+	now = deadline
+	for range 2 {
+		if err := fixture.Drive(ctx); !errors.Is(err, transition.ErrCompatibility) {
+			t.Fatalf("unavailable timer replay was not reported: %v", err)
+		}
+	}
+	membership, err := fixture.Membership(ctx, "owner", "b")
+	if err != nil || membership.Status != taskmanager.Expired {
+		t.Fatalf("unavailable timer replay stopped independent expiry: membership=%+v error=%v", membership, err)
+	}
+}
+
 func TestIncompatiblePendingInputDoesNotStopIndependentInvitation(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)

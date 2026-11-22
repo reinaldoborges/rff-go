@@ -41,29 +41,33 @@ func (f *Fixture) driveExpiryTimers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var compatibilityErr error
 	for _, invitation := range invitations {
 		if _, _, err := scheduler.Schedule(ctx, transition.TimerRequest[string]{
 			ID: expiryTimerID(invitation.id), WorkflowID: invitation.id, Deadline: invitation.deadline,
 			Event: invitation.id, EventCodec: membershipEventCodec,
 		}); err != nil {
-			return fmt.Errorf("schedule invitation expiry: %w", err)
+			scheduleErr := fmt.Errorf("schedule invitation expiry: %w", err)
+			compatibilityErr = errors.Join(compatibilityErr, scheduleErr)
+			if !onlyCompatibility(err) || ctx.Err() != nil {
+				return compatibilityErr
+			}
 		}
 	}
 	worker, err := transition.NewTimerWorker[string](f.store, resolveMembershipEvent, f.deliverExpiry,
 		transition.TimerWorkerConfig{ID: "taskmanager-timer", Clock: fixtureClock{now: f.clock},
 			LeaseTTL: time.Minute, RenewalInterval: 10 * time.Second})
 	if err != nil {
-		return err
+		return errors.Join(compatibilityErr, err)
 	}
 	blocked, err := f.store.BlockedTimers(ctx)
 	if err != nil {
-		return err
+		return errors.Join(compatibilityErr, err)
 	}
 	seen := make(map[string]bool, len(blocked))
 	for _, timer := range blocked {
 		seen[timer.ID] = true
 	}
-	var compatibilityErr error
 	for {
 		err := worker.RunOne(ctx)
 		if errors.Is(err, transition.ErrNoDueTimer) {
