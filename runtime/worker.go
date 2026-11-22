@@ -271,7 +271,27 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 			}
 		}
 	}()
-	result, err := prepared.run(attemptCtx, attempt)
+	type hookOutcome struct {
+		hookErr error
+		err     error
+	}
+	hookDone := make(chan hookOutcome, 1)
+	go func() {
+		hookErr, err := prepared.invoke(attemptCtx, attempt)
+		hookDone <- hookOutcome{hookErr: hookErr, err: err}
+	}()
+	var result HookResult
+	select {
+	case outcome := <-hookDone:
+		err = outcome.err
+		if err == nil {
+			result, err = prepared.finish(attemptCtx, outcome.hookErr)
+		}
+	case <-attemptCtx.Done():
+		result, err = prepared.finish(attemptCtx, nil)
+	case <-workCtx.Done():
+		err = workCtx.Err()
+	}
 	var reportErr error
 	reported := false
 	if err == nil && workCtx.Err() == nil {

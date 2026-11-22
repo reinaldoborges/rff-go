@@ -165,14 +165,22 @@ func validateHookAttempt(executionID string, attempt fsm.AttemptMetadata) error 
 }
 
 func (p preparedHook[EntityID, StateID, Event, Input]) run(ctx context.Context, attempt fsm.AttemptMetadata) (HookResult, error) {
-	if err := validateHookAttempt(p.execution.ID, attempt); err != nil {
+	hookErr, err := p.invoke(ctx, attempt)
+	if err != nil {
 		return HookResult{}, err
+	}
+	return p.finish(ctx, hookErr)
+}
+
+func (p preparedHook[EntityID, StateID, Event, Input]) invoke(ctx context.Context, attempt fsm.AttemptMetadata) (error, error) {
+	if err := validateHookAttempt(p.execution.ID, attempt); err != nil {
+		return nil, err
 	}
 	hookContext, err := fsm.NewExecutionContext(
 		p.execution.Entity, p.previous, p.execution.Target, p.event, p.input, p.execution.Key, attempt,
 	)
 	if err != nil {
-		return HookResult{}, fmt.Errorf("%w: %w", ErrInvalidHook, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidHook, err)
 	}
 	if ctx.Err() == nil {
 		switch p.kind {
@@ -186,6 +194,10 @@ func (p preparedHook[EntityID, StateID, Event, Input]) run(ctx context.Context, 
 			err = p.handler.Recover(ctx, hookContext, p.failure)
 		}
 	}
+	return err, nil
+}
+
+func (p preparedHook[EntityID, StateID, Event, Input]) finish(ctx context.Context, err error) (HookResult, error) {
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return HookResult{}, context.Canceled
 	}

@@ -32,6 +32,9 @@ persist hook outcomes.
 
 `HookWorker` claims hook activities through a host-injected activity store,
 renews their leases while working and reporting, and supports draining.
+An attempt timeout is reported without waiting for a hook that ignores context
+cancellation; such a hook may continue external side effects, which the host
+must make idempotent.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
 `Coordinator.Status` reports the last scan separately from worker capacity.
