@@ -87,10 +87,13 @@ func TestCoordinatorClassifiesExpiredStartedWork(t *testing.T) {
 	if _, err := store.StartHook(ctx, retry, clock); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReportHook(ctx, retry, transition.HookResult{
-		Failure: fsm.Failure{Code: "retry-failed"}, Disposition: fsm.DispositionRetry,
-	}, clock); err != nil {
+	now = now.Add(time.Minute)
+	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
+	}
+	progress, err = store.ReadHookProgress(ctx, "execution")
+	if err != nil || len(progress.Attempts) != 2 || !progress.Attempts[1].Unknown {
+		t.Fatalf("lost Retry was not classified as unknown: progress=%+v error=%v", progress, err)
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)

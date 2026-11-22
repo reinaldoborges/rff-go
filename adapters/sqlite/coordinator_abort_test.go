@@ -25,7 +25,7 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 		}
 	})
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	clock := fixedClock(now)
+	clock := func() time.Time { return now }
 	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
@@ -94,13 +94,31 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention}); err != nil {
 		t.Fatal(err)
 	}
-	retried, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	retried, err := store.ClaimHook(ctx, "worker", clock, time.Second)
 	if err != nil || retried.ActivityID != recovery.ActivityID {
 		t.Fatalf("recovery retry changed identity: lease=%+v error=%v", retried, err)
 	}
 	attempt, err := store.StartHook(ctx, retried, clock)
 	if err != nil || attempt.Attempt.Number != 3 {
 		t.Fatalf("recovery retry did not retain history: attempt=%+v error=%v", attempt, err)
+	}
+	now = now.Add(time.Second)
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-unknown-recovery", Action: transition.RetryIntervention}); err != nil {
+		t.Fatal(err)
+	}
+	retried, err = store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil || retried.ActivityID != recovery.ActivityID {
+		t.Fatalf("unknown recovery did not retain identity: lease=%+v error=%v", retried, err)
+	}
+	attempt, err = store.StartHook(ctx, retried, clock)
+	if err != nil || attempt.Attempt.Number != 4 {
+		t.Fatalf("unknown recovery did not retain attempt history: attempt=%+v error=%v", attempt, err)
 	}
 	if err := store.ReportHook(ctx, retried, transition.HookResult{Success: true}, clock); err != nil {
 		t.Fatal(err)
