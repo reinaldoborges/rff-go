@@ -2,6 +2,7 @@ package taskmanager_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -19,10 +20,38 @@ func (notificationControlClassifier) ClassifyHookFailure(transition.Execution[st
 	return transition.HookResult{}, errors.New("unexpected hook failure")
 }
 
-type notificationControlCommit struct{}
+type notificationControlCommit struct {
+	db       *sql.DB
+	deadline time.Time
+}
 
-func (notificationControlCommit) Commit(_ context.Context, _ transition.TransitionLease[string], execution transition.Execution[string, string]) (transition.CommitReceipt, error) {
-	return transition.CommitReceipt{ExecutionID: execution.ID, OperationID: execution.CommitOperationID, Outcome: transition.CommitSucceeded}, nil
+func (h notificationControlCommit) Commit(ctx context.Context, _ transition.TransitionLease[string], execution transition.Execution[string, string]) (transition.CommitReceipt, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return transition.CommitReceipt{}, err
+	}
+	defer tx.Rollback()
+	var operation string
+	err = tx.QueryRowContext(ctx, `SELECT operation_id FROM test_notification_commits WHERE execution_id = ?`, execution.ID).Scan(&operation)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tm_memberships (id, group_id, user_id, status, deadline, reason)
+			VALUES ('membership', 'group', 'invitee', 'Invited', ?, '')`, h.deadline.Format(time.RFC3339Nano)); err != nil {
+			return transition.CommitReceipt{}, err
+		}
+		operation = execution.CommitOperationID
+		if _, err := tx.ExecContext(ctx, `INSERT INTO test_notification_commits (execution_id, operation_id) VALUES (?, ?)`, execution.ID, operation); err != nil {
+			return transition.CommitReceipt{}, err
+		}
+	} else if err != nil {
+		return transition.CommitReceipt{}, err
+	}
+	if operation != execution.CommitOperationID {
+		return transition.CommitReceipt{}, errors.New("commit operation changed")
+	}
+	if err := tx.Commit(); err != nil {
+		return transition.CommitReceipt{}, err
+	}
+	return transition.CommitReceipt{ExecutionID: execution.ID, OperationID: operation, Outcome: transition.CommitSucceeded}, nil
 }
 
 type notificationControlFailure struct{}
@@ -43,8 +72,10 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() {
-				if err := fixture.Close(); err != nil {
-					t.Error(err)
+				if fixture != nil {
+					if err := fixture.Close(); err != nil {
+						t.Error(err)
+					}
 				}
 			})
 			if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
@@ -90,7 +121,19 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 			if err := coordinator.Reconcile(ctx); err != nil {
 				t.Fatal(err)
 			}
-			commits, err := transition.NewCommitCoordinator[string, string](store, notificationControlCommit{}, config)
+			db, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if _, err := db.ExecContext(ctx, `CREATE TABLE test_notification_commits (execution_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL)`); err != nil {
+				t.Fatal(err)
+			}
+			commits, err := transition.NewCommitCoordinator[string, string](store, notificationControlCommit{db: db, deadline: now.Add(time.Hour)}, config)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -108,6 +151,13 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 			if err != nil || record.Status != transition.NotificationRepair {
 				t.Fatalf("failed handoff did not enter repair: %+v, %v", record, err)
 			}
+			if err := fixture.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fixture, err = taskmanager.Open(path, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := fixture.ControlExecution(ctx, "owner", id, "repair", action); !errors.Is(err, taskmanager.ErrDenied) {
 				t.Fatalf("owner was allowed notification control: %v", err)
 			}
@@ -118,6 +168,13 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 			if err := fixture.ControlExecution(ctx, "operator", id, "repair", action); err != nil {
 				t.Fatal(err)
 			}
+			var delivered []taskmanager.InvitationNotification
+			if err := fixture.SetNotificationSink(func(_ context.Context, notification taskmanager.InvitationNotification) error {
+				delivered = append(delivered, notification)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
 			if err := fixture.Drive(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -125,17 +182,16 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 			if err != nil || record.Status != transition.Complete {
 				t.Fatalf("authorized notification control did not settle: %+v, %v", record, err)
 			}
-			outbox, err := sqlite.NewNotificationOutbox(store, clock)
-			if err != nil {
-				t.Fatal(err)
+			membership, err := fixture.Membership(ctx, "owner", "membership")
+			if err != nil || membership.Status != taskmanager.Invited || !membership.Deadline.Equal(now.Add(time.Hour)) {
+				t.Fatalf("notification repair changed committed membership: %+v, %v", membership, err)
 			}
-			delivery, err := outbox.ClaimNotification(ctx, "delivery", clock, time.Minute)
 			if action == transition.ControlNotificationRetry {
-				if err != nil || delivery.Intent.ExecutionID != id {
-					t.Fatalf("retry did not hand off notification: %+v, %v", delivery, err)
+				if len(delivered) != 1 || delivered[0].MembershipID != membership.ID || delivered[0].ID == "" {
+					t.Fatalf("retry did not deliver notification: %+v", delivered)
 				}
-			} else if !errors.Is(err, transition.ErrNoNotificationActivity) {
-				t.Fatalf("waiver created notification work: %+v, %v", delivery, err)
+			} else if len(delivered) != 0 {
+				t.Fatalf("waiver delivered notification: %+v", delivered)
 			}
 			if err := fixture.ControlExecution(ctx, "operator", id, "repair", action); err != nil {
 				t.Fatalf("notification control did not replay: %v", err)
