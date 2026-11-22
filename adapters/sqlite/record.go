@@ -82,17 +82,23 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 	}
 	entity, err := s.entityCodec.Decode(record.Entity)
 	if err != nil {
-		return transition.Execution[EntityID, StateID]{}, fmt.Errorf("%w: decode entity: %w", transition.ErrCompatibility, err)
+		return transition.Execution[EntityID, StateID]{}, transition.NewCompatibilityError(transition.CompatibilityDiagnostic{
+			Component: transition.CompatibilityEntity, Name: record.MachineID, Version: record.MachineVersion,
+		}, err)
 	}
 	target, err := s.stateCodec.Decode(record.Target)
 	if err != nil {
-		return transition.Execution[EntityID, StateID]{}, fmt.Errorf("%w: decode target: %w", transition.ErrCompatibility, err)
+		return transition.Execution[EntityID, StateID]{}, transition.NewCompatibilityError(transition.CompatibilityDiagnostic{
+			Component: transition.CompatibilityState, Name: record.MachineID, Version: record.MachineVersion,
+		}, err)
 	}
 	var previous StateID
 	if record.HasPrevious {
 		previous, err = s.stateCodec.Decode(record.Previous)
 		if err != nil {
-			return transition.Execution[EntityID, StateID]{}, fmt.Errorf("%w: decode source: %w", transition.ErrCompatibility, err)
+			return transition.Execution[EntityID, StateID]{}, transition.NewCompatibilityError(transition.CompatibilityDiagnostic{
+				Component: transition.CompatibilityState, Name: record.MachineID, Version: record.MachineVersion,
+			}, err)
 		}
 	}
 	return transition.Execution[EntityID, StateID]{

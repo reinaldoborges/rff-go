@@ -173,20 +173,14 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	}
 	execution, call, err := w.store.InspectHook(claimCtx, lease, w.config.Clock.Now)
 	if err != nil {
-		return err
+		return w.recordCompatibility(claimCtx, lease, err)
 	}
 	if execution.ID != lease.ExecutionID {
 		return fmt.Errorf("%w: execution does not match claim", ErrInvalidHook)
 	}
 	prepared, err := w.runner.prepare(claimCtx, execution, call)
 	if err != nil {
-		var compatibility *CompatibilityError
-		if errors.As(err, &compatibility) {
-			if blockErr := w.store.BlockHookCompatibility(claimCtx, lease, compatibility.Diagnostic, w.config.Clock.Now); blockErr != nil {
-				return errors.Join(err, fmt.Errorf("record compatibility block: %w", blockErr))
-			}
-		}
-		return err
+		return w.recordCompatibility(claimCtx, lease, err)
 	}
 	deadline := execution.EffectiveDeadline()
 	if execution.Policy.AttemptTimeout <= 0 || deadline.IsZero() {
@@ -299,6 +293,16 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 		return err
 	}
 	return reportErr
+}
+
+func (w *HookWorker[EntityID, StateID, Event, Input]) recordCompatibility(ctx context.Context, lease HookLease, err error) error {
+	var compatibility *CompatibilityError
+	if errors.As(err, &compatibility) {
+		if blockErr := w.store.BlockHookCompatibility(ctx, lease, compatibility.Diagnostic, w.config.Clock.Now); blockErr != nil {
+			return errors.Join(err, fmt.Errorf("record compatibility block: %w", blockErr))
+		}
+	}
+	return err
 }
 
 // Shutdown stops claims and drains work until ctx ends, then cancels work.

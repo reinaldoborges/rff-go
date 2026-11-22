@@ -18,6 +18,8 @@ const (
 	CompatibilityHandler    CompatibilityComponent = "handler"
 	CompatibilityInputCodec CompatibilityComponent = "input-codec"
 	CompatibilityEventCodec CompatibilityComponent = "event-codec"
+	CompatibilityEntity     CompatibilityComponent = "entity"
+	CompatibilityState      CompatibilityComponent = "state"
 )
 
 // CompatibilityDiagnostic contains safe identity data, never input or raw errors.
@@ -55,7 +57,12 @@ func (e *CompatibilityError) Unwrap() []error {
 }
 
 func compatibilityError(component CompatibilityComponent, name, version string, cause error) error {
-	return &CompatibilityError{Diagnostic: CompatibilityDiagnostic{Component: component, Name: name, Version: version}, cause: cause}
+	return NewCompatibilityError(CompatibilityDiagnostic{Component: component, Name: name, Version: version}, cause)
+}
+
+// NewCompatibilityError preserves a cause while exposing only the safe diagnostic.
+func NewCompatibilityError(diagnostic CompatibilityDiagnostic, cause error) *CompatibilityError {
+	return &CompatibilityError{Diagnostic: diagnostic, cause: cause}
 }
 
 // CompatibilityStore provides fenced revalidation of persisted diagnostics.

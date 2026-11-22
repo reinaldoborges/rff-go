@@ -4,11 +4,32 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+// ReadCompatibility inspects a diagnostic without decoding application state.
+func (s *Store[EntityID, StateID]) ReadCompatibility(ctx context.Context, id string) (*transition.CompatibilityDiagnostic, error) {
+	var data []byte
+	err := s.db.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, id).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, transition.ErrExecutionNotActive
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read compatibility diagnostic: %w", err)
+	}
+	var record diskRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.SchemaVersion != transition.CurrentSchemaVersion || record.ID != id {
+		return nil, fmt.Errorf("%w: invalid compatibility execution", ErrUnsupportedSchema)
+	}
+	if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
+		return nil, fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
+	}
+	return record.Compatibility, nil
+}
 
 func validDiagnostic(record diskRecord, diagnostic transition.CompatibilityDiagnostic) bool {
 	if diagnostic.Name == "" || diagnostic.Version == "" {
@@ -18,7 +39,8 @@ func validDiagnostic(record diskRecord, diagnostic transition.CompatibilityDiagn
 		return false
 	}
 	switch diagnostic.Component {
-	case transition.CompatibilityMachine, transition.CompatibilityClassifier, transition.CompatibilityHandler:
+	case transition.CompatibilityMachine, transition.CompatibilityClassifier, transition.CompatibilityHandler,
+		transition.CompatibilityEntity, transition.CompatibilityState:
 		return diagnostic.Name == record.MachineID && diagnostic.Version == record.MachineVersion
 	case transition.CompatibilityInputCodec:
 		return diagnostic.Name == record.Input.Codec.Name && diagnostic.Version == record.Input.Codec.Version

@@ -50,6 +50,8 @@ When a worker cannot rehydrate a pinned hook before starting it, the adapter
 persists a safe compatibility diagnostic without consuming an attempt.
 `CompatibilityCoordinator` revalidates these blocks after behavior is restored;
 the host must schedule that scan and use the same coordinator owner.
+SQLite's `ReadCompatibility` can inspect a diagnostic even when an identifier
+or state value cannot be decoded.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
