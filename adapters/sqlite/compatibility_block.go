@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -57,6 +58,19 @@ func (s *Store[EntityID, StateID]) BlockUnreadableExecution(ctx context.Context,
 		var compatibility *transition.CompatibilityError
 		if !errors.As(err, &compatibility) || !validDiagnostic(record, compatibility.Diagnostic) {
 			return err
+		}
+		var generation int64
+		err = tx.QueryRowContext(ctx, `SELECT generation FROM rff_transition_leases WHERE execution_id = ?`, id).Scan(&generation)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read unreadable execution fence: %w", err)
+		}
+		if err == nil {
+			if generation <= 0 || generation == math.MaxInt64 {
+				return fmt.Errorf("%w: unreadable execution fence cannot advance", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_transition_leases SET generation = ? WHERE execution_id = ?`, generation+1, id); err != nil {
+				return fmt.Errorf("fence unreadable execution: %w", err)
+			}
 		}
 		record.Compatibility = &compatibility.Diagnostic
 		return saveExecution(ctx, tx, id, record)

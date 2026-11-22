@@ -128,7 +128,7 @@ func (o *NotificationOutbox[EntityID, StateID]) Handoff(
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read notification work: %w", err)
 		}
-		now, record, err := o.store.fencedExecution(ctx, tx, lease, o.clock)
+		now, record, err := o.store.fencedExecutionForProgress(ctx, tx, lease, o.clock)
 		if err != nil {
 			return err
 		}

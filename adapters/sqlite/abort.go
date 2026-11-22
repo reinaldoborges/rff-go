@@ -16,7 +16,7 @@ func (s *Store[EntityID, StateID]) FinishAbort(
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		_, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}

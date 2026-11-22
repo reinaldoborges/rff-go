@@ -19,7 +19,7 @@ func (s *Store[EntityID, StateID]) CompleteNotificationHandoff(
 		return transition.ErrInvalidHook
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		_, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}

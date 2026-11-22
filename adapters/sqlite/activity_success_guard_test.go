@@ -27,7 +27,7 @@ func TestDurableWorkSuccessCannotBeDispatchedAgain(t *testing.T) {
 	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
-			Entity: "entity", Key: "key", Operation: transition.Initialize, Status: transition.Waiting,
+			Entity: "entity", Key: "key", Operation: transition.Initialize, Status: transition.Waiting, MachineID: "task", MachineVersion: "1",
 			Deadline: now.Add(time.Hour), Policy: fsm.Policy{MaxAttempts: 3, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
 		}, nil
 	})
@@ -56,6 +56,16 @@ func TestDurableWorkSuccessCannotBeDispatchedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, fixedClock(now)); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := transition.CompatibilityDiagnostic{Component: transition.CompatibilityMachine, Name: "task", Version: "1"}
+	if err := store.BlockExecutionCompatibility(ctx, fence, fixedClock(now), diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkWorkSuccess(ctx, fence, fixedClock(now)); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("compatibility block did not stop work settlement: %v", err)
+	}
+	if err := store.RevalidateCompatibility(ctx, fence, fixedClock(now), diagnostic, nil); err != nil {
 		t.Fatal(err)
 	}
 	stale := fence

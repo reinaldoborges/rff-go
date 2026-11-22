@@ -152,6 +152,9 @@ func (s *Store[EntityID, StateID]) StartHook(ctx context.Context, lease transiti
 		if work.Progress.Completed {
 			return transition.ErrStaleActivityLease
 		}
+		if err := ensureCompatibleExecution(ctx, tx, lease.ExecutionID); err != nil {
+			return err
+		}
 		if work.Started {
 			last := work.Progress.Attempts[len(work.Progress.Attempts)-1]
 			started = transition.StartedHook{Attempt: last.Metadata, StartedAt: last.StartedAt}

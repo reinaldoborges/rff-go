@@ -183,15 +183,3 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 	}
 	return receipt, nil
 }
-
-func fenceHook(work *hookWork, now time.Time) {
-	if work.Started {
-		if !work.Progress.Completed {
-			work.Progress.Attempts[len(work.Progress.Attempts)-1].Unknown = true
-			work.FencedUnknown = true
-		}
-		work.ExpiresAt = now.UTC()
-		return
-	}
-	work.Owner, work.ExpiresAt = "", time.Time{}
-}

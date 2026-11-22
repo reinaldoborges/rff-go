@@ -17,7 +17,7 @@ func (s *Store[EntityID, StateID]) EnterHookIntervention(ctx context.Context, le
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		now, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -86,6 +86,19 @@ func (s *Store[EntityID, StateID]) fencedExecution(
 	}
 	if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
 		return now, execution, fmt.Errorf("%w: invalid fenced execution", ErrUnsupportedSchema)
+	}
+	return now, execution, nil
+}
+
+func (s *Store[EntityID, StateID]) fencedExecutionForProgress(
+	ctx context.Context, tx *sql.Tx, lease transition.TransitionLease[EntityID], clock func() time.Time,
+) (time.Time, diskRecord, error) {
+	now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+	if err != nil {
+		return now, execution, err
+	}
+	if execution.Compatibility != nil {
+		return now, execution, transition.ErrCompatibility
 	}
 	return now, execution, nil
 }

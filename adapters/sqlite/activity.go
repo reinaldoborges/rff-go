@@ -46,6 +46,18 @@ type hookAttemptRef struct {
 	Generation uint64
 }
 
+func fenceHook(work *hookWork, now time.Time) {
+	if work.Started {
+		if !work.Progress.Completed {
+			work.Progress.Attempts[len(work.Progress.Attempts)-1].Unknown = true
+			work.FencedUnknown = true
+		}
+		work.ExpiresAt = now.UTC()
+		return
+	}
+	work.Owner, work.ExpiresAt = "", time.Time{}
+}
+
 func hookAttemptKey(id string, generation uint64) string {
 	return id + ":" + strconv.FormatUint(generation, 10)
 }
@@ -307,6 +319,21 @@ func equalDispatch(a, b transition.HookDispatch) bool {
 	return a.Failure == nil || *a.Failure == *b.Failure
 }
 
+func ensureCompatibleExecution(ctx context.Context, tx *sql.Tx, id string) error {
+	var data []byte
+	if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, id).Scan(&data); err != nil {
+		return fmt.Errorf("read execution compatibility: %w", err)
+	}
+	var execution diskRecord
+	if err := json.Unmarshal(data, &execution); err != nil || execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != id {
+		return fmt.Errorf("%w: invalid execution compatibility", ErrUnsupportedSchema)
+	}
+	if execution.Compatibility != nil {
+		return transition.ErrCompatibility
+	}
+	return nil
+}
+
 // DispatchHook durably schedules a logical hook under the current transition fence.
 func (s *Store[EntityID, StateID]) DispatchHook(ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time, dispatch transition.HookDispatch) (string, error) {
 	if clock == nil || !validDispatch(dispatch) {
@@ -360,6 +387,9 @@ func (s *Store[EntityID, StateID]) DispatchHook(ctx context.Context, lease trans
 		}
 		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
 			return fmt.Errorf("%w: invalid dispatch execution", ErrUnsupportedSchema)
+		}
+		if execution.Compatibility != nil {
+			return transition.ErrCompatibility
 		}
 		if execution.Operation != transition.Initialize && execution.Operation != transition.Transition ||
 			(dispatch.Kind == transition.HookEnter && execution.Operation != transition.Initialize) ||
@@ -493,6 +523,9 @@ func (s *Store[EntityID, StateID]) ResolveUnknownHook(
 				return transition.ErrConflict
 			}
 		}
+		if err := ensureCompatibleExecution(ctx, tx, lease.ExecutionID); err != nil {
+			return err
+		}
 		if work.Progress.ActivityID != activityID || uint64(work.Generation) != generation ||
 			!work.Started || work.Progress.Completed {
 			return transition.ErrStaleActivityLease
@@ -538,6 +571,9 @@ func (s *Store[EntityID, StateID]) RedeliverHook(
 				}
 				return transition.ErrConflict
 			}
+		}
+		if err := ensureCompatibleExecution(ctx, tx, lease.ExecutionID); err != nil {
+			return err
 		}
 		var failed *transition.HookAttempt
 		for i := range work.Progress.Attempts {
@@ -669,6 +705,9 @@ func (s *Store[EntityID, StateID]) MarkWorkSuccess(ctx context.Context, lease tr
 		if execution.CommitOperationID != "" {
 			operationID = execution.CommitOperationID
 			return nil
+		}
+		if execution.Compatibility != nil {
+			return transition.ErrCompatibility
 		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)
 		if err != nil {

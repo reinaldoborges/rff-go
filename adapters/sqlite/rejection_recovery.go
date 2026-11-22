@@ -16,7 +16,7 @@ func (s *Store[EntityID, StateID]) StartRejectedRecovery(
 		return transition.ErrInvalidLease
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		now, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		now, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}

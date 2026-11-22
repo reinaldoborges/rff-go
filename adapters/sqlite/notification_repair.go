@@ -20,7 +20,7 @@ func (s *Store[EntityID, StateID]) EnterNotificationRepair(
 		return transition.ErrInvalidHook
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		_, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -70,6 +70,9 @@ func (s *Store[EntityID, StateID]) ApplyNotificationControl(
 		if execution.Status != transition.NotificationRepair || execution.NotificationFailure == nil ||
 			execution.CommitReceipt == nil || execution.CommitReceipt.Outcome != transition.CommitSucceeded {
 			return transition.ErrInvalidHook
+		}
+		if execution.Compatibility != nil {
+			return transition.ErrCompatibility
 		}
 		execution.NotificationControls = append(execution.NotificationControls, transition.NotificationControlReceipt{
 			Control: control, AcceptedAt: now.UTC(), Failure: *execution.NotificationFailure,

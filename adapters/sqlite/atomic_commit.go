@@ -36,7 +36,7 @@ func (s *Store[EntityID, StateID]) CommitAtomic(
 			receipt = *stored.CommitReceipt
 			return nil
 		}
-		_, stored, err = s.fencedExecution(ctx, tx, lease, clock)
+		_, stored, err = s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}

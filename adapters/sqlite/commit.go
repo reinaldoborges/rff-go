@@ -39,7 +39,7 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			}
 			return transition.ErrConflict
 		}
-		_, execution, err := s.fencedExecution(ctx, tx, lease, clock)
+		_, execution, err := s.fencedExecutionForProgress(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}

@@ -39,6 +39,10 @@ func TestCoordinatorRecordsUndecodableWaitingExecution(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	oldFence, err := store.AcquireTransitionLease(ctx, "a", "a", "coordinator", time.Now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +62,9 @@ func TestCoordinatorRecordsUndecodableWaitingExecution(t *testing.T) {
 	diagnostic, err := store.ReadCompatibility(ctx, "a")
 	if err != nil || diagnostic == nil || diagnostic.Component != transition.CompatibilityState {
 		t.Fatalf("undecodable execution has no safe diagnostic: diagnostic=%+v error=%v", diagnostic, err)
+	}
+	if _, err := store.RenewTransitionLease(ctx, oldFence, time.Now, time.Hour); !errors.Is(err, transition.ErrStaleLease) {
+		t.Fatalf("unreadable execution did not fence its old coordinator: %v", err)
 	}
 	if _, err := store.ReadHookProgress(ctx, "b"); err != nil {
 		t.Fatalf("compatible execution was not dispatched: %v", err)
