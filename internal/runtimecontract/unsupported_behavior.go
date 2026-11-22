@@ -10,11 +10,23 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+type compatibilityHandler struct {
+	handler
+}
+
+func (h compatibilityHandler) Transition(_ context.Context, input fsm.ExecutionContext[string, string, string, string]) error {
+	if input.Input() != "payload" {
+		return errors.New("wrong rehydrated input")
+	}
+	*h.calls++
+	return nil
+}
+
 // RunUnsupportedBehavior checks isolation and restoration of pinned dependencies.
 func RunUnsupportedBehavior(t *testing.T, newStore func(*testing.T) CompatibilityStore) {
 	t.Helper()
 	for _, missing := range []transition.CompatibilityComponent{
-		transition.CompatibilityHandler, transition.CompatibilityClassifier, transition.CompatibilityInputCodec,
+		transition.CompatibilityHandler, transition.CompatibilityClassifier, transition.CompatibilityInputCodec, transition.CompatibilityEventCodec,
 	} {
 		t.Run(string(missing), func(t *testing.T) {
 			ctx := context.Background()
@@ -28,13 +40,18 @@ func RunUnsupportedBehavior(t *testing.T, newStore func(*testing.T) Compatibilit
 			}
 			for _, item := range []struct{ id, version, target string }{{"a", "1", target}, {"b", "2", "open"}} {
 				_, _, err := store.Accept(ctx, item.id, "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
-					return &transition.Execution[string, string]{
+					execution := &transition.Execution[string, string]{
 						SchemaVersion: transition.CurrentSchemaVersion, ID: item.id, Entity: item.id, Key: "key",
 						Operation: transition.Initialize, MachineID: "machine", MachineVersion: item.version, Target: item.target,
 						Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: item.version}, Data: []byte("payload")},
 						Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
 						Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
-					}, nil
+					}
+					if missing == transition.CompatibilityEventCodec && item.id == "a" {
+						execution.Operation, execution.Previous, execution.HasPrevious = transition.Transition, "open", true
+						execution.Event = transition.EncodedValue{Codec: transition.CodecVersion{Name: "event", Version: "1"}, Data: []byte("start")}
+					}
+					return execution, nil
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -43,13 +60,19 @@ func RunUnsupportedBehavior(t *testing.T, newStore func(*testing.T) Compatibilit
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := store.DispatchHook(ctx, lease, clock.Now, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+				kind := transition.HookEnter
+				if missing == transition.CompatibilityEventCodec && item.id == "a" {
+					kind = transition.HookTransition
+				}
+				if _, err := store.DispatchHook(ctx, lease, clock.Now, transition.HookDispatch{Kind: kind, DueAt: now}); err != nil {
 					t.Fatal(err)
 				}
 			}
 			available := false
 			resolve := func(ref transition.CodecVersion) (transition.Codec[string], error) {
-				if missing == transition.CompatibilityInputCodec && ref.Version == "1" && !available {
+				if !available && ref.Version == "1" &&
+					(missing == transition.CompatibilityInputCodec && ref.Name == "input" ||
+						missing == transition.CompatibilityEventCodec && ref.Name == "event") {
 					return nil, transition.ErrCodecNotFound
 				}
 				return stringCodec{}, nil
@@ -58,9 +81,9 @@ func RunUnsupportedBehavior(t *testing.T, newStore func(*testing.T) Compatibilit
 				t.Helper()
 				var registry fsm.Registry[string, string, string, string]
 				for _, version := range []string{"1", "2"} {
-					handlers := map[string]fsm.Handler[string, string, string, string]{"open": handler{calls: &calls}}
+					handlers := map[string]fsm.Handler[string, string, string, string]{"open": compatibilityHandler{handler{calls: &calls}}}
 					if restored || missing != transition.CompatibilityHandler || version != "1" {
-						handlers["missing"] = handler{calls: &calls}
+						handlers["missing"] = compatibilityHandler{handler{calls: &calls}}
 					}
 					classify := func(error) (fsm.Failure, fsm.Disposition) {
 						return fsm.Failure{Code: "failed"}, fsm.DispositionIntervention
