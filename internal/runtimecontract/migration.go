@@ -112,6 +112,7 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 				selections++
 				return fsm.Selection[string]{Target: "open", Policy: fsm.Policy{
 					MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
+					RetryDelays: []time.Duration{time.Second, 5 * time.Second},
 				}}, nil
 			},
 			SelectTransition: func(string, string, string) (fsm.Selection[string], error) {
