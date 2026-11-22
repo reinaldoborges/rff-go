@@ -154,13 +154,8 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	if selected.Policy.MaxAttempts == 0 || selected.Policy.AttemptTimeout <= 0 || selected.Policy.OverallTimeout <= 0 {
-		return nil, fmt.Errorf("%w: invalid execution policy", ErrInvalidRequest)
-	}
-	for _, delay := range selected.Policy.RetryDelays {
-		if delay < 0 {
-			return nil, fmt.Errorf("%w: negative retry delay", ErrInvalidRequest)
-		}
+	if err := validatePolicy(selected.Policy); err != nil {
+		return nil, err
 	}
 	id, err := a.newID()
 	if err != nil {
