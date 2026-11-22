@@ -41,6 +41,9 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 		if execution.Status != transition.NeedsIntervention || execution.Failure == nil {
 			return transition.ErrInvalidHook
 		}
+		if execution.Compatibility != nil {
+			return transition.ErrCompatibility
+		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)
 		if err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
 			return err

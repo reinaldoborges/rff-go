@@ -47,6 +47,7 @@ type HookActivityStore[EntityID comparable, StateID comparable] interface {
 	StartHook(context.Context, HookLease, func() time.Time) (StartedHook, error)
 	RenewHook(context.Context, HookLease, func() time.Time, time.Duration) (HookLease, error)
 	ReportHook(context.Context, HookLease, HookResult, func() time.Time) error
+	BlockHookCompatibility(context.Context, HookLease, CompatibilityDiagnostic, func() time.Time) error
 }
 
 // WorkerTicker is a stoppable ticker driven by a worker clock.
@@ -179,6 +180,12 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	}
 	prepared, err := w.runner.prepare(claimCtx, execution, call)
 	if err != nil {
+		var compatibility *CompatibilityError
+		if errors.As(err, &compatibility) {
+			if blockErr := w.store.BlockHookCompatibility(claimCtx, lease, compatibility.Diagnostic, w.config.Clock.Now); blockErr != nil {
+				return errors.Join(err, fmt.Errorf("record compatibility block: %w", blockErr))
+			}
+		}
 		return err
 	}
 	deadline := execution.EffectiveDeadline()

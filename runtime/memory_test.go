@@ -57,6 +57,7 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
 		next.CommitOperationID != "" || next.CommitReceipt != nil || next.NotificationIntentID != "" || next.NotificationFailure != nil ||
 		next.NotificationWaived || len(next.NotificationControls) != 0 ||
+		next.Compatibility != nil ||
 		next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
@@ -76,6 +77,10 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.Compatibility != nil {
+		diagnostic := *record.Compatibility
+		record.Compatibility = &diagnostic
+	}
 	if record.NotificationFailure != nil {
 		failure := *record.NotificationFailure
 		record.NotificationFailure = &failure

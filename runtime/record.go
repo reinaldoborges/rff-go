@@ -112,6 +112,7 @@ type Execution[EntityID comparable, StateID comparable] struct {
 	NotificationFailure       *fsm.Failure
 	NotificationWaived        bool
 	NotificationControls      []NotificationControlReceipt
+	Compatibility             *CompatibilityDiagnostic
 	RecoveryStarted           bool
 	RejectionRecoveryDeadline time.Time
 	Failure                   *fsm.Failure

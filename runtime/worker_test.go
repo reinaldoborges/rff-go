@@ -44,6 +44,10 @@ func (s *oneActivityStore) ReportHook(_ context.Context, _ transition.HookLease,
 	return nil
 }
 
+func (s *oneActivityStore) BlockHookCompatibility(context.Context, transition.HookLease, transition.CompatibilityDiagnostic, func() time.Time) error {
+	return nil
+}
+
 func TestWorkerRunsClaimedHookAndReportsSuccess(t *testing.T) {
 	runner, record, call := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
 	record.Policy.AttemptTimeout = time.Minute

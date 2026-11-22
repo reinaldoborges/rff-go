@@ -96,38 +96,38 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) prepare(
 	}
 	machine, err := r.machines.Lookup(execution.MachineID, execution.MachineVersion)
 	if err != nil {
-		return prepared, fmt.Errorf("%w: machine: %w", ErrCompatibility, err)
+		return prepared, compatibilityError(CompatibilityMachine, execution.MachineID, execution.MachineVersion, err)
 	}
 	if !machine.HasFailureClassifier() {
-		return prepared, fmt.Errorf("%w: failure classifier unavailable", ErrCompatibility)
+		return prepared, compatibilityError(CompatibilityClassifier, execution.MachineID, execution.MachineVersion, nil)
 	}
 	prepared.machine = machine
 	prepared.handler, err = machine.HandlerFor(execution.Target)
 	if err != nil {
-		return prepared, fmt.Errorf("%w: target handler: %w", ErrCompatibility, err)
+		return prepared, compatibilityError(CompatibilityHandler, execution.MachineID, execution.MachineVersion, err)
 	}
 	inputCodec, err := resolveCodec(r.inputCodec, execution.Input.Codec)
 	if err != nil {
-		return prepared, err
+		return prepared, compatibilityError(CompatibilityInputCodec, execution.Input.Codec.Name, execution.Input.Codec.Version, err)
 	}
 	prepared.input, err = inputCodec.Decode(ctx, slices.Clone(execution.Input.Data))
 	if err != nil {
 		if ctx.Err() != nil {
 			return prepared, ctx.Err()
 		}
-		return prepared, fmt.Errorf("%w: decode input: %w", ErrCompatibility, err)
+		return prepared, compatibilityError(CompatibilityInputCodec, execution.Input.Codec.Name, execution.Input.Codec.Version, err)
 	}
 	if execution.Operation == Transition {
 		eventCodec, err := resolveCodec(r.eventCodec, execution.Event.Codec)
 		if err != nil {
-			return prepared, err
+			return prepared, compatibilityError(CompatibilityEventCodec, execution.Event.Codec.Name, execution.Event.Codec.Version, err)
 		}
 		event, err := eventCodec.Decode(ctx, slices.Clone(execution.Event.Data))
 		if err != nil {
 			if ctx.Err() != nil {
 				return prepared, ctx.Err()
 			}
-			return prepared, fmt.Errorf("%w: decode event: %w", ErrCompatibility, err)
+			return prepared, compatibilityError(CompatibilityEventCodec, execution.Event.Codec.Name, execution.Event.Codec.Version, err)
 		}
 		prepared.previous = fsm.Some(execution.Previous)
 		prepared.event = fsm.Some(event)
@@ -140,7 +140,7 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) prepare(
 func (p preparedHook[EntityID, StateID, Event, Input]) classify(err error) (HookResult, error) {
 	failure, disposition, classifyErr := p.machine.ClassifyFailure(err)
 	if classifyErr != nil {
-		return HookResult{}, fmt.Errorf("%w: classify hook failure: %w", ErrCompatibility, classifyErr)
+		return HookResult{}, compatibilityError(CompatibilityClassifier, p.execution.MachineID, p.execution.MachineVersion, classifyErr)
 	}
 	return HookResult{Failure: failure, Disposition: disposition}, nil
 }
@@ -213,11 +213,11 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) ClassifyHookFailure(
 	}
 	machine, err := r.machines.Lookup(execution.MachineID, execution.MachineVersion)
 	if err != nil {
-		return HookResult{}, fmt.Errorf("%w: machine: %w", ErrCompatibility, err)
+		return HookResult{}, compatibilityError(CompatibilityMachine, execution.MachineID, execution.MachineVersion, err)
 	}
 	safe, disposition, err := machine.ClassifyFailure(failure)
 	if err != nil {
-		return HookResult{}, fmt.Errorf("%w: classify hook failure: %w", ErrCompatibility, err)
+		return HookResult{}, compatibilityError(CompatibilityClassifier, execution.MachineID, execution.MachineVersion, err)
 	}
 	return HookResult{Failure: safe, Disposition: disposition}, nil
 }

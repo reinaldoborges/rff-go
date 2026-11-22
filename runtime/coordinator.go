@@ -237,6 +237,9 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 }
 
 func reconcilable[EntityID comparable, StateID comparable](execution Execution[EntityID, StateID]) bool {
+	if execution.Compatibility != nil {
+		return false
+	}
 	if execution.Status == Aborting {
 		return execution.RecoveryStarted
 	}

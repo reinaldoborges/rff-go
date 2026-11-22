@@ -258,6 +258,9 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		if record.SchemaVersion != transition.CurrentSchemaVersion || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
 		}
+		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
+			return fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
+		}
 		terminal := record.Status == transition.Complete || record.Status == transition.Aborted
 		if terminal == reservation.Valid {
 			return fmt.Errorf("%w: execution and reservation disagree", ErrUnsupportedSchema)

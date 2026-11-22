@@ -122,6 +122,7 @@ func (s *Store[EntityID, StateID]) Accept(
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
 		next.CommitOperationID != "" || next.CommitReceipt != nil || next.NotificationIntentID != "" || next.NotificationFailure != nil ||
 		next.NotificationWaived || len(next.NotificationControls) != 0 ||
+		next.Compatibility != nil ||
 		next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return result, false, transition.ErrInvalidDecision

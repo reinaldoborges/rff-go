@@ -54,7 +54,7 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 				(candidate.Progress.Dispatch.Kind != transition.HookRecover && execution.Status != transition.Waiting && execution.Status != transition.Running) {
 				continue
 			}
-			if candidate.Progress.Completed || candidate.Started || now.Before(candidate.Progress.AvailableAt) ||
+			if execution.Compatibility != nil || candidate.Progress.Completed || candidate.Started || now.Before(candidate.Progress.AvailableAt) ||
 				(candidate.Owner != "" && now.Before(candidate.ExpiresAt)) {
 				continue
 			}

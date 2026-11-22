@@ -46,6 +46,10 @@ outbox. Use the same coordinator owner for all scans.
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by
 intent ID. A delivery error is returned even when retry scheduling succeeds.
+When a worker cannot rehydrate a pinned hook before starting it, the adapter
+persists a safe compatibility diagnostic without consuming an attempt.
+`CompatibilityCoordinator` revalidates these blocks after behavior is restored;
+the host must schedule that scan and use the same coordinator owner.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -81,7 +85,8 @@ tables in the adapter transaction, atomically recording the receipt and enabled
 notification intent. Its callback must use only the provided transaction and
 must not control or retain it. Rejection discards callback writes. Separate
 stores use the host commit and handoff reconciliation interfaces instead.
-Compatibility migration is not yet implemented.
+Other compatibility failure paths and explicit execution migration are not yet
+implemented.
 
 ```sh
 go test ./adapters/sqlite
@@ -90,6 +95,7 @@ go test ./adapters/sqlite -run 'TestCoordinator|TestAbortRecovery|TestRecoveryDe
 go test ./adapters/sqlite -run 'TestNotificationHandoff|TestNotificationRepair'
 go test ./adapters/sqlite -run TestNotificationDelivery
 go test ./adapters/sqlite -run TestAtomicCommit
+go test ./adapters/sqlite -run TestIncompatibleExecution
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
 ```

@@ -37,6 +37,7 @@ type diskRecord struct {
 	NotificationFailure       *fsm.Failure
 	NotificationWaived        bool
 	NotificationControls      []transition.NotificationControlReceipt
+	Compatibility             *transition.CompatibilityDiagnostic
 	RecoveryStarted           bool
 	RejectionRecoveryDeadline time.Time
 	Failure                   *fsm.Failure
@@ -65,6 +66,7 @@ func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[Enti
 		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
 		NotificationIntentID: record.NotificationIntentID,
 		NotificationFailure:  record.NotificationFailure, NotificationWaived: record.NotificationWaived, NotificationControls: record.NotificationControls,
+		Compatibility:             record.Compatibility,
 		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
 		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	})
@@ -103,6 +105,7 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
 		NotificationIntentID: record.NotificationIntentID,
 		NotificationFailure:  record.NotificationFailure, NotificationWaived: record.NotificationWaived, NotificationControls: record.NotificationControls,
+		Compatibility:             record.Compatibility,
 		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
 		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	}, nil
