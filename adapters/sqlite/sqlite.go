@@ -65,6 +65,22 @@ func (s *Store[EntityID, StateID]) Accept(
 	if key == "" || decide == nil {
 		return result, false, transition.ErrInvalidDecision
 	}
+	return s.AcceptAtomic(ctx, entity, key, func(_ context.Context, _ *sql.Tx, view transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error) {
+		return decide(view)
+	})
+}
+
+// AcceptAtomic lets the host authorize and write application-owned data in the
+// same transaction as acceptance. The callback must use only tx, never commit,
+// roll back, retain it, re-enter the store, or modify adapter tables. Replays
+// must be read-only; callback errors and invalid decisions roll back host writes.
+func (s *Store[EntityID, StateID]) AcceptAtomic(
+	ctx context.Context, entity EntityID, key string,
+	decide func(context.Context, *sql.Tx, transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error),
+) (result transition.Execution[EntityID, StateID], created bool, err error) {
+	if key == "" || decide == nil {
+		return result, false, transition.ErrInvalidDecision
+	}
 	encodedEntity, err := s.encodeEntity(entity)
 	if err != nil {
 		return result, false, err
@@ -105,7 +121,7 @@ func (s *Store[EntityID, StateID]) Accept(
 		}
 		viewExisting = &copy
 	}
-	next, err := decide(transition.AcceptanceView[EntityID, StateID]{Existing: viewExisting, Active: active})
+	next, err := decide(ctx, tx, transition.AcceptanceView[EntityID, StateID]{Existing: viewExisting, Active: active})
 	if err != nil {
 		return result, false, err
 	}

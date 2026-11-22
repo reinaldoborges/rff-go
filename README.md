@@ -83,6 +83,8 @@ requirements. In-memory databases are not supported by this adapter.
 The adapter owns its `rff_` tables, scans existing records on open, and fails
 without writes for unsupported schemas. It migrates version 1 through 7 stores
 transactionally, preserving accepted records, reservations, and leases.
+`Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
+the acceptance transaction; its callback must leave replays read-only.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
 record a commit-pending work-success marker, and finish authorized abort
