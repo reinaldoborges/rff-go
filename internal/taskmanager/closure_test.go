@@ -61,3 +61,40 @@ func TestGroupClosureRevokesInvitationsAndOperatorCanInspectHistory(t *testing.T
 		t.Fatalf("closed group accepted invitation: %v", err)
 	}
 }
+
+func TestClosingGroupRejectsPreviouslyAcceptedInvitationAtCommit(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fixture, err := taskmanager.Open(filepath.Join(t.TempDir(), "accepted-before-closure.db"), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fixture.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.SeedOperator(ctx, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "pending", "invite", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CloseGroup(ctx, "owner", "group"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if membership, err := fixture.InspectMembership(ctx, "operator", "pending"); !errors.Is(err, taskmanager.ErrNotFound) {
+		t.Fatalf("closed group committed pending invitation: %+v, %v", membership, err)
+	}
+}

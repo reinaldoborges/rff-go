@@ -91,3 +91,66 @@ func TestCompetingOwnershipTransfersSerializeAndAcceptedInvitationSurvivesTransf
 		t.Fatalf("former owner retained invitation authority: %v", err)
 	}
 }
+
+func TestOwnershipTransferSerializesWithGroupClosure(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fixture, err := taskmanager.Open(filepath.Join(t.TempDir(), "transfer-closure.db"), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fixture.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "member"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "member", "member-membership", "invite", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Decide(ctx, "member", "member-membership", "accept", taskmanager.AcceptInvitation); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	transferResult, closureResult := make(chan error, 1), make(chan error, 1)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		_, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+		transferResult <- err
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		closureResult <- fixture.CloseGroup(ctx, "owner", "group")
+	}()
+	ready.Wait()
+	close(start)
+	transferErr, closureErr := <-transferResult, <-closureResult
+	switch {
+	case transferErr == nil && errors.Is(closureErr, taskmanager.ErrDenied):
+		group, err := fixture.Group(ctx, "member", "group")
+		if err != nil || group.Owner != "member" || group.Closed {
+			t.Fatalf("transfer winner left inconsistent group: %+v, %v", group, err)
+		}
+	case closureErr == nil && errors.Is(transferErr, taskmanager.ErrDenied):
+		if _, err := fixture.Group(ctx, "owner", "group"); !errors.Is(err, taskmanager.ErrDenied) {
+			t.Fatalf("closure winner left group accessible: %v", err)
+		}
+	default:
+		t.Fatalf("transfer and closure did not serialize: transfer=%v closure=%v", transferErr, closureErr)
+	}
+}
