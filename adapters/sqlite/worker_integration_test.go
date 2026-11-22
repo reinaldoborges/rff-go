@@ -89,6 +89,31 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("accept failed: created=%v error=%v", created, err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if store != nil {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	acceptor, err = transition.NewAcceptor[string, string, string, string](
+		store, &registry, resolve, resolve, func() (string, error) { return "other", nil }, time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, created, err := acceptor.Accept(ctx, request)
+	if err != nil || created || replayed.ID != execution.ID || selections != 1 {
+		t.Fatalf("waiting request did not retain its identity after restart: record=%+v created=%v selections=%d error=%v",
+			replayed, created, selections, err)
+	}
 	runner, err := transition.NewHookRunner[string, string, string, string](&registry, resolve, resolve)
 	if err != nil {
 		t.Fatal(err)
@@ -121,11 +146,6 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
 	progress, err := store.ReadHookProgress(ctx, execution.ID)
 	if err != nil || !progress.Completed || !progress.Result.Success || calls != 1 {
 		t.Fatalf("durable work success missing: progress=%+v calls=%d error=%v", progress, calls, err)
@@ -172,7 +192,7 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, created, err := acceptor.Accept(ctx, request)
+	replayed, created, err = acceptor.Accept(ctx, request)
 	if err != nil || created || replayed.ID != execution.ID || replayed.Status != transition.Running || selections != 1 {
 		t.Fatalf("reopened replay changed execution or reran selection: record=%+v created=%v selections=%d error=%v", replayed, created, selections, err)
 	}
