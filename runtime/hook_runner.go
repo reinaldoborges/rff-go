@@ -113,6 +113,9 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) prepare(
 	}
 	inputCodec, err := resolveCodec(r.inputCodec, execution.Input.Codec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return prepared, ctx.Err()
+		}
 		return prepared, compatibilityError(CompatibilityInputCodec, execution.Input.Codec.Name, execution.Input.Codec.Version, err)
 	}
 	prepared.input, err = inputCodec.Decode(ctx, slices.Clone(execution.Input.Data))
@@ -125,6 +128,9 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) prepare(
 	if execution.Operation == Transition {
 		eventCodec, err := resolveCodec(r.eventCodec, execution.Event.Codec)
 		if err != nil {
+			if ctx.Err() != nil {
+				return prepared, ctx.Err()
+			}
 			return prepared, compatibilityError(CompatibilityEventCodec, execution.Event.Codec.Name, execution.Event.Codec.Version, err)
 		}
 		event, err := eventCodec.Decode(ctx, slices.Clone(execution.Event.Data))

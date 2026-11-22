@@ -28,6 +28,7 @@ func TestHookRunnerDistinguishesCodecCancellationFromIncompatibility(t *testing.
 	if _, err := runner.Run(ctx, record, call); !errors.Is(err, context.Canceled) || errors.Is(err, transition.ErrCompatibility) {
 		t.Fatalf("cancellation was reported as incompatibility: %v", err)
 	}
+
 	ctx, cancel = context.WithDeadline(context.Background(), time.Unix(1, 0))
 	defer cancel()
 	result, err := runner.Run(ctx, record, call)
@@ -36,5 +37,22 @@ func TestHookRunnerDistinguishesCodecCancellationFromIncompatibility(t *testing.
 	}
 	if calls != 0 {
 		t.Fatal("hook ran after its context was done")
+	}
+}
+
+func TestHookRunnerCodecResolutionCancellationIsNotIncompatibility(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner, record, call := newHookRunnerWithCodec(t, errorHandler{
+		enter: func(context.Context) error {
+			t.Fatal("canceled hook ran")
+			return nil
+		},
+	}, func(transition.CodecVersion) (transition.Codec[int], error) {
+		cancel()
+		return nil, context.Canceled
+	})
+	if _, err := runner.Run(ctx, record, call); !errors.Is(err, context.Canceled) || errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("canceled resolution was reported as incompatibility: %v", err)
 	}
 }
