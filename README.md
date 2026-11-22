@@ -126,4 +126,5 @@ go test ./adapters/sqlite -run TestTimer
 go test ./adapters/sqlite -run 'TestTypedInput|TestTypedCommand'
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
+go test ./internal/taskmanager
 ```
