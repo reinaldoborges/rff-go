@@ -95,7 +95,13 @@ func (f *Fixture) initializeMembershipRuntime() error {
 			return fsm.Selection[string]{Target: string(Invited), Policy: policy, Notify: true}, nil
 		},
 		SelectTransition: func(source, event string, input fixtureInput) (fsm.Selection[string], error) {
-			if source != string(Invited) || event != string(input.Event) {
+			if event != string(input.Event) {
+				return fsm.Selection[string]{}, ErrConflict
+			}
+			if source == string(Active) && input.Event == removeMembership {
+				return fsm.Selection[string]{Target: string(Removed), Policy: policy}, nil
+			}
+			if source != string(Invited) {
 				return fsm.Selection[string]{}, ErrConflict
 			}
 			var target MembershipStatus

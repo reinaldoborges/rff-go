@@ -41,6 +41,9 @@ func (h membershipCommitHost) Commit(ctx context.Context, lease transition.Trans
 			return transition.CommitReceipt{}, transition.ErrInvalidDecision
 		}
 		if execution.Operation == transition.Transition {
+			if input.Event == removeMembership {
+				return h.fixture.commitRemoval(ctx, tx, execution, input, receipt)
+			}
 			var status, deadline string
 			var closed bool
 			err := tx.QueryRowContext(ctx, `SELECT m.status, m.deadline, g.closed FROM tm_memberships AS m

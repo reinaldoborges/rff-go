@@ -72,6 +72,7 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 			`CREATE TABLE IF NOT EXISTS tm_memberships (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), user_id TEXT NOT NULL REFERENCES tm_users(id), status TEXT NOT NULL, deadline TEXT, reason TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_tasks (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), title TEXT NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_task_assignments (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tm_tasks(id), membership_id TEXT NOT NULL REFERENCES tm_memberships(id), assigned_at TEXT NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS tm_membership_removals (membership_id TEXT PRIMARY KEY REFERENCES tm_memberships(id), execution_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL REFERENCES tm_users(id), occurred_at TEXT NOT NULL)`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS tm_live_membership ON tm_memberships (group_id, user_id) WHERE status IN ('Invited', 'Active')`,
 			`CREATE TABLE IF NOT EXISTS tm_ownership_transfers (group_id TEXT NOT NULL REFERENCES tm_groups(id), actor_id TEXT NOT NULL REFERENCES tm_users(id), request_key TEXT NOT NULL, former_owner TEXT NOT NULL, new_owner TEXT NOT NULL, occurred_at TEXT NOT NULL, PRIMARY KEY (group_id, actor_id, request_key))`,
 		} {

@@ -32,7 +32,8 @@ func (f *Fixture) Invite(ctx context.Context, actor, groupID, userID, membership
 		return "", ErrInvalidRequest
 	}
 	var known bool
-	if err := f.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_users WHERE id = ?)`, actor).Scan(&known); err != nil {
+	if err := f.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_groups
+		WHERE id = ? AND owner_id = ? AND closed = 0)`, groupID, actor).Scan(&known); err != nil {
 		return "", fmt.Errorf("authenticate invitation actor: %w", err)
 	}
 	if !known {
@@ -78,7 +79,7 @@ func (f *Fixture) Membership(ctx context.Context, actor, id string) (Membership,
 	if err != nil {
 		return Membership{}, err
 	}
-	if closed || actor != owner && actor != membership.UserID {
+	if closed || actor != owner && (actor != membership.UserID || membership.Status == Removed) {
 		return Membership{}, ErrDenied
 	}
 	return membership, nil

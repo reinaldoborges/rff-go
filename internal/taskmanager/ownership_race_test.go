@@ -80,6 +80,9 @@ func TestCompetingOwnershipTransfersSerializeAndAcceptedInvitationSurvivesTransf
 	if err != nil || winner == "" || group.Owner != winner {
 		t.Fatalf("ownership race left an inconsistent owner: group=%+v winner=%q error=%v", group, winner, err)
 	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "pending-membership", "pending", now.Add(time.Hour)); !errors.Is(err, taskmanager.ErrDenied) {
+		t.Fatalf("former owner replayed invitation after transfer: %v", err)
+	}
 	if err := fixture.Drive(ctx); err != nil {
 		t.Fatalf("previously accepted invitation was deauthorized: %v", err)
 	}

@@ -17,6 +17,7 @@ const (
 	AcceptInvitation  InvitationDecision = "accept"
 	DeclineInvitation InvitationDecision = "decline"
 	RevokeInvitation  InvitationDecision = "revoke"
+	removeMembership  InvitationDecision = "remove"
 	expireInvitation  InvitationDecision = "expire"
 )
 
@@ -33,7 +34,8 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 			if view.Existing != nil {
 				return decide(view)
 			}
-			var groupID, userID, status, deadline, owner string
+			var groupID, userID, status, owner string
+			var deadline sql.NullString
 			var closed bool
 			err := tx.QueryRowContext(ctx, `SELECT m.group_id, m.user_id, m.status, m.deadline, g.owner_id, g.closed
 				FROM tm_memberships AS m JOIN tm_groups AS g ON g.id = m.group_id WHERE m.id = ?`, entity).
@@ -45,7 +47,7 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 				return nil, fmt.Errorf("authorize invitation decision: %w", err)
 			}
 			authorized := s.input.Actor == userID
-			if s.input.Event == RevokeInvitation {
+			if s.input.Event == RevokeInvitation || s.input.Event == removeMembership {
 				authorized = s.input.Actor == owner
 			} else if s.input.Event == expireInvitation {
 				authorized = s.input.Actor == ""
@@ -53,7 +55,24 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 			if closed || !authorized {
 				return nil, ErrDenied
 			}
-			expiry, err := time.Parse(time.RFC3339Nano, deadline)
+			if s.input.Event == removeMembership {
+				if status != string(Active) || groupID != s.input.GroupID || userID != s.input.UserID || userID == owner {
+					return nil, ErrConflict
+				}
+				var assigned bool
+				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_tasks WHERE group_id = ? AND assignee = ?)`,
+					groupID, entity).Scan(&assigned); err != nil {
+					return nil, fmt.Errorf("check member task assignments: %w", err)
+				}
+				if assigned {
+					return nil, ErrConflict
+				}
+				return decide(view)
+			}
+			if !deadline.Valid {
+				return nil, ErrConflict
+			}
+			expiry, err := time.Parse(time.RFC3339Nano, deadline.String)
 			if err != nil {
 				return nil, fmt.Errorf("decode membership deadline: %w", err)
 			}
@@ -90,9 +109,13 @@ func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputD
 	if err != nil {
 		return transition.InputOutcome{}, err
 	}
+	previous := string(Invited)
+	if input.Event == removeMembership {
+		previous = string(Active)
+	}
 	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, fixtureInput]{
 		Entity: input.MembershipID, Key: delivery.ID, Operation: transition.Transition, MachineID: "taskmanager-membership", MachineVersion: "1",
-		HasPrevious: true, Previous: string(Invited), HasEvent: true, Event: string(input.Event), EventCodec: membershipEventCodec,
+		HasPrevious: true, Previous: previous, HasEvent: true, Event: string(input.Event), EventCodec: membershipEventCodec,
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,
 	})
 	switch {
@@ -126,13 +149,24 @@ func (f *Fixture) Decide(ctx context.Context, actor, membershipID, key string, d
 	}
 	var input fixtureInput
 	var deadline sql.NullString
-	err := f.db.QueryRowContext(ctx, `SELECT group_id, user_id, deadline FROM tm_memberships WHERE id = ?`, membershipID).
-		Scan(&input.GroupID, &input.UserID, &deadline)
+	var status MembershipStatus
+	var owner string
+	var closed bool
+	err := f.db.QueryRowContext(ctx, `SELECT m.group_id, m.user_id, m.deadline, m.status, g.owner_id, g.closed
+		FROM tm_memberships m JOIN tm_groups g ON g.id = m.group_id WHERE m.id = ?`, membershipID).
+		Scan(&input.GroupID, &input.UserID, &deadline, &status, &owner, &closed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", fmt.Errorf("read decision membership: %w", err)
+	}
+	authorized := actor == input.UserID && status != Removed
+	if decision == RevokeInvitation {
+		authorized = actor == owner
+	}
+	if closed || !authorized {
+		return "", ErrDenied
 	}
 	if !deadline.Valid {
 		return "", ErrConflict
