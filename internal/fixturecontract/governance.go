@@ -162,6 +162,15 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 		if _, err := fixture.TransferOwnership(ctx, "owner", "group", "owner", "self"); !errors.Is(err, taskmanager.ErrConflict) {
 			t.Fatalf("self-transfer was accepted: %v", err)
 		}
+		if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "create-task"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.AssignTask(ctx, "owner", "task", "member-membership"); err != nil {
+			t.Fatal(err)
+		}
 		receipt, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
 		if err != nil || receipt.Actor != "owner" || receipt.FormerOwner != "owner" || receipt.NewOwner != "member" || !receipt.At.Equal(now) {
 			t.Fatalf("transfer audit was not recorded: %+v, %v", receipt, err)
@@ -169,6 +178,16 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 		group, err := fixture.Group(ctx, "owner", "group")
 		if err != nil || group.Owner != "member" {
 			t.Fatalf("transfer did not preserve former owner membership: %+v, %v", group, err)
+		}
+		task, err := fixture.Task(ctx, "member", "task")
+		if err != nil || task.Assignee != "member-membership" {
+			t.Fatalf("transfer changed task assignment: %+v, %v", task, err)
+		}
+		for _, id := range []string{"owner-membership", "member-membership"} {
+			membership, err := fixture.InspectMembership(ctx, "operator", id)
+			if err != nil || membership.Status != taskmanager.Active {
+				t.Fatalf("transfer changed active membership %q: %+v, %v", id, membership, err)
+			}
 		}
 		if _, err := fixture.RemoveMember(ctx, "member", "owner-membership", "remove"); err != nil {
 			t.Fatal(err)
