@@ -3,6 +3,7 @@ package runtimecontract
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -231,8 +232,14 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	}
 	migrated, err := store.ReadActiveExecution(ctx, original.ID)
 	if err != nil || migrated.ID != original.ID || migrated.MachineVersion != "2" ||
-		!migrated.Notify || !migrated.Deadline.Equal(original.Deadline) {
-		t.Fatalf("migration lost identity, choice, or deadline: %+v, %v", migrated, err)
+		!migrated.Notify || !migrated.Deadline.Equal(original.Deadline) ||
+		!reflect.DeepEqual(migrated.Policy, original.Policy) {
+		t.Fatalf("migration lost identity, choice, deadline, or policy: %+v, %v", migrated, err)
+	}
+	competing := request
+	competing.Key = "competing"
+	if _, _, err := acceptor.Accept(ctx, competing); !errors.Is(err, transition.ErrBusy) || selections != 1 {
+		t.Fatalf("migration lost entity reservation: selections=%d error=%v", selections, err)
 	}
 	replayed, created, err := acceptor.Accept(ctx, request)
 	if err != nil || created || replayed.ID != original.ID || selections != 1 {
@@ -260,9 +267,10 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	if _, err := authorized.Migrate(ctx, lease, clock, migration); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed migration replay did not conflict: %v", err)
 	}
+	previousClaim := claim
 	claim, err = store.ClaimHook(ctx, "worker", clock, time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || claim.ActivityID != previousClaim.ActivityID || claim.Generation <= previousClaim.Generation {
+		t.Fatalf("migration changed activity identity or failed to fence the old claim: old=%+v new=%+v error=%v", previousClaim, claim, err)
 	}
 	if _, err := store.StartHook(ctx, claim, clock); err != nil {
 		t.Fatal(err)
