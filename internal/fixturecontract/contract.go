@@ -132,4 +132,48 @@ func Run(t *testing.T, newFixture func(*testing.T, func() time.Time) Fixture) {
 			t.Fatalf("completed task was cancelled: %v", err)
 		}
 	})
+	for _, startFirst := range []bool{false, true} {
+		name := "cancel open task"
+		if startFirst {
+			name = "cancel in-progress task"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			fixture := newFixture(t, func() time.Time { return now })
+			if err := fixture.SeedUsers(ctx, "owner"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "create"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if startFirst {
+				if _, err := fixture.TransitionTask(ctx, "owner", "task", "start", taskmanager.StartTask); err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.Drive(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := fixture.TransitionTask(ctx, "owner", "task", "cancel", taskmanager.CancelTask); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			task, err := fixture.Task(ctx, "owner", "task")
+			if err != nil || task.Status != taskmanager.TaskCancelled {
+				t.Fatalf("task was not cancelled: %+v, %v", task, err)
+			}
+			if _, err := fixture.TransitionTask(ctx, "owner", "task", "complete", taskmanager.CompleteTask); !errors.Is(err, taskmanager.ErrConflict) {
+				t.Fatalf("cancelled task accepted another transition: %v", err)
+			}
+		})
+	}
 }
