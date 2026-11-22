@@ -51,7 +51,8 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 		}
 	})
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	clock := fixedClock(now)
+	clock := func() time.Time { return now }
+	originalDeadline := now.Add(time.Hour)
 	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
@@ -85,6 +86,7 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 	if _, err := store.MarkWorkSuccess(ctx, fence, clock); err != nil {
 		t.Fatal(err)
 	}
+	now = now.Add(10 * time.Minute)
 	host := &lostRejectionHost{current: "changed-source"}
 	commits, err := transition.NewCommitCoordinator[string, string](store, host, transition.CoordinatorConfig{
 		ID: "coordinator", LeaseTTL: 2 * time.Hour, Clock: clock,
@@ -109,7 +111,7 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 	execution, err := store.ReadActiveExecution(ctx, "execution")
 	if err != nil || execution.Status != transition.Aborting || !execution.RecoveryStarted ||
 		execution.CommitReceipt == nil || execution.CommitReceipt.Outcome != transition.CommitDenied ||
-		!execution.CycleDeadline.Equal(now.Add(time.Hour)) {
+		!execution.Deadline.Equal(originalDeadline) || !execution.CycleDeadline.Equal(now.Add(time.Hour)) {
 		t.Fatalf("rejection did not start a fresh recovery cycle: execution=%+v error=%v", execution, err)
 	}
 	recovery, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
