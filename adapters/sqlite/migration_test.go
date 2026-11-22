@@ -293,4 +293,24 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 	if err != nil || created || replayed.Status != transition.Complete || replayed.ID != accepted.ID || selections != 1 {
 		t.Fatalf("migrated terminal replay did not survive restart: execution=%+v created=%v error=%v", replayed, created, err)
 	}
+	ids, err := store.ListExecutionIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailable := func(transition.CodecVersion) (transition.Codec[string], error) {
+		return nil, errors.New("original codec unavailable")
+	}
+	acceptor, err = transition.NewAcceptor[string, string, string, string](store, &registry, unavailable, resolve, func() (string, error) {
+		return "unexpected", nil
+	}, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := acceptor.Accept(ctx, request); created || !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("terminal replay without original codec did not fail explicitly: created=%v error=%v", created, err)
+	}
+	after, err := store.ListExecutionIDs(ctx)
+	if err != nil || len(after) != len(ids) || selections != 1 {
+		t.Fatalf("unverifiable terminal replay created work: before=%v after=%v selections=%d error=%v", ids, after, selections, err)
+	}
 }
