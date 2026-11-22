@@ -76,6 +76,13 @@ in-memory test fake exercises that contract without claiming durability:
 go test ./runtime -run TestAcceptanceStoreContract
 ```
 
+`internal/runtimecontract` provides a reusable typed execution and commit
+contract over the runtime ports. Run it against the SQLite adapter with:
+
+```sh
+go test ./adapters/sqlite -run TestRuntimeStoreContract
+```
+
 ## SQLite acceptance store
 
 `adapters/sqlite` provides a host-injected file-backed acceptance store.
