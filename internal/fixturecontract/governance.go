@@ -48,6 +48,43 @@ func activeMember(t *testing.T, fixture GovernanceFixture, now time.Time) {
 // RunGovernance checks assignment-aware removal and ownership transfer replay.
 func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) GovernanceFixture) {
 	t.Helper()
+	t.Run("owner-only operations deny active non-owner", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		activeMember(t, fixture, now)
+		if id, err := fixture.Invite(ctx, "member", "group", "outsider", "outsider-membership", "denied", now.Add(time.Hour)); !errors.Is(err, taskmanager.ErrDenied) || id != "" {
+			t.Fatalf("active non-owner invited another user: id=%q error=%v", id, err)
+		}
+		if _, err := fixture.Invite(ctx, "owner", "group", "outsider", "outsider-membership", "invite-outsider", now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.Decide(ctx, "outsider", "outsider-membership", "accept-outsider", taskmanager.AcceptInvitation); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if id, err := fixture.RemoveMember(ctx, "member", "outsider-membership", "denied-removal"); !errors.Is(err, taskmanager.ErrDenied) || id != "" {
+			t.Fatalf("active non-owner removed a member: id=%q error=%v", id, err)
+		}
+		if receipt, err := fixture.TransferOwnership(ctx, "member", "group", "outsider", "denied-transfer"); !errors.Is(err, taskmanager.ErrDenied) || receipt != (taskmanager.OwnershipTransfer{}) {
+			t.Fatalf("active non-owner transferred ownership: %+v, %v", receipt, err)
+		}
+		if _, err := fixture.RemoveMember(ctx, "owner", "outsider-membership", "remove-outsider"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		membership, err := fixture.InspectMembership(ctx, "operator", "outsider-membership")
+		if err != nil || membership.Status != taskmanager.Removed {
+			t.Fatalf("owner could not remove active member: %+v, %v", membership, err)
+		}
+	})
 	t.Run("task permissions require active membership", func(t *testing.T) {
 		ctx := context.Background()
 		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
