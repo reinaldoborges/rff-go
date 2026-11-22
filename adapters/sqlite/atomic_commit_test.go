@@ -114,8 +114,26 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 		if _, err := store.MarkWorkSuccess(ctx, fence, clock); err != nil {
 			t.Fatal(err)
 		}
-		host := &localCommitHost{store: store, clock: clock, deny: true}
+		host := &localCommitHost{store: store, clock: clock, deny: true, loseReply: true}
 		coordinator, err := transition.NewCommitCoordinator[string, string](store, host, transition.CoordinatorConfig{
+			ID: "coordinator", Clock: clock, LeaseTTL: time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err == nil {
+			t.Fatal("lost rejection response was not reported")
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		host.store = store
+		host.deny = false
+		coordinator, err = transition.NewCommitCoordinator[string, string](store, host, transition.CoordinatorConfig{
 			ID: "coordinator", Clock: clock, LeaseTTL: time.Hour,
 		})
 		if err != nil {
