@@ -138,11 +138,49 @@ func TestLocalFixtureCLIExecutable(t *testing.T) {
 		t.Fatalf("build CLI: %v\n%s", err, output)
 	}
 	db := filepath.Join(dir, "fixture.db")
-	command := exec.Command(binary, "-db", db, "seed-user", "owner")
-	if output, err := command.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != `"ok"` {
-		t.Fatalf("execute CLI: output=%q error=%v", output, err)
+	invoke := func(args ...string) []byte {
+		t.Helper()
+		command := exec.Command(binary, append([]string{"-db", db}, args...)...)
+		output, err := command.CombinedOutput()
+		if err != nil || !json.Valid(output) {
+			t.Fatalf("execute CLI %v: output=%q error=%v", args, output, err)
+		}
+		return output
 	}
-	command = exec.Command(binary, "-db", db, "unknown")
+	for _, args := range [][]string{
+		{"seed-user", "owner", "invitee"},
+		{"seed-operator", "operator"},
+		{"create-group", "owner", "group", "owner-membership"},
+	} {
+		invoke(args...)
+	}
+	var execution string
+	if err := json.Unmarshal(invoke("start-invitation", "owner", "group", "invitee", "membership", "invite-1",
+		"2099-01-01T00:00:00Z"), &execution); err != nil || execution == "" {
+		t.Fatalf("parse invitation execution: %q, %v", execution, err)
+	}
+	for _, args := range [][]string{
+		{"drive"},
+		{"signal-invitation", "invitee", "membership", "decision-1", "accept"},
+		{"drive"},
+		{"start-task", "invitee", "group", "task", "Example task", "create-task-1"},
+		{"drive"},
+		{"signal-task", "invitee", "task", "start-1", "start"},
+		{"drive"},
+	} {
+		invoke(args...)
+	}
+	if list := invoke("list", "operator"); !strings.Contains(string(list), execution) {
+		t.Fatalf("list omitted invitation execution: %s", list)
+	}
+	if show := invoke("show", "operator", execution); !strings.Contains(string(show), `"Status":"Complete"`) {
+		t.Fatalf("show did not inspect completed invitation: %s", show)
+	}
+	var task taskmanager.Task
+	if err := json.Unmarshal(invoke("task", "invitee", "task"), &task); err != nil || task.Status != taskmanager.TaskInProgress {
+		t.Fatalf("task did not progress across CLI processes: %+v, %v", task, err)
+	}
+	command := exec.Command(binary, "-db", db, "unknown")
 	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "unknown command") {
 		t.Fatalf("invalid command succeeded: output=%q error=%v", output, err)
 	}
