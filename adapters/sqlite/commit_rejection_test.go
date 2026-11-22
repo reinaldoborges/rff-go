@@ -23,6 +23,14 @@ func (h *lostRejectionHost) Commit(
 	if h.receipt != nil {
 		return *h.receipt, nil
 	}
+	if h.current == execution.Previous {
+		h.current = execution.Target
+		receipt := transition.CommitReceipt{
+			ExecutionID: execution.ID, OperationID: execution.CommitOperationID, Outcome: transition.CommitSucceeded,
+		}
+		h.receipt = &receipt
+		return receipt, nil
+	}
 	failure := fsm.Failure{Code: "source-changed"}
 	receipt := transition.CommitReceipt{
 		ExecutionID: execution.ID, OperationID: execution.CommitOperationID, Outcome: transition.CommitDenied, Failure: &failure,
@@ -47,7 +55,8 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
-			Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting,
+			Entity: "entity", Key: "key", Operation: transition.Transition, Previous: "original-source", HasPrevious: true,
+			Target: "target", Status: transition.Waiting,
 			AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
 				MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 			},
@@ -60,7 +69,7 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookTransition, DueAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
@@ -90,7 +99,7 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 	if err != nil || pending.Status != transition.Running || pending.CommitReceipt != nil || pending.RecoveryStarted {
 		t.Fatalf("unknown commit result was treated as rejection: execution=%+v error=%v", pending, err)
 	}
-	host.current = "original-source"
+	host.current = "later-source"
 	if err := commits.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +140,7 @@ func TestDefinitiveRejectionAutomaticallyStartsRecoveryAfterLostResponse(t *test
 		return nil, nil
 	})
 	if err != nil || created || replayed.Status != transition.Aborted || replayed.CommitReceipt == nil ||
-		replayed.CommitReceipt.Outcome != transition.CommitDenied || host.current != "original-source" {
+		replayed.CommitReceipt.Outcome != transition.CommitDenied || host.current != "later-source" {
 		t.Fatalf("rejection or authoritative state changed: execution=%+v created=%v host=%+v error=%v", replayed, created, host, err)
 	}
 }
