@@ -14,6 +14,18 @@ import (
 
 type repairHandoff struct{ available bool }
 
+type toggleStateCodec struct {
+	sqlite.StringCodec
+	available *bool
+}
+
+func (c toggleStateCodec) Decode(data []byte) (string, error) {
+	if !*c.available {
+		return "", errors.New("state codec unavailable")
+	}
+	return string(data), nil
+}
+
 func (h *repairHandoff) Handoff(
 	_ context.Context, _ transition.TransitionLease[string], _ transition.NotificationIntent[string, string],
 ) error {
@@ -28,7 +40,8 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 		t.Run(string(action), func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "repair.db")
-			store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+			stateAvailable := true
+			store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, toggleStateCodec{available: &stateAvailable})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -42,7 +55,8 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 			_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 				return &transition.Execution[string, string]{
 					SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
-					Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting,
+					Entity: "entity", Key: "key", Operation: transition.Initialize, MachineID: "task", MachineVersion: "1",
+					Target: "target", Status: transition.Waiting,
 					Notify: true, AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
 						MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 					},
@@ -124,6 +138,19 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 				t.Fatalf("denied repair control changed the execution: inspection=%+v error=%v", afterDenial, err)
 			}
 			allowed = true
+			stateAvailable = false
+			if err := controls.Notification(ctx, fence, clock, control); !errors.Is(err, transition.ErrCompatibility) {
+				t.Fatalf("unavailable state did not block repair control: %v", err)
+			}
+			blocked, err := store.InspectExecution(ctx, "execution")
+			if err != nil || blocked.Status != transition.NotificationRepair || len(blocked.NotificationControls) != 0 ||
+				blocked.Compatibility == nil || blocked.Compatibility.Component != transition.CompatibilityState {
+				t.Fatalf("incompatible repair control changed the execution: inspection=%+v error=%v", blocked, err)
+			}
+			stateAvailable = true
+			if err := store.RevalidateCompatibility(ctx, fence, clock, *blocked.Compatibility, nil); err != nil {
+				t.Fatal(err)
+			}
 			if err := controls.Notification(ctx, fence, clock, control); err != nil {
 				t.Fatal(err)
 			}

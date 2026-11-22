@@ -53,7 +53,7 @@ func TestRecoveryDeadlineRequiresInterventionAndRenewsOnAuthorizedRetry(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention})
+	first, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestRecoveryDeadlineRequiresInterventionAndRenewsOnAuthorizedRetry(t *testi
 	if err != nil || execution.Status != transition.NeedsIntervention || !execution.RecoveryStarted {
 		t.Fatalf("expired recovery did not retain its phase and reservation: execution=%+v error=%v", execution, err)
 	}
-	second, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention})
+	second, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention})
 	if err != nil || !second.Deadline.Equal(now.Add(time.Second)) {
 		t.Fatalf("recovery retry did not get a fresh deadline: receipt=%+v error=%v", second, err)
 	}

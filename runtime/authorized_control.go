@@ -30,8 +30,7 @@ type ControlAuthorization struct {
 
 // AuthorizedControlStore supplies the phase-gated control operations.
 type AuthorizedControlStore[EntityID comparable] interface {
-	HookControlStore[EntityID]
-	NotificationControlStore[EntityID]
+	ApplyCheckedNotificationControl(context.Context, TransitionLease[EntityID], func() time.Time, NotificationControl) error
 }
 
 // AuthorizedControls invokes host authorization before every request, including
@@ -48,27 +47,6 @@ func NewAuthorizedControls[EntityID comparable](
 		return nil, errors.New("control store and host authorization are required")
 	}
 	return &AuthorizedControls[EntityID]{store: store, authorize: authorize}, nil
-}
-
-func (c *AuthorizedControls[EntityID]) Hook(
-	ctx context.Context, lease TransitionLease[EntityID], clock func() time.Time, control HookControl,
-) (HookControlReceipt, error) {
-	var action ControlAction
-	switch control.Action {
-	case RetryIntervention:
-		action = ControlRetry
-	case AbortIntervention:
-		action = ControlAbort
-	default:
-		return HookControlReceipt{}, ErrInvalidHook
-	}
-	if control.ID == "" || lease.ExecutionID == "" || clock == nil {
-		return HookControlReceipt{}, ErrInvalidRequest
-	}
-	if err := c.authorize(ctx, ControlAuthorization{ExecutionID: lease.ExecutionID, RequestID: control.ID, Action: action}); err != nil {
-		return HookControlReceipt{}, err
-	}
-	return c.store.ApplyHookControl(ctx, lease, clock, control)
 }
 
 func (c *AuthorizedControls[EntityID]) Notification(
@@ -89,5 +67,5 @@ func (c *AuthorizedControls[EntityID]) Notification(
 	if err := c.authorize(ctx, ControlAuthorization{ExecutionID: lease.ExecutionID, RequestID: control.ID, Action: action}); err != nil {
 		return err
 	}
-	return c.store.ApplyNotificationControl(ctx, lease, clock, control)
+	return c.store.ApplyCheckedNotificationControl(ctx, lease, clock, control)
 }

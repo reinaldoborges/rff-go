@@ -12,6 +12,13 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+func applyTestHookControl(store *sqlite.Store[string, string], ctx context.Context, lease transition.TransitionLease[string],
+	clock func() time.Time, control transition.HookControl,
+) (transition.HookControlReceipt, error) {
+	return store.ApplyCheckedHookControl(ctx, lease, clock, control,
+		func(transition.Execution[string, string], transition.HookCall) error { return nil })
+}
+
 func TestCoordinatorEntersInterventionWhenRetryConsumesLastAttempt(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "intervention.db")
@@ -93,7 +100,7 @@ func TestCoordinatorEntersInterventionWhenRetryConsumesLastAttempt(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
 		t.Fatal(err)
 	}
 	coordinator, err = transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{

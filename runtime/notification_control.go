@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"context"
 	"time"
 
 	"github.com/reinaldoborges/rff-go/fsm"
@@ -26,10 +25,4 @@ type NotificationControlReceipt struct {
 	Control    NotificationControl
 	AcceptedAt time.Time
 	Failure    fsm.Failure
-}
-
-// NotificationControlStore applies new controls under a fence and replays
-// recorded controls after settlement. The host authorizes and audits both.
-type NotificationControlStore[EntityID comparable] interface {
-	ApplyNotificationControl(context.Context, TransitionLease[EntityID], func() time.Time, NotificationControl) error
 }

@@ -3,6 +3,9 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/reinaldoborges/rff-go/fsm"
@@ -40,8 +43,8 @@ func (s *Store[EntityID, StateID]) EnterNotificationRepair(
 	})
 }
 
-// ApplyNotificationControl applies a host-authorized repair retry or waiver.
-func (s *Store[EntityID, StateID]) ApplyNotificationControl(
+// ApplyCheckedNotificationControl validates stored identifiers before a new decision.
+func (s *Store[EntityID, StateID]) ApplyCheckedNotificationControl(
 	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time, control transition.NotificationControl,
 ) error {
 	if clock == nil {
@@ -50,7 +53,8 @@ func (s *Store[EntityID, StateID]) ApplyNotificationControl(
 	if control.ID == "" || control.Action != transition.RetryNotification && control.Action != transition.WaiveNotification {
 		return transition.ErrInvalidHook
 	}
-	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	var compatibilityErr error
+	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
 		stored, err := s.readControlExecution(ctx, tx, lease)
 		if err != nil {
 			return err
@@ -74,6 +78,32 @@ func (s *Store[EntityID, StateID]) ApplyNotificationControl(
 		if execution.Compatibility != nil {
 			return transition.ErrCompatibility
 		}
+		{
+			data, err := json.Marshal(execution)
+			if err != nil {
+				return fmt.Errorf("encode control execution: %w", err)
+			}
+			_, err = s.decodeRecord(data)
+			now = clock()
+			if now.IsZero() {
+				return transition.ErrInvalidLease
+			}
+			if fenceErr := s.validTransitionFence(ctx, tx, lease, now); fenceErr != nil {
+				return fenceErr
+			}
+			if err != nil {
+				var incompatible *transition.CompatibilityError
+				if !errors.As(err, &incompatible) || !validDiagnostic(execution, incompatible.Diagnostic) {
+					return err
+				}
+				execution.Compatibility = &incompatible.Diagnostic
+				if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
+					return err
+				}
+				compatibilityErr = err
+				return nil
+			}
+		}
 		execution.NotificationControls = append(execution.NotificationControls, transition.NotificationControlReceipt{
 			Control: control, AcceptedAt: now.UTC(), Failure: *execution.NotificationFailure,
 		})
@@ -92,4 +122,8 @@ func (s *Store[EntityID, StateID]) ApplyNotificationControl(
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return compatibilityErr
 }

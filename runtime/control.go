@@ -30,14 +30,6 @@ type HookControlReceipt struct {
 	Disposition fsm.Disposition
 }
 
-// HookControlStore applies new controls atomically under a transition fence.
-// An identical recorded control replays by execution identity even after its
-// fence or reservation expires. The host must authorize both new controls and
-// replays and perform its own actor attribution.
-type HookControlStore[EntityID comparable] interface {
-	ApplyHookControl(context.Context, TransitionLease[EntityID], func() time.Time, HookControl) (HookControlReceipt, error)
-}
-
 // AbortStore finalizes a successful recovery and releases the reservation.
 type AbortStore[EntityID comparable] interface {
 	FinishAbort(context.Context, TransitionLease[EntityID], func() time.Time) error

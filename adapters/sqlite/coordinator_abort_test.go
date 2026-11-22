@@ -65,7 +65,7 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention}); err != nil {
 		t.Fatal(err)
 	}
 	recovery, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
@@ -91,7 +91,7 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if err != nil || execution.Status != transition.NeedsIntervention {
 		t.Fatalf("exhausted recovery did not require intervention: execution=%+v error=%v", execution, err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention}); err != nil {
 		t.Fatal(err)
 	}
 	retried, err := store.ClaimHook(ctx, "worker", clock, time.Second)
@@ -109,7 +109,7 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-unknown-recovery", Action: transition.RetryIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry-unknown-recovery", Action: transition.RetryIntervention}); err != nil {
 		t.Fatal(err)
 	}
 	retried, err = store.ClaimHook(ctx, "worker", clock, time.Minute)
@@ -155,7 +155,7 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if err != nil || created || replayed.Status != transition.Aborted {
 		t.Fatalf("durable aborted outcome did not replay: execution=%+v created=%v error=%v", replayed, created, err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "abort", Action: transition.AbortIntervention}); err != nil {
 		t.Fatalf("lost abort control response could not replay after settlement: %v", err)
 	}
 }

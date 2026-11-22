@@ -81,7 +81,7 @@ func TestCoordinatorStopsWhenPolicyCannotRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+			if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
 				t.Fatal(err)
 			}
 			if err := coordinator.Reconcile(ctx); err != nil {
@@ -107,7 +107,7 @@ func TestCoordinatorStopsWhenPolicyCannotRetry(t *testing.T) {
 			if err := coordinator.Reconcile(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry-again", Action: transition.RetryIntervention}); err != nil {
+			if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry-again", Action: transition.RetryIntervention}); err != nil {
 				t.Fatal(err)
 			}
 			retried, err := store.ClaimHook(ctx, "worker", clock, time.Minute)

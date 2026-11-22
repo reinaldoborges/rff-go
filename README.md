@@ -86,9 +86,11 @@ transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
 record a commit-pending work-success marker, and finish authorized abort
-recovery. `AuthorizedControls` and `AuthorizedMigration` call host authorization
-for every request, including replay; hosts own actor attribution and audit.
-The host may use low-level control stores directly only after authorization.
+recovery. `AuthorizedHookControls`, `AuthorizedControls`, and
+`AuthorizedMigration` call host authorization for every request, including
+replay; hosts own actor attribution and audit. New hook controls validate
+pinned behavior under the transition fence, while notification controls check
+stored identifier compatibility.
 `InputIngress` persists typed commands, events, and human decisions before
 calling the host, deduplicates their semantic payloads, and replays durable
 outcomes. The host must authorize every submission and persist enough approved

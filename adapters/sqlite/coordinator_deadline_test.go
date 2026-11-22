@@ -76,24 +76,24 @@ func TestCoordinatorSettlesExpiredUnstartedWorkWithoutWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := transition.HookControl{ID: "retry-control", Action: transition.RetryIntervention}
-	receipt, err := store.ApplyHookControl(ctx, fence, clock, control)
+	receipt, err := applyTestHookControl(store, ctx, fence, clock, control)
 	if err != nil || !receipt.Deadline.Equal(now.Add(time.Second)) {
 		t.Fatalf("retry did not get a fresh deadline: receipt=%+v error=%v", receipt, err)
 	}
 	now = now.Add(500 * time.Millisecond)
-	replay, err := store.ApplyHookControl(ctx, fence, clock, control)
+	replay, err := applyTestHookControl(store, ctx, fence, clock, control)
 	if err != nil || !replay.Deadline.Equal(receipt.Deadline) {
 		t.Fatalf("control replay changed deadline: receipt=%+v error=%v", replay, err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: control.ID, Action: transition.AbortIntervention}); !errors.Is(err, transition.ErrConflict) {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: control.ID, Action: transition.AbortIntervention}); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed control replay did not conflict: %v", err)
 	}
 	stale := fence
 	stale.Generation++
-	if _, err := store.ApplyHookControl(ctx, stale, clock, control); err != nil {
+	if _, err := applyTestHookControl(store, ctx, stale, clock, control); err != nil {
 		t.Fatalf("recorded control could not replay under a stale fence: %v", err)
 	}
-	if _, err := store.ApplyHookControl(ctx, stale, clock, transition.HookControl{ID: "different", Action: transition.RetryIntervention}); !errors.Is(err, transition.ErrStaleLease) {
+	if _, err := applyTestHookControl(store, ctx, stale, clock, transition.HookControl{ID: "different", Action: transition.RetryIntervention}); !errors.Is(err, transition.ErrStaleLease) {
 		t.Fatalf("stale fence accepted a new control: %v", err)
 	}
 	if _, err := store.StartHook(ctx, oldClaim, clock); !errors.Is(err, transition.ErrStaleActivityLease) {

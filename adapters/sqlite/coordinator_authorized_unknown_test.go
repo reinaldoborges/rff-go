@@ -73,7 +73,7 @@ func TestAuthorizedRetryOfUnknownOutcomeKeepsOriginalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyHookControl(ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+	if _, err := applyTestHookControl(store, ctx, fence, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
 		t.Fatal(err)
 	}
 	retry, err := store.ClaimHook(ctx, "worker", clock, time.Minute)

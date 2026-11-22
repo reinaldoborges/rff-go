@@ -3,17 +3,24 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
-// ApplyHookControl applies a host-authorized pre-commit control.
-func (s *Store[EntityID, StateID]) ApplyHookControl(
+// ApplyCheckedHookControl checks behavior atomically before a new control.
+func (s *Store[EntityID, StateID]) ApplyCheckedHookControl(
 	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time, control transition.HookControl,
+	check func(transition.Execution[EntityID, StateID], transition.HookCall) error,
 ) (transition.HookControlReceipt, error) {
+	if check == nil {
+		return transition.HookControlReceipt{}, transition.ErrInvalidRequest
+	}
 	var receipt transition.HookControlReceipt
+	var compatibilityErr error
 	if clock == nil {
 		return receipt, transition.ErrInvalidLease
 	}
@@ -43,6 +50,39 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 		}
 		if execution.Compatibility != nil {
 			return transition.ErrCompatibility
+		}
+		{
+			data, err := json.Marshal(execution)
+			if err != nil {
+				return fmt.Errorf("encode control execution: %w", err)
+			}
+			decoded, err := s.decodeRecord(data)
+			if err == nil {
+				kind := transition.HookRetry
+				if control.Action == transition.AbortIntervention || execution.RecoveryStarted {
+					kind = transition.HookRecover
+				}
+				err = check(decoded, transition.HookCall{Kind: kind, Failure: execution.Failure})
+			}
+			now = clock()
+			if now.IsZero() {
+				return transition.ErrInvalidLease
+			}
+			if fenceErr := s.validTransitionFence(ctx, tx, lease, now); fenceErr != nil {
+				return fenceErr
+			}
+			if err != nil {
+				var incompatible *transition.CompatibilityError
+				if !errors.As(err, &incompatible) || !validDiagnostic(execution, incompatible.Diagnostic) {
+					return err
+				}
+				execution.Compatibility = &incompatible.Diagnostic
+				if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
+					return err
+				}
+				compatibilityErr = err
+				return nil
+			}
 		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)
 		if err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
@@ -109,6 +149,9 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 	})
 	if err != nil {
 		return transition.HookControlReceipt{}, err
+	}
+	if compatibilityErr != nil {
+		return transition.HookControlReceipt{}, compatibilityErr
 	}
 	return receipt, nil
 }
