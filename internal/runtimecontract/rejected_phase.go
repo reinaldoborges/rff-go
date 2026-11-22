@@ -10,6 +10,12 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+type noRecommitHost struct{}
+
+func (noRecommitHost) Commit(context.Context, transition.TransitionLease[string], transition.Execution[string, string]) (transition.CommitReceipt, error) {
+	return transition.CommitReceipt{}, errors.New("rejected commit was retried")
+}
+
 // RunRejectedPhase checks fencing and control gates before automatic recovery.
 func RunRejectedPhase(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	t.Helper()
@@ -91,7 +97,7 @@ func RunRejectedPhase(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	if !errors.Is(err, transition.ErrInvalidHook) || conversions != 0 {
 		t.Fatalf("rejected commit accepted migration: conversions=%d error=%v", conversions, err)
 	}
-	commits, err := transition.NewCommitCoordinator[string, string](store, rejectionHost{}, config)
+	commits, err := transition.NewCommitCoordinator[string, string](store, noRecommitHost{}, config)
 	if err != nil {
 		t.Fatal(err)
 	}
