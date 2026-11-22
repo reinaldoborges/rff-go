@@ -93,9 +93,9 @@ in-memory test fake exercises that contract without claiming durability:
 go test ./runtime -run TestAcceptanceStoreContract
 ```
 
-`internal/runtimecontract` provides reusable execution, worker-loss,
+`internal/runtimecontract` provides reusable execution, wakeup, worker-loss,
 commit-rejection, notification-handoff, delivery and repair,
-timer-compatibility, typed-ingress, authorized-control, migration, capacity,
+timer-delivery and compatibility, typed-ingress, authorized-control, migration, capacity,
 retry-budget, pinned versions, and execution-compatibility contracts over the
 runtime ports.
 Run them against the SQLite adapter with:
