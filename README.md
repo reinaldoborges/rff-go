@@ -55,6 +55,12 @@ or state value cannot be decoded.
 `InspectionStore` lists retained executions and returns payload-free protocol
 summaries, including compatibility diagnostics and hook attempt history. The
 host must authorize access and protect application-provided failure details.
+`TimerScheduler` persists typed timer events with stable IDs and original
+deadlines. The host schedules `TimerWorker.RunOne` calls and supplies a durable
+handler that deduplicates by timer ID. Delivery is at least once, and errors
+leave claims to expire for recovery. Timer scheduling is not atomic with
+application state: hosts must reconcile missing timers from durable workflow
+state after a crash.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -75,7 +81,7 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 through 5 stores
+without writes for unsupported schemas. It migrates version 1 through 6 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
@@ -107,6 +113,7 @@ go test ./adapters/sqlite -run TestNotificationDelivery
 go test ./adapters/sqlite -run TestAtomicCommit
 go test ./adapters/sqlite -run TestIncompatibleExecution
 go test ./adapters/sqlite -run TestMigration
+go test ./adapters/sqlite -run TestTimer
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
 ```

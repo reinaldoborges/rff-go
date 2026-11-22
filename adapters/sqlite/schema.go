@@ -13,13 +13,14 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 6
+	adapterSchemaVersion = 7
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
 	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
 	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
+	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -33,7 +34,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
@@ -41,23 +42,25 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		"rff_transition_leases": &leasesExist,
 		"rff_hook_work":         &hookWorkExists,
 		"rff_notification_work": &notificationWorkExists,
+		"rff_timers":            &timersExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (6)`,
+			`INSERT INTO rff_schema_version (version) VALUES (7)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
 			hookWorkDDL,
 			notificationWorkDDL,
+			timersDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -183,10 +186,35 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 5`); err != nil {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
-			if schemaVersion < 6 {
-				if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 6`); err != nil {
-					return fmt.Errorf("update adapter version: %w", err)
-				}
+		}
+		if schemaVersion < 6 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 6`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
+		if schemaVersion < 7 {
+			if timersExist {
+				return fmt.Errorf("%w: unexpected timers table", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, timersDDL); err != nil {
+				return fmt.Errorf("migrate timers: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 7`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		} else {
+			var definition string
+			if !timersExist {
+				return fmt.Errorf("%w: timers table missing", ErrUnsupportedSchema)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_timers'`).Scan(&definition); err != nil {
+				return fmt.Errorf("%w: inspect timers: %w", ErrUnsupportedSchema, err)
+			}
+			if definition != timersDDL {
+				return fmt.Errorf("%w: incompatible timers table", ErrUnsupportedSchema)
+			}
+			if err := validateTimers(ctx, tx); err != nil {
+				return err
 			}
 		}
 	}

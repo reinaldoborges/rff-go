@@ -90,7 +90,7 @@ func TestVersionOneStoreMigratesWithoutLosingAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`DROP TABLE rff_notification_work; DROP TABLE rff_hook_work; DROP TABLE rff_transition_leases; UPDATE rff_schema_version SET version = 1`); err != nil {
+	if _, err := db.Exec(`DROP TABLE rff_timers; DROP TABLE rff_notification_work; DROP TABLE rff_hook_work; DROP TABLE rff_transition_leases; UPDATE rff_schema_version SET version = 1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

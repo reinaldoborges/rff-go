@@ -26,6 +26,7 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"unreadable lease", `INSERT INTO rff_transition_leases (entity, execution_id, owner, generation, expires_at) VALUES (X'65', 'missing', 'owner', 0, 'not-a-time')`},
 		{"unreadable hook work", `INSERT INTO rff_hook_work (execution_id, work) VALUES ('missing', X'ff')`},
 		{"unreadable notification work", `INSERT INTO rff_notification_work (execution_id, work) VALUES ('missing', X'ff')`},
+		{"unreadable timer", `INSERT INTO rff_timers (id, record) VALUES ('timer', X'ff')`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

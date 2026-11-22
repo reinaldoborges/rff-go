@@ -16,10 +16,11 @@ func TestStoreMigrationPreservesTransitionLease(t *testing.T) {
 		name string
 		sql  string
 	}{
-		{"version two", `DROP TABLE rff_notification_work; DROP TABLE rff_hook_work; UPDATE rff_schema_version SET version = 2`},
-		{"version three", `DROP TABLE rff_notification_work; UPDATE rff_schema_version SET version = 3`},
-		{"version four", `UPDATE rff_schema_version SET version = 4`},
-		{"version five", `UPDATE rff_schema_version SET version = 5`},
+		{"version two", `DROP TABLE rff_timers; DROP TABLE rff_notification_work; DROP TABLE rff_hook_work; UPDATE rff_schema_version SET version = 2`},
+		{"version three", `DROP TABLE rff_timers; DROP TABLE rff_notification_work; UPDATE rff_schema_version SET version = 3`},
+		{"version four", `DROP TABLE rff_timers; UPDATE rff_schema_version SET version = 4`},
+		{"version five", `DROP TABLE rff_timers; UPDATE rff_schema_version SET version = 5`},
+		{"version six", `DROP TABLE rff_timers; UPDATE rff_schema_version SET version = 6`},
 	} {
 		t.Run(migration.name, func(t *testing.T) {
 			ctx := context.Background()
