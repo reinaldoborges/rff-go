@@ -19,6 +19,9 @@ type ControlStore interface {
 // RunAuthorizedControl checks phase gates, authorization and durable replay.
 func RunAuthorizedControl(t *testing.T, newStore func(*testing.T) ControlStore) {
 	t.Helper()
+	t.Run("unknown transition retry", func(t *testing.T) {
+		runUnknownTransitionRetry(t, newStore)
+	})
 	store := newStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
