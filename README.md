@@ -32,6 +32,7 @@ persist hook outcomes.
 renews their leases while working and reporting, and supports draining.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
+`Coordinator.Status` reports the last scan separately from worker capacity.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The

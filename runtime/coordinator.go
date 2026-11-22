@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/reinaldoborges/rff-go/fsm"
@@ -25,11 +26,18 @@ type HookFailureClassifier[EntityID comparable, StateID comparable] interface {
 	ClassifyHookFailure(Execution[EntityID, StateID], error) (HookResult, error)
 }
 
-// CoordinatorConfig sets the deployment-specific lease and clock.
+// CoordinatorConfig sets the deployment-specific lease and clock. The clock
+// must be concurrency-safe, nonblocking, and must not re-enter the store.
 type CoordinatorConfig struct {
 	ID       string
 	LeaseTTL time.Duration
 	Clock    func() time.Time
+}
+
+// CoordinatorStatus reports the last scan independently of worker capacity.
+type CoordinatorStatus struct {
+	Healthy  bool
+	LastScan time.Time
 }
 
 // Coordinator reconciles persisted executions; callers schedule regular scans.
@@ -37,6 +45,8 @@ type Coordinator[EntityID comparable, StateID comparable] struct {
 	store      CoordinatorStore[EntityID, StateID]
 	classifier HookFailureClassifier[EntityID, StateID]
 	config     CoordinatorConfig
+	mu         sync.Mutex
+	status     CoordinatorStatus
 }
 
 // NewCoordinator creates a reconciler with an explicitly configured lease.
@@ -49,14 +59,29 @@ func NewCoordinator[EntityID comparable, StateID comparable](
 	return &Coordinator[EntityID, StateID]{store: store, classifier: classifier, config: config}, nil
 }
 
+// Status reports whether the last complete reconciliation scan succeeded.
+func (c *Coordinator[EntityID, StateID]) Status() CoordinatorStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status
+}
+
 // Reconcile scans all active executions independently. Callers must invoke it
 // regularly, even without wakeups, and often enough to renew held leases.
-func (c *Coordinator[EntityID, StateID]) Reconcile(ctx context.Context) error {
+func (c *Coordinator[EntityID, StateID]) Reconcile(ctx context.Context) (result error) {
+	defer func() {
+		now := c.config.Clock()
+		if now.IsZero() {
+			result = errors.Join(result, ErrInvalidLease)
+		}
+		c.mu.Lock()
+		c.status = CoordinatorStatus{Healthy: result == nil, LastScan: now}
+		c.mu.Unlock()
+	}()
 	ids, err := c.store.ActiveExecutionIDs(ctx)
 	if err != nil {
 		return err
 	}
-	var result error
 	for _, id := range ids {
 		if err := c.reconcileOne(ctx, id); err != nil {
 			if errors.Is(err, ErrExecutionNotActive) || errors.Is(err, ErrLeaseHeld) {
