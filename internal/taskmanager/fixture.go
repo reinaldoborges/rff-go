@@ -67,6 +67,7 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 		for _, statement := range []string{
 			`CREATE TABLE IF NOT EXISTS tm_users (id TEXT PRIMARY KEY NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_operators (id TEXT PRIMARY KEY NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS tm_operator_audit (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, execution_id TEXT NOT NULL, allowed INTEGER NOT NULL, occurred_at TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_groups (id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL REFERENCES tm_users(id), closed INTEGER NOT NULL CHECK (closed IN (0, 1)))`,
 			`CREATE TABLE IF NOT EXISTS tm_memberships (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), user_id TEXT NOT NULL REFERENCES tm_users(id), status TEXT NOT NULL, deadline TEXT, reason TEXT NOT NULL)`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS tm_live_membership ON tm_memberships (group_id, user_id) WHERE status IN ('Invited', 'Active')`,
