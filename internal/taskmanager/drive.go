@@ -34,7 +34,44 @@ func (h membershipCommitHost) Commit(ctx context.Context, lease transition.Trans
 		if err != nil {
 			return transition.CommitReceipt{}, fmt.Errorf("decode membership commit input: %w", err)
 		}
-		if execution.Operation != transition.Initialize || execution.Entity != input.MembershipID || execution.Target != string(Invited) {
+		if execution.Entity != input.MembershipID {
+			return transition.CommitReceipt{}, transition.ErrInvalidDecision
+		}
+		if execution.Operation == transition.Transition {
+			var status, deadline string
+			var closed bool
+			err := tx.QueryRowContext(ctx, `SELECT m.status, m.deadline, g.closed FROM tm_memberships AS m
+				JOIN tm_groups AS g ON g.id = m.group_id WHERE m.id = ?`, input.MembershipID).Scan(&status, &deadline, &closed)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return transition.CommitReceipt{}, fmt.Errorf("read membership for decision: %w", err)
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				receipt.Outcome = transition.CommitDenied
+				receipt.Failure = &fsm.Failure{Code: "membership-invariant"}
+				return receipt, nil
+			}
+			expiry, err := time.Parse(time.RFC3339Nano, deadline)
+			if err != nil {
+				return transition.CommitReceipt{}, fmt.Errorf("decode membership deadline: %w", err)
+			}
+			now := h.fixture.clock()
+			if now.IsZero() {
+				return transition.CommitReceipt{}, transition.ErrInvalidLease
+			}
+			due := !now.Before(expiry)
+			if closed || status != execution.Previous || status != string(Invited) ||
+				!expiry.Equal(input.Deadline) || (input.Event == expireInvitation) != due {
+				receipt.Outcome = transition.CommitDenied
+				receipt.Failure = &fsm.Failure{Code: "membership-invariant"}
+				return receipt, nil
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE tm_memberships SET status = ? WHERE id = ?`, execution.Target, input.MembershipID); err != nil {
+				return transition.CommitReceipt{}, fmt.Errorf("commit membership decision: %w", err)
+			}
+			receipt.Outcome = transition.CommitSucceeded
+			return receipt, nil
+		}
+		if execution.Operation != transition.Initialize || execution.Target != string(Invited) {
 			return transition.CommitReceipt{}, transition.ErrInvalidDecision
 		}
 		var valid bool
@@ -68,6 +105,11 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err := ingress.Reconcile(ctx); err != nil {
 		return err
 	}
+	decisions, err := f.decisionIngress()
+	if err != nil {
+		return err
+	}
+	pendingErr := decisions.Reconcile(ctx)
 	config := transition.CoordinatorConfig{ID: "taskmanager", Clock: f.clock, LeaseTTL: time.Minute}
 	coordinator, err := transition.NewCoordinator[string, string](f.store, f.runner, config)
 	if err != nil {
@@ -98,5 +140,8 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return commits.Reconcile(ctx)
+	if err := commits.Reconcile(ctx); err != nil {
+		return errors.Join(pendingErr, err)
+	}
+	return errors.Join(pendingErr, f.driveExpiryTimers(ctx))
 }

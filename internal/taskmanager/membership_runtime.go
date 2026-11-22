@@ -41,6 +41,7 @@ type membershipInput struct {
 	UserID       string
 	MembershipID string
 	Deadline     time.Time
+	Event        InvitationDecision
 }
 
 type jsonCodec[T any] struct{}
@@ -90,8 +91,24 @@ func (f *Fixture) initializeMembershipRuntime() error {
 		SelectInitial: func(membershipInput) (fsm.Selection[string], error) {
 			return fsm.Selection[string]{Target: string(Invited), Policy: policy, Notify: true}, nil
 		},
-		SelectTransition: func(string, string, membershipInput) (fsm.Selection[string], error) {
-			return fsm.Selection[string]{}, ErrConflict
+		SelectTransition: func(source, event string, input membershipInput) (fsm.Selection[string], error) {
+			if source != string(Invited) || event != string(input.Event) {
+				return fsm.Selection[string]{}, ErrConflict
+			}
+			var target MembershipStatus
+			switch input.Event {
+			case AcceptInvitation:
+				target = Active
+			case DeclineInvitation:
+				target = Declined
+			case RevokeInvitation:
+				target = Revoked
+			case expireInvitation:
+				target = Expired
+			default:
+				return fsm.Selection[string]{}, ErrConflict
+			}
+			return fsm.Selection[string]{Target: string(target), Policy: policy}, nil
 		},
 		ClassifyFailure: func(error) (fsm.Failure, fsm.Disposition) {
 			return fsm.Failure{Code: "membership-hook-failed"}, fsm.DispositionIntervention

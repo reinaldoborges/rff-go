@@ -66,8 +66,8 @@ func (s *Store[EntityID, StateID]) AcquireTransitionLease(
 		if parseErr != nil || generation <= 0 || priorOwner == "" {
 			return result, fmt.Errorf("%w: invalid transition lease", ErrUnsupportedSchema)
 		}
-		if now.Before(priorExpiry) {
-			if priorID != executionID || priorOwner != owner {
+		if priorID == executionID && now.Before(priorExpiry) {
+			if priorOwner != owner {
 				return result, transition.ErrLeaseHeld
 			}
 			return transition.TransitionLease[EntityID]{Entity: entity, ExecutionID: executionID, Owner: owner, Generation: uint64(generation), ExpiresAt: priorExpiry}, nil
