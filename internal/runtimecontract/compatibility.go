@@ -116,4 +116,55 @@ func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore
 	if err := worker.RunOne(ctx); err != nil || calls != 2 {
 		t.Fatalf("restored execution did not proceed: calls=%d error=%v", calls, err)
 	}
+	_, _, err = store.Accept(ctx, "c", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "c", Entity: "c", Key: "key",
+			Operation: transition.Initialize, MachineID: "machine", MachineVersion: "3", Target: "open",
+			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
+			Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireTransitionLease(ctx, "c", "c", "coordinator", clock.Now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, lease, clock.Now, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimHook(ctx, "worker", clock.Now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, claim, clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReportHook(ctx, claim, transition.HookResult{
+		Failure: fsm.Failure{Code: "failed"}, Disposition: fsm.DispositionIntervention,
+	}, clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterHookIntervention(ctx, lease, clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	intervention, err := store.ReadActiveExecution(ctx, "c")
+	if err != nil || intervention.Status != transition.NeedsIntervention || intervention.Compatibility == nil ||
+		intervention.Compatibility.Component != transition.CompatibilityMachine {
+		t.Fatalf("intervention did not discover unavailable behavior: %+v, %v", intervention, err)
+	}
+	register("3")
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restored, err = store.ReadActiveExecution(ctx, "c")
+	if err != nil || restored.Status != transition.NeedsIntervention || restored.Compatibility != nil ||
+		!restored.Deadline.Equal(intervention.Deadline) {
+		t.Fatalf("restoration bypassed intervention or changed its deadline: %+v, %v", restored, err)
+	}
 }

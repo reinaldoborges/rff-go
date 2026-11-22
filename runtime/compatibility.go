@@ -71,6 +71,7 @@ type CompatibilityStore[EntityID comparable, StateID comparable] interface {
 	ActiveExecutionReader[EntityID, StateID]
 	TransitionLeaseStore[EntityID]
 	ReadHookProgress(context.Context, string) (HookProgress, error)
+	BlockQuiescedCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, Execution[EntityID, StateID], CompatibilityDiagnostic) error
 	RevalidateCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, CompatibilityDiagnostic, *CompatibilityDiagnostic) error
 }
 
@@ -91,7 +92,8 @@ func NewCompatibilityCoordinator[EntityID comparable, StateID comparable, Event,
 	return &CompatibilityCoordinator[EntityID, StateID, Event, Input]{store: store, runner: runner, config: config}, nil
 }
 
-// Reconcile scans blocked executions; hosts must schedule this alongside other scans.
+// Reconcile discovers incompatible intervention work and revalidates blocked
+// executions; hosts must schedule this alongside other scans.
 func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) Reconcile(ctx context.Context) error {
 	ids, err := c.store.ActiveExecutionIDs(ctx)
 	if err != nil {
@@ -112,10 +114,10 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) Reconcile(ct
 
 func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne(ctx context.Context, id string) error {
 	execution, err := readForReconciliation(ctx, c.store, id)
-	if err != nil || execution.Compatibility == nil {
+	if err != nil || execution.Compatibility == nil && execution.Status != NeedsIntervention {
 		return err
 	}
-	if execution.Compatibility.Component == CompatibilityMigration {
+	if execution.Compatibility != nil && execution.Compatibility.Component == CompatibilityMigration {
 		return nil
 	}
 	lease, err := c.store.AcquireTransitionLease(ctx, execution.Entity, id, c.config.ID, c.config.Clock, c.config.LeaseTTL)
@@ -127,11 +129,17 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		return err
 	}
 	execution, err = readForReconciliation(ctx, c.store, id)
-	if err != nil || execution.Compatibility == nil {
+	if err != nil || execution.Compatibility == nil && execution.Status != NeedsIntervention {
 		return err
+	}
+	if execution.Compatibility != nil && execution.Compatibility.Component == CompatibilityMigration {
+		return nil
 	}
 	if !execution.RecoveryStarted && (execution.CommitOperationID != "" ||
 		execution.Status == Notifying || execution.Status == NotificationRepair) {
+		if execution.Compatibility == nil {
+			return nil
+		}
 		return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, nil)
 	}
 	progress, err := c.store.ReadHookProgress(ctx, id)
@@ -147,7 +155,7 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		}
 	}
 	_, err = c.runner.prepare(ctx, execution, call)
-	if err == nil {
+	if err == nil && execution.Compatibility != nil {
 		switch execution.Compatibility.Check {
 		case CompatibilityUnknownAttempt:
 			_, err = c.runner.ClassifyHookFailure(execution, ErrAttemptUnknown)
@@ -162,7 +170,17 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 			return err
 		}
 		next = &compatibility.Diagnostic
+		if execution.Compatibility == nil {
+			err := c.store.BlockQuiescedCompatibility(ctx, lease, c.config.Clock, execution, *next)
+			if errors.Is(err, ErrConflict) {
+				return nil
+			}
+			return err
+		}
 		next.Check = execution.Compatibility.Check
+	}
+	if execution.Compatibility == nil {
+		return nil
 	}
 	return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, next)
 }

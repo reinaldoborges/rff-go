@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -156,6 +157,43 @@ func (s *Store[EntityID, StateID]) BlockExecutionCompatibility(
 		}
 		if record.Compatibility != nil && *record.Compatibility != diagnostic {
 			return transition.ErrConflict
+		}
+		record.Compatibility = &diagnostic
+		return saveExecution(ctx, tx, lease.ExecutionID, record)
+	})
+}
+
+// BlockQuiescedCompatibility records a discovered failure only if the
+// intervention snapshot has not changed since validation.
+func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
+	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time,
+	expected transition.Execution[EntityID, StateID], diagnostic transition.CompatibilityDiagnostic,
+) error {
+	if clock == nil {
+		return transition.ErrInvalidLease
+	}
+	if expected.Status != transition.NeedsIntervention || expected.Compatibility != nil ||
+		expected.ID != lease.ExecutionID || expected.Entity != lease.Entity {
+		return transition.ErrInvalidHook
+	}
+	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		_, record, err := s.fencedExecution(ctx, tx, lease, clock)
+		if err != nil {
+			return err
+		}
+		current, err := json.Marshal(record)
+		if err != nil {
+			return fmt.Errorf("encode current execution: %w", err)
+		}
+		snapshot, err := s.encodeRecord(expected, record.Entity)
+		if err != nil {
+			return fmt.Errorf("encode expected execution: %w", err)
+		}
+		if !bytes.Equal(current, snapshot) {
+			return transition.ErrConflict
+		}
+		if !validDiagnostic(record, diagnostic) {
+			return transition.ErrInvalidHook
 		}
 		record.Compatibility = &diagnostic
 		return saveExecution(ctx, tx, lease.ExecutionID, record)

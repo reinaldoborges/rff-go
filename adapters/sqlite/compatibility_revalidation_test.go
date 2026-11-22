@@ -212,6 +212,114 @@ func TestRejectedCommitRecoveryRetainsCompatibilityBlockUntilBehaviorReturns(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("intervention discovers unavailable behavior before control", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "intervention-discovery.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		clock := fixedClock(now)
+		_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+				Operation: transition.Initialize, MachineID: "task", MachineVersion: "1", Target: "open",
+				Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "string", Version: "1"}, Data: []byte("payload")},
+				Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+				Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DispatchHook(ctx, lease, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReportHook(ctx, claim, transition.HookResult{
+			Failure: fsm.Failure{Code: "failed"}, Disposition: fsm.DispositionIntervention,
+		}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EnterHookIntervention(ctx, lease, clock); err != nil {
+			t.Fatal(err)
+		}
+		var registry fsm.Registry[string, string, string, string]
+		resolve := func(transition.CodecVersion) (transition.Codec[string], error) { return stringValueCodec{}, nil }
+		runner, err := transition.NewHookRunner[string, string, string, string](&registry, resolve, resolve)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager, err := transition.NewCompatibilityCoordinator(store, runner, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		blocked, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || blocked.Status != transition.NeedsIntervention || blocked.Compatibility == nil ||
+			blocked.Compatibility.Component != transition.CompatibilityMachine || !blocked.Deadline.Equal(now.Add(time.Hour)) {
+			t.Fatalf("intervention did not expose unavailable pinned behavior: %+v, %v", blocked, err)
+		}
+		machine, err := fsm.NewMachine(fsm.Config[string, string, string, string]{
+			ID: "task", Version: "1", InitialStates: []string{"open"},
+			Handlers:         map[string]fsm.Handler[string, string, string, string]{"open": fsm.NoopHandler[string, string, string, string]{}},
+			SelectInitial:    func(string) (fsm.Selection[string], error) { return fsm.Selection[string]{}, nil },
+			SelectTransition: func(string, string, string) (fsm.Selection[string], error) { return fsm.Selection[string]{}, nil },
+			ClassifyFailure: func(error) (fsm.Failure, fsm.Disposition) {
+				return fsm.Failure{Code: "failed"}, fsm.DispositionIntervention
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := registry.Register(machine); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		restored, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || restored.Compatibility != nil || restored.Status != transition.NeedsIntervention ||
+			!restored.Deadline.Equal(blocked.Deadline) {
+			t.Fatalf("restoration changed intervention or deadline: %+v, %v", restored, err)
+		}
+		controls, err := transition.NewAuthorizedHookControls(store, runner, func(context.Context, transition.ControlAuthorization) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := controls.Hook(ctx, lease, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BlockQuiescedCompatibility(ctx, lease, clock, restored, transition.CompatibilityDiagnostic{
+			Component: transition.CompatibilityMachine, Name: "task", Version: "1",
+		}); !errors.Is(err, transition.ErrConflict) {
+			t.Fatalf("stale discovery blocked an authorized control: %v", err)
+		}
+		resumed, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || resumed.Status != transition.Waiting || resumed.Compatibility != nil {
+			t.Fatalf("stale discovery changed resumed work: %+v, %v", resumed, err)
+		}
+	})
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Error(err)
