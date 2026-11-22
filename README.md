@@ -55,9 +55,10 @@ intent ID. A delivery error is returned even when retry scheduling succeeds.
 When a worker cannot rehydrate a pinned hook before starting it, the adapter
 persists a safe compatibility diagnostic without consuming an attempt.
 `CompatibilityCoordinator` revalidates these blocks after behavior is restored;
-it also discovers missing pinned behavior for waiting and quiesced intervention
-work, fencing any unstarted claim. The host must schedule that scan and use the
-same coordinator owner.
+it also discovers missing pinned behavior for waiting, quiesced retry/recovery,
+and intervention work, fencing any unstarted claim. It does not interrupt
+started or successfully completed hooks. The host must schedule that scan and
+use the same coordinator owner.
 SQLite's `ReadCompatibility` can inspect a diagnostic even when an identifier
 or state value cannot be decoded.
 `InspectionStore` lists retained executions and returns payload-free protocol
@@ -137,8 +138,8 @@ stores use the host commit and handoff reconciliation interfaces instead.
 destination validation, original-request replay, and worker fencing. Converters
 receive the old encoded state; domain verification and audit remain host-owned.
 Migration preserves policy and deadlines, and fenced started attempts are
-recorded as unknown. Compatibility discovery for running work depends on a
-worker or coordinator encountering the missing behavior; it is not exhaustive.
+recorded as unknown. Compatibility discovery is not exhaustive: in-flight and
+completed work depends on a worker or coordinator encountering missing behavior.
 
 ```sh
 go test ./adapters/sqlite

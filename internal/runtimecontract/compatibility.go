@@ -196,4 +196,63 @@ func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore
 		!restored.Deadline.Equal(waiting.Deadline) {
 		t.Fatalf("waiting restoration changed phase or deadline: %+v, %v", restored, err)
 	}
+	_, _, err = store.Accept(ctx, "e", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "e", Entity: "e", Key: "key",
+			Operation: transition.Initialize, MachineID: "machine", MachineVersion: "5", Target: "open",
+			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
+			Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 3, AttemptTimeout: time.Minute, OverallTimeout: time.Hour, RetryDelays: []time.Duration{0}},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err = store.AcquireTransitionLease(ctx, "e", "e", "coordinator", clock.Now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, lease, clock.Now, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = store.ClaimHook(ctx, "worker", clock.Now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, claim, clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReportHook(ctx, claim, transition.HookResult{
+		Failure: fsm.Failure{Code: "failed"}, Disposition: fsm.DispositionRetry,
+	}, clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("unavailable retry behavior was not reported: %v", err)
+	}
+	retry, err := store.ReadActiveExecution(ctx, "e")
+	progress, progressErr := store.ReadHookProgress(ctx, "e")
+	if err != nil || progressErr != nil || retry.Status != transition.Running || retry.Compatibility == nil ||
+		progress.Dispatch.Kind != transition.HookRetry || len(progress.Attempts) != 1 || progress.BudgetUsed != 1 {
+		t.Fatalf("retry discovery changed phase or attempt history: execution=%+v progress=%+v errors=%v, %v",
+			retry, progress, err, progressErr)
+	}
+	register("5")
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restored, err = store.ReadActiveExecution(ctx, "e")
+	if err != nil || restored.Status != transition.Running || restored.Compatibility != nil ||
+		!restored.Deadline.Equal(retry.Deadline) {
+		t.Fatalf("retry restoration changed phase or deadline: %+v, %v", restored, err)
+	}
 }

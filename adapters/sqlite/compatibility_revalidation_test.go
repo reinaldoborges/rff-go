@@ -310,7 +310,7 @@ func TestRejectedCommitRecoveryRetainsCompatibilityBlockUntilBehaviorReturns(t *
 		if _, err := controls.Hook(ctx, lease, clock, transition.HookControl{ID: "retry", Action: transition.RetryIntervention}); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.BlockQuiescedCompatibility(ctx, lease, clock, restored, transition.CompatibilityDiagnostic{
+		if err := store.BlockQuiescedCompatibility(ctx, lease, clock, restored, nil, transition.CompatibilityDiagnostic{
 			Component: transition.CompatibilityMachine, Name: "task", Version: "1",
 		}); !errors.Is(err, transition.ErrConflict) {
 			t.Fatalf("stale discovery blocked an authorized control: %v", err)

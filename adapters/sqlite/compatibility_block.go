@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -167,13 +168,14 @@ func (s *Store[EntityID, StateID]) BlockExecutionCompatibility(
 // quiesced snapshot has not changed since validation.
 func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
 	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time,
-	expected transition.Execution[EntityID, StateID], diagnostic transition.CompatibilityDiagnostic,
+	expected transition.Execution[EntityID, StateID], expectedProgress *transition.HookProgress, diagnostic transition.CompatibilityDiagnostic,
 ) error {
 	if clock == nil {
 		return transition.ErrInvalidLease
 	}
 	if (expected.Status != transition.NeedsIntervention &&
-		(expected.Status != transition.Waiting || expected.CommitOperationID != "")) || expected.Compatibility != nil ||
+		((expected.Status != transition.Waiting && expected.Status != transition.Running || expected.CommitOperationID != "") &&
+			(expected.Status != transition.Aborting || !expected.RecoveryStarted))) || expected.Compatibility != nil ||
 		expected.ID != lease.ExecutionID || expected.Entity != lease.Entity {
 		return transition.ErrInvalidHook
 	}
@@ -196,20 +198,26 @@ func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
 		if !validDiagnostic(record, diagnostic) {
 			return transition.ErrInvalidHook
 		}
-		if record.Status == transition.Waiting {
-			work, err := loadHook(ctx, tx, lease.ExecutionID)
-			if err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
-				return err
+		work, err := loadHook(ctx, tx, lease.ExecutionID)
+		if err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
+			return err
+		}
+		if errors.Is(err, transition.ErrNoHookActivity) != (expectedProgress == nil) {
+			return transition.ErrConflict
+		}
+		if expectedProgress != nil {
+			current := work.Progress
+			current.Started, current.LeaseExpiresAt, current.BudgetUsed = work.Started, work.ExpiresAt, work.BudgetUsed
+			if !reflect.DeepEqual(current, *expectedProgress) {
+				return transition.ErrConflict
 			}
-			if err == nil {
-				if work.Started {
-					return transition.ErrConflict
-				}
-				if work.Owner != "" {
-					fenceHook(&work, now)
-					if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
-						return err
-					}
+			if record.Status != transition.NeedsIntervention && (work.Started || work.Progress.Completed) {
+				return transition.ErrConflict
+			}
+			if work.Owner != "" && !work.Started {
+				fenceHook(&work, now)
+				if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
+					return err
 				}
 			}
 		}

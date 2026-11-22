@@ -67,13 +67,14 @@ func NewCompatibilityError(diagnostic CompatibilityDiagnostic, cause error) *Com
 }
 
 // CompatibilityStore provides fenced discovery and revalidation of diagnostics.
-// BlockQuiescedCompatibility compares the complete snapshot atomically and
-// fences unstarted hook claims without consuming an attempt.
+// BlockQuiescedCompatibility compares the execution and hook progress atomically,
+// rejects started or completed runnable work, and fences unstarted claims
+// without consuming an attempt. A nil progress denotes no dispatched hook.
 type CompatibilityStore[EntityID comparable, StateID comparable] interface {
 	ActiveExecutionReader[EntityID, StateID]
 	TransitionLeaseStore[EntityID]
 	ReadHookProgress(context.Context, string) (HookProgress, error)
-	BlockQuiescedCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, Execution[EntityID, StateID], CompatibilityDiagnostic) error
+	BlockQuiescedCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, Execution[EntityID, StateID], *HookProgress, CompatibilityDiagnostic) error
 	RevalidateCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, CompatibilityDiagnostic, *CompatibilityDiagnostic) error
 }
 
@@ -149,6 +150,10 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 	if err != nil && !errors.Is(err, ErrNoHookActivity) {
 		return err
 	}
+	if execution.Compatibility == nil && (execution.Status == Running || execution.Status == Aborting) &&
+		(!hasProgress || progress.Started || progress.Completed) {
+		return nil
+	}
 	call := HookCall{Kind: progress.Dispatch.Kind, Failure: progress.Dispatch.Failure}
 	if !hasProgress {
 		call.Kind = HookEnter
@@ -173,7 +178,11 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		}
 		next = &compatibility.Diagnostic
 		if execution.Compatibility == nil {
-			err := c.store.BlockQuiescedCompatibility(ctx, lease, c.config.Clock, execution, *next)
+			var expectedProgress *HookProgress
+			if hasProgress {
+				expectedProgress = &progress
+			}
+			err := c.store.BlockQuiescedCompatibility(ctx, lease, c.config.Clock, execution, expectedProgress, *next)
 			if errors.Is(err, ErrConflict) {
 				return nil
 			}
@@ -192,5 +201,6 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 
 func compatibilityDiscoverable[EntityID comparable, StateID comparable](execution Execution[EntityID, StateID]) bool {
 	return execution.Status == NeedsIntervention ||
-		execution.Status == Waiting && execution.CommitOperationID == ""
+		(execution.Status == Waiting || execution.Status == Running) && execution.CommitOperationID == "" ||
+		execution.Status == Aborting && execution.RecoveryStarted
 }
