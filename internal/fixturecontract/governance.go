@@ -148,6 +148,46 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 			t.Fatalf("changed transfer replay did not conflict: %v", err)
 		}
 	})
+	t.Run("assignment requires an active same-group membership", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		activeMember(t, fixture, now)
+		if err := fixture.SeedUsers(ctx, "invitee"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.CreateGroup(ctx, "outsider", "other-group", "outsider-membership"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "invited-membership", "invite-new", now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.AssignTask(ctx, "outsider", "task", "member-membership"); !errors.Is(err, taskmanager.ErrDenied) {
+			t.Fatalf("outsider assigned a task: %v", err)
+		}
+		for _, membership := range []string{"invited-membership", "outsider-membership"} {
+			if err := fixture.AssignTask(ctx, "member", "task", membership); !errors.Is(err, taskmanager.ErrConflict) {
+				t.Fatalf("invalid assignee %q was accepted: %v", membership, err)
+			}
+		}
+		history, err := fixture.TaskAssignmentHistory(ctx, "owner", "task")
+		if err != nil || len(history) != 0 {
+			t.Fatalf("denied assignments created history: %+v, %v", history, err)
+		}
+		if err := fixture.AssignTask(ctx, "member", "task", "member-membership"); err != nil {
+			t.Fatal(err)
+		}
+		task, err := fixture.Task(ctx, "owner", "task")
+		if err != nil || task.Assignee != "member-membership" {
+			t.Fatalf("active same-group assignment was not retained: %+v, %v", task, err)
+		}
+	})
 	t.Run("invalid recipients preserve ownership", func(t *testing.T) {
 		ctx := context.Background()
 		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
