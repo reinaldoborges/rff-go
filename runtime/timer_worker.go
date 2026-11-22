@@ -27,10 +27,16 @@ type TimerDelivery[Event any] struct {
 }
 
 // TimerDeliveryStore claims due timers and completes only the current claim.
+// Compatibility blocks fence a claim; clearing a block must compare both its
+// diagnostic and generation so stale revalidation cannot clear a newer block.
+// BlockedTimers returns encoded application events and requires host protection.
 type TimerDeliveryStore interface {
 	ClaimDueTimer(context.Context, string, func() time.Time, time.Duration) (TimerRecord, TimerLease, error)
 	RenewTimer(context.Context, TimerLease, func() time.Time, time.Duration) (TimerLease, error)
 	CompleteTimer(context.Context, TimerLease, func() time.Time) error
+	BlockTimerCompatibility(context.Context, TimerLease, func() time.Time, CompatibilityDiagnostic) error
+	BlockedTimers(context.Context) ([]TimerRecord, error)
+	ClearTimerCompatibility(context.Context, string, uint64, CompatibilityDiagnostic) error
 }
 
 // TimerWorkerConfig supplies explicit delivery lease timing and a worker clock.
@@ -62,10 +68,18 @@ func NewTimerWorker[Event any](
 	return &TimerWorker[Event]{store: store, resolve: resolve, handle: handle, config: config}, nil
 }
 
-// RunOne processes one due timer. Errors leave the claim for expiry and retry.
+// RunOne revalidates blocked codecs and processes one due timer. Handler errors
+// leave the claim for expiry and retry; codec failures persist a fenced block.
 func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
+	unavailable, err := w.revalidateCompatibility(ctx)
+	if err != nil {
+		return err
+	}
 	record, lease, err := w.store.ClaimDueTimer(ctx, w.config.ID, w.config.Clock.Now, w.config.LeaseTTL)
 	if err != nil {
+		if errors.Is(err, ErrNoDueTimer) && unavailable != nil {
+			return unavailable
+		}
 		return err
 	}
 	if record.ID == "" || record.ID != lease.ID || lease.Owner != w.config.ID || lease.Generation == 0 ||
@@ -120,9 +134,33 @@ func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
 			}
 		}
 	}()
-	deliveryErr := w.deliver(workCtx, record)
+	event, deliveryErr := w.decode(workCtx, record)
+	var compatibility *CompatibilityError
+	if deliveryErr == nil {
+		deliveryErr = w.handle(workCtx, TimerDelivery[Event]{TimerReceipt: record.TimerReceipt, Event: event})
+		if deliveryErr != nil {
+			deliveryErr = fmt.Errorf("deliver timer %q: %w", record.ID, deliveryErr)
+		}
+	} else {
+		errors.As(deliveryErr, &compatibility)
+	}
 	if deliveryErr == nil {
 		deliveryErr = workCtx.Err()
+	}
+	if compatibility != nil {
+		stopRenewal()
+		renewalErr := <-renewed
+		if renewalErr != nil {
+			renewalErr = fmt.Errorf("renew timer lease: %w", renewalErr)
+		}
+		var blockErr error
+		if workCtx.Err() == nil && renewalErr == nil {
+			blockErr = w.store.BlockTimerCompatibility(workCtx, lease, w.config.Clock.Now, compatibility.Diagnostic)
+			if blockErr != nil {
+				blockErr = fmt.Errorf("block incompatible timer: %w", blockErr)
+			}
+		}
+		return errors.Join(deliveryErr, blockErr, renewalErr, workCtx.Err())
 	}
 	var reportErr error
 	reported := false
@@ -136,7 +174,7 @@ func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
 		return nil
 	}
 	if reportErr != nil {
-		reportErr = fmt.Errorf("complete timer delivery: %w", reportErr)
+		reportErr = fmt.Errorf("record timer delivery outcome: %w", reportErr)
 	}
 	if renewalErr != nil {
 		renewalErr = fmt.Errorf("renew timer lease: %w", renewalErr)
@@ -144,17 +182,47 @@ func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
 	return errors.Join(deliveryErr, reportErr, renewalErr, workCtx.Err())
 }
 
-func (w *TimerWorker[Event]) deliver(ctx context.Context, record TimerRecord) error {
+func (w *TimerWorker[Event]) decode(ctx context.Context, record TimerRecord) (Event, error) {
+	var zero Event
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
 	codec, err := resolveCodec(w.resolve, record.Event.Codec)
 	if err != nil {
-		return err
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		return zero, compatibilityError(CompatibilityEventCodec, record.Event.Codec.Name, record.Event.Codec.Version, err)
 	}
 	event, err := codec.Decode(ctx, slices.Clone(record.Event.Data))
 	if err != nil {
-		return compatibilityError(CompatibilityEventCodec, record.Event.Codec.Name, record.Event.Codec.Version, err)
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		return zero, compatibilityError(CompatibilityEventCodec, record.Event.Codec.Name, record.Event.Codec.Version, err)
 	}
-	if err := w.handle(ctx, TimerDelivery[Event]{TimerReceipt: record.TimerReceipt, Event: event}); err != nil {
-		return fmt.Errorf("deliver timer %q: %w", record.ID, err)
+	return event, nil
+}
+
+func (w *TimerWorker[Event]) revalidateCompatibility(ctx context.Context) (unavailable error, err error) {
+	records, err := w.store.BlockedTimers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list incompatible timers: %w", err)
 	}
-	return nil
+	for _, record := range records {
+		if record.Compatibility == nil {
+			return nil, ErrInvalidDecision
+		}
+		if _, err := w.decode(ctx, record); err != nil {
+			if errors.Is(err, ErrCompatibility) && ctx.Err() == nil {
+				unavailable = errors.Join(unavailable, fmt.Errorf("timer %q: %w", record.ID, err))
+				continue
+			}
+			return nil, err
+		}
+		if err := w.store.ClearTimerCompatibility(ctx, record.ID, record.Generation, *record.Compatibility); err != nil && !errors.Is(err, ErrConflict) {
+			return nil, fmt.Errorf("revalidate timer %q: %w", record.ID, err)
+		}
+	}
+	return unavailable, nil
 }

@@ -66,7 +66,11 @@ deadlines. The host schedules `TimerWorker.RunOne` calls and supplies a durable
 handler that deduplicates by timer ID. Delivery is at least once, and errors
 leave claims to expire for recovery. Timer scheduling is not atomic with
 application state: hosts must reconcile missing timers from durable workflow
-state after a crash.
+state after a crash. Unavailable timer event codecs block only the affected
+timer and persist a diagnostic, available through `BlockedTimers`. The worker
+revalidates blocked timers before each scan and resumes them when their pinned
+codec can decode the original event. When no other timer can be claimed, it
+reports the remaining incompatibility rather than an empty queue.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -77,11 +81,12 @@ go test ./runtime -run TestAcceptanceStoreContract
 ```
 
 `internal/runtimecontract` provides reusable execution, worker-loss,
-commit-rejection, and notification-handoff contracts over the runtime ports.
+commit-rejection, notification-handoff, and timer-compatibility contracts over
+the runtime ports.
 Run them against the SQLite adapter with:
 
 ```sh
-go test ./adapters/sqlite -run TestRuntimeStoreContract
+go test ./adapters/sqlite -run 'TestRuntime(Store|TimerCompatibility)Contract'
 ```
 
 ## SQLite acceptance store
@@ -95,8 +100,9 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 through 7 stores
+without writes for unsupported schemas. It migrates version 1 through 8 stores
 transactionally, preserving accepted records, reservations, and leases.
+Older adapter versions cannot open a migrated store.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
 the acceptance transaction; its callback must leave replays read-only.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.

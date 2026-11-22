@@ -26,6 +26,9 @@ type TimerReceipt struct {
 	Deadline   time.Time
 }
 
+// CurrentTimerSchemaVersion identifies the current durable timer representation.
+const CurrentTimerSchemaVersion uint = 2
+
 // TimerRecord is the versioned representation persisted by a timer adapter.
 type TimerRecord struct {
 	SchemaVersion uint
@@ -35,6 +38,7 @@ type TimerRecord struct {
 	Owner          string
 	Generation     uint64
 	LeaseExpiresAt time.Time
+	Compatibility  *CompatibilityDiagnostic `json:",omitempty"`
 }
 
 // TimerScheduleStore serializes scheduling by timer ID. A nil decision replays
@@ -89,7 +93,7 @@ func (s *TimerScheduler[Event]) Schedule(ctx context.Context, request TimerReque
 			return nil, fmt.Errorf("encode timer event: %w", err)
 		}
 		return &TimerRecord{
-			SchemaVersion: 1,
+			SchemaVersion: CurrentTimerSchemaVersion,
 			TimerReceipt:  TimerReceipt{ID: request.ID, WorkflowID: request.WorkflowID, Deadline: request.Deadline.UTC()},
 			Event:         EncodedValue{Codec: request.EventCodec, Data: slices.Clone(data)},
 		}, nil

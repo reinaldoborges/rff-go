@@ -27,6 +27,9 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"unreadable hook work", `INSERT INTO rff_hook_work (execution_id, work) VALUES ('missing', X'ff')`},
 		{"unreadable notification work", `INSERT INTO rff_notification_work (execution_id, work) VALUES ('missing', X'ff')`},
 		{"unreadable timer", `INSERT INTO rff_timers (id, record) VALUES ('timer', X'ff')`},
+		{"new timer record in old adapter schema", `UPDATE rff_schema_version SET version = 8;
+			INSERT INTO rff_timers (id, record) VALUES ('timer',
+			'{"SchemaVersion":2,"ID":"timer","WorkflowID":"workflow","Deadline":"2026-01-01T00:00:00Z","Event":{"Codec":{"Name":"event","Version":"1"}}}')`},
 		{"unreadable input", `INSERT INTO rff_inputs (id, record) VALUES ('input', X'ff')`},
 	}
 	for _, tt := range tests {

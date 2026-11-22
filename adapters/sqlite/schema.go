@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 8
+	adapterSchemaVersion = 9
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -56,7 +56,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (8)`,
+			`INSERT INTO rff_schema_version (version) VALUES (9)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -216,7 +216,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			if definition != timersDDL {
 				return fmt.Errorf("%w: incompatible timers table", ErrUnsupportedSchema)
 			}
-			if err := validateTimers(ctx, tx); err != nil {
+			if err := validateTimers(ctx, tx, schemaVersion); err != nil {
 				return err
 			}
 		}
@@ -243,6 +243,11 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			}
 			if err := validateInputs(ctx, tx); err != nil {
 				return err
+			}
+		}
+		if schemaVersion < 9 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 9`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}
 	}
