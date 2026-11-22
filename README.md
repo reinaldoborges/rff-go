@@ -45,8 +45,8 @@ requirements. In-memory databases are not supported by this adapter.
 The adapter owns its `rff_` tables, scans existing records on open, and fails
 without writes for unsupported schemas. It migrates version 1 acceptance stores
 to version 2 transactionally, preserving accepted records and reservations.
-It currently implements acceptance and transition leases only, not worker
-execution, domain commits, or notifications.
+It currently implements acceptance, active-execution discovery, and transition
+leases only, not worker execution, domain commits, or notifications.
 
 ```sh
 go test ./adapters/sqlite

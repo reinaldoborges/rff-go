@@ -48,6 +48,16 @@ func TestIncompatibleStateBlocksOnlyAffectedExecution(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	ids, err := store.ActiveExecutionIDs(context.Background())
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("incompatible state prevented discovery: ids=%v error=%v", ids, err)
+	}
+	if _, err := store.ReadActiveExecution(context.Background(), "incompatible"); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("incompatible execution should fail individually: %v", err)
+	}
+	if record, err := store.ReadActiveExecution(context.Background(), "compatible"); err != nil || record.Target != "compatible" {
+		t.Fatalf("compatible execution could not be read: record=%+v error=%v", record, err)
+	}
 	replay := func(view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		if view.Existing == nil || !view.Active {
 			return nil, errors.New("missing execution or reservation")
