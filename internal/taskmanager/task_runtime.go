@@ -108,6 +108,10 @@ func (f *Fixture) acceptTask(ctx context.Context, delivery transition.InputDeliv
 	if input.Task == nil || delivery.Kind != transition.Command || delivery.WorkflowID != taskEntity(input.Task.ID) {
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
 	}
+	entity, err := f.entityForInput(ctx, taskEntityKind, input.Task.ID, delivery.ID)
+	if err != nil {
+		return transition.InputOutcome{}, err
+	}
 	var previous string
 	if input.Task.Event != "" {
 		err := f.db.QueryRowContext(ctx, `SELECT status FROM tm_tasks WHERE id = ?`, input.Task.ID).Scan(&previous)
@@ -127,7 +131,7 @@ func (f *Fixture) acceptTask(ctx context.Context, delivery transition.InputDeliv
 		return transition.InputOutcome{}, err
 	}
 	request := transition.Request[string, string, string, fixtureInput]{
-		Entity: delivery.WorkflowID, Key: delivery.ID, MachineID: "taskmanager-task", MachineVersion: "1",
+		Entity: entity, Key: delivery.ID, MachineID: "taskmanager-task", MachineVersion: "1",
 		Input: input, InputCodec: taskInputCodec, Notification: transition.NotifyInherit,
 	}
 	if input.Task.Event == "" {

@@ -2,6 +2,7 @@ package taskmanager_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,91 @@ import (
 	"github.com/reinaldoborges/rff-go/internal/taskmanager"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+func TestOverlappingIdentifiersPreserveLegacyActiveWork(t *testing.T) {
+	for _, taskFirst := range []bool{false, true} {
+		name := "legacy-membership"
+		if taskFirst {
+			name = "legacy-task"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			path := filepath.Join(t.TempDir(), "legacy.db")
+			fixture, err := taskmanager.Open(path, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				if fixture != nil {
+					if err := fixture.Close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+				t.Fatal(err)
+			}
+			var original string
+			if taskFirst {
+				original, err = fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+			} else {
+				original, err = fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fixture = nil
+			db, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`DROP TABLE tm_runtime_entities`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fixture, err = taskmanager.Open(path, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if taskFirst {
+				_, err = fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour))
+			} else {
+				_, err = fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+			}
+			if err != nil {
+				t.Fatalf("new independent request conflicts with legacy work: %v", err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var replay string
+			if taskFirst {
+				replay, err = fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+			} else {
+				replay, err = fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour))
+			}
+			if err != nil || replay != original {
+				t.Fatalf("legacy replay: %q, %v", replay, err)
+			}
+			if _, err := fixture.Task(ctx, "owner", "task"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.Membership(ctx, "owner", "taskmanager-task:task"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestTaskLifecycleProgressesAndRejectsInvalidEvents(t *testing.T) {
 	ctx := context.Background()
@@ -283,5 +369,166 @@ func TestTaskRequestsReplayAcrossReopen(t *testing.T) {
 	}
 	if _, err := fixture.TransitionTask(ctx, "owner", "task", "start", taskmanager.CancelTask); !errors.Is(err, taskmanager.ErrConflict) {
 		t.Fatalf("changed transition replay did not conflict: %v", err)
+	}
+}
+
+func TestLegacyPendingInputReplaysAfterEntityRemapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "pending.db")
+	fixture, err := taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if fixture != nil {
+			if err := fixture.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	original, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "other-group", "taskmanager-task:task"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture = nil
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(`UPDATE rff_inputs SET record = CAST(json_set(CAST(record AS TEXT), '$.Outcome', NULL) AS BLOB)
+		WHERE json_extract(CAST(record AS TEXT), '$.Channel') = 'taskmanager-tasks'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		t.Fatalf("prepare interrupted input: count=%d, error=%v", count, err)
+	}
+	if _, err := db.Exec(`DROP TABLE tm_runtime_entities`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture, err = taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+	if err != nil || replay != original {
+		t.Fatalf("interrupted legacy input replay: %q, %v", replay, err)
+	}
+	if _, err := fixture.TransitionTask(ctx, "owner", "task", "start", taskmanager.StartTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	task, err := fixture.Task(ctx, "owner", "task")
+	if err != nil || task.Status != taskmanager.TaskInProgress {
+		t.Fatalf("task after legacy replay: %+v, %v", task, err)
+	}
+}
+
+func TestTaskAndMembershipWithOverlappingIdentifiersAreIndependent(t *testing.T) {
+	for _, taskFirst := range []bool{false, true} {
+		name := "membership-first"
+		if taskFirst {
+			name = "task-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			path := filepath.Join(t.TempDir(), "overlap.db")
+			fixture, err := taskmanager.Open(path, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if fixture != nil {
+					if err := fixture.Close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+				t.Fatal(err)
+			}
+			var invitation, task string
+			invite := func() {
+				invitation, err = fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour))
+				if err != nil {
+					t.Fatalf("invite: %v", err)
+				}
+			}
+			create := func() {
+				task, err = fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task")
+				if err != nil {
+					t.Fatalf("create task: %v", err)
+				}
+			}
+			if taskFirst {
+				create()
+				invite()
+			} else {
+				invite()
+				create()
+			}
+			if err := fixture.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fixture = nil
+			fixture, err = taskmanager.Open(path, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if replay, err := fixture.Invite(ctx, "owner", "group", "invitee", "taskmanager-task:task", "invite", now.Add(time.Hour)); err != nil || replay != invitation {
+				t.Fatalf("invitation replay: %q, %v", replay, err)
+			}
+			if replay, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task"); err != nil || replay != task {
+				t.Fatalf("task replay: %q, %v", replay, err)
+			}
+			if _, err := fixture.Decide(ctx, "invitee", "taskmanager-task:task", "accept", taskmanager.AcceptInvitation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.TransitionTask(ctx, "owner", "task", "start", taskmanager.StartTask); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			gotTask, err := fixture.Task(ctx, "owner", "task")
+			if err != nil || gotTask.Status != taskmanager.TaskInProgress {
+				t.Fatalf("task status: %+v, %v", gotTask, err)
+			}
+			membership, err := fixture.Membership(ctx, "owner", "taskmanager-task:task")
+			if err != nil || membership.Status != taskmanager.Active {
+				t.Fatalf("membership status: %+v, %v", membership, err)
+			}
+		})
 	}
 }

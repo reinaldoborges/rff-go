@@ -189,6 +189,10 @@ func (f *Fixture) acceptInvitation(ctx context.Context, delivery transition.Inpu
 	if delivery.Kind != transition.Command || delivery.WorkflowID != input.MembershipID {
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
 	}
+	entity, err := f.entityForInput(ctx, membershipEntityKind, input.MembershipID, delivery.ID)
+	if err != nil {
+		return transition.InputOutcome{}, err
+	}
 	store := invitationAcceptanceStore{fixture: f, input: input}
 	acceptor, err := transition.NewAcceptor[string, string, string, fixtureInput](
 		store, &f.machines, resolveMembershipInput, resolveMembershipEvent, newExecutionID, f.clock,
@@ -197,7 +201,7 @@ func (f *Fixture) acceptInvitation(ctx context.Context, delivery transition.Inpu
 		return transition.InputOutcome{}, err
 	}
 	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, fixtureInput]{
-		Entity: input.MembershipID, Key: delivery.ID, Operation: transition.Initialize,
+		Entity: entity, Key: delivery.ID, Operation: transition.Initialize,
 		MachineID: "taskmanager-membership", MachineVersion: "1",
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,
 	})

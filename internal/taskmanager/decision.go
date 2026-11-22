@@ -38,7 +38,7 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 			var deadline sql.NullString
 			var closed bool
 			err := tx.QueryRowContext(ctx, `SELECT m.group_id, m.user_id, m.status, m.deadline, g.owner_id, g.closed
-				FROM tm_memberships AS m JOIN tm_groups AS g ON g.id = m.group_id WHERE m.id = ?`, entity).
+				FROM tm_memberships AS m JOIN tm_groups AS g ON g.id = m.group_id WHERE m.id = ?`, s.input.MembershipID).
 				Scan(&groupID, &userID, &status, &deadline, &owner, &closed)
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrNotFound
@@ -61,7 +61,7 @@ func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 				}
 				var assigned bool
 				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_tasks WHERE group_id = ? AND assignee = ?)`,
-					groupID, entity).Scan(&assigned); err != nil {
+					groupID, s.input.MembershipID).Scan(&assigned); err != nil {
 					return nil, fmt.Errorf("check member task assignments: %w", err)
 				}
 				if assigned {
@@ -102,6 +102,10 @@ func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputD
 		delivery.Kind != transition.ExternalEvent) {
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "invalid"}}, nil
 	}
+	entity, err := f.entityForInput(ctx, membershipEntityKind, input.MembershipID, delivery.ID)
+	if err != nil {
+		return transition.InputOutcome{}, err
+	}
 	store := decisionAcceptanceStore{fixture: f, input: input}
 	acceptor, err := transition.NewAcceptor[string, string, string, fixtureInput](
 		store, &f.machines, resolveMembershipInput, resolveMembershipEvent, newExecutionID, f.clock,
@@ -114,7 +118,7 @@ func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputD
 		previous = string(Active)
 	}
 	execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, fixtureInput]{
-		Entity: input.MembershipID, Key: delivery.ID, Operation: transition.Transition, MachineID: "taskmanager-membership", MachineVersion: "1",
+		Entity: entity, Key: delivery.ID, Operation: transition.Transition, MachineID: "taskmanager-membership", MachineVersion: "1",
 		HasPrevious: true, Previous: previous, HasEvent: true, Event: string(input.Event), EventCodec: membershipEventCodec,
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,
 	})

@@ -153,6 +153,10 @@ can inspect and control executions but has no task-manager permissions.
 Each invocation opens the same file-backed fixture; `drive` performs one
 reconciliation round and must be run again when more work or timers are due.
 No background service or real notification provider is started.
+Task and Membership runtime identities are stored separately. Existing active
+work and interrupted input replays are preserved on upgrade. Once a fixture
+database has been opened by this version, do not use older fixture binaries
+against it: they do not recognize the identity mapping.
 
 ```sh
 go run ./cmd/taskmanager -db ./fixture.db seed-user owner invitee

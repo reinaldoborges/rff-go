@@ -37,7 +37,11 @@ func (h membershipCommitHost) Commit(ctx context.Context, lease transition.Trans
 		if execution.MachineID == "taskmanager-task" {
 			return commitTask(ctx, tx, execution, input, receipt)
 		}
-		if execution.Entity != input.MembershipID {
+		entityValid, err := validRuntimeEntity(ctx, tx, membershipEntityKind, input.MembershipID, execution.Entity)
+		if err != nil {
+			return transition.CommitReceipt{}, fmt.Errorf("validate membership identity: %w", err)
+		}
+		if !entityValid {
 			return transition.CommitReceipt{}, transition.ErrInvalidDecision
 		}
 		if execution.Operation == transition.Transition {

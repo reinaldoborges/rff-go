@@ -12,7 +12,14 @@ import (
 func commitTask(ctx context.Context, tx *sql.Tx, execution transition.Execution[string, string], input fixtureInput,
 	receipt transition.CommitReceipt,
 ) (transition.CommitReceipt, error) {
-	if input.Task == nil || execution.Entity != taskEntity(input.Task.ID) {
+	if input.Task == nil {
+		return transition.CommitReceipt{}, transition.ErrInvalidDecision
+	}
+	valid, err := validRuntimeEntity(ctx, tx, taskEntityKind, input.Task.ID, execution.Entity)
+	if err != nil {
+		return transition.CommitReceipt{}, fmt.Errorf("validate task identity: %w", err)
+	}
+	if !valid {
 		return transition.CommitReceipt{}, transition.ErrInvalidDecision
 	}
 	var open bool
