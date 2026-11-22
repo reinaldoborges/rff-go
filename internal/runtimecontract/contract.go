@@ -229,6 +229,9 @@ func Run(t *testing.T, newStore func(*testing.T) Store) {
 		if err := store.ReportHook(ctx, lost, transition.HookResult{Success: true}, clock); !errors.Is(err, transition.ErrStaleActivityLease) {
 			t.Fatalf("stale worker report was accepted: %v", err)
 		}
+		if _, err := store.RenewHook(ctx, lost, clock, time.Minute); !errors.Is(err, transition.ErrStaleActivityLease) {
+			t.Fatalf("stale worker renewal was accepted: %v", err)
+		}
 	})
 	t.Run("definitive rejection recovers without commit", func(t *testing.T) {
 		ctx := context.Background()
