@@ -21,6 +21,31 @@ func (fixtureClock) WithTimeout(ctx context.Context, d time.Duration) (context.C
 	return context.WithTimeout(ctx, d)
 }
 
+func onlyCompatibility(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*transition.CompatibilityError); ok {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !onlyCompatibility(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyCompatibility(wrapped.Unwrap())
+	}
+	return err == transition.ErrCompatibility
+}
+
 type membershipCommitHost struct{ fixture *Fixture }
 
 func (h membershipCommitHost) Commit(ctx context.Context, lease transition.TransitionLease[string],
@@ -113,7 +138,7 @@ func (f *Fixture) Drive(ctx context.Context) error {
 		return err
 	}
 	pendingErr := ingress.Reconcile(ctx)
-	if pendingErr != nil && (!errors.Is(pendingErr, transition.ErrCompatibility) || ctx.Err() != nil) {
+	if pendingErr != nil && (!onlyCompatibility(pendingErr) || ctx.Err() != nil) {
 		return pendingErr
 	}
 	tasks, err := f.taskIngress()
@@ -121,7 +146,7 @@ func (f *Fixture) Drive(ctx context.Context) error {
 		return errors.Join(pendingErr, err)
 	}
 	taskErr := tasks.Reconcile(ctx)
-	if taskErr != nil && (!errors.Is(taskErr, transition.ErrCompatibility) || ctx.Err() != nil) {
+	if taskErr != nil && (!onlyCompatibility(taskErr) || ctx.Err() != nil) {
 		return errors.Join(pendingErr, taskErr)
 	}
 	pendingErr = errors.Join(pendingErr, taskErr)
@@ -136,7 +161,10 @@ func (f *Fixture) Drive(ctx context.Context) error {
 		return errors.Join(pendingErr, err)
 	}
 	if err := compatibility.Reconcile(ctx); err != nil {
-		return errors.Join(pendingErr, err)
+		pendingErr = errors.Join(pendingErr, err)
+		if !onlyCompatibility(err) || ctx.Err() != nil {
+			return pendingErr
+		}
 	}
 	coordinator, err := transition.NewCoordinator[string, string](f.store, f.runner, config)
 	if err != nil {
@@ -149,26 +177,52 @@ func (f *Fixture) Drive(ctx context.Context) error {
 		return errors.Join(pendingErr, err)
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
-		return errors.Join(pendingErr, err)
+		pendingErr = errors.Join(pendingErr, err)
+		if !onlyCompatibility(err) || ctx.Err() != nil {
+			return pendingErr
+		}
 	}
+	compatibilityFailures := 0
+	compatibilityLimit := 0
 	for {
 		err := worker.RunOne(ctx)
 		if errors.Is(err, transition.ErrNoHookActivity) {
 			break
 		}
 		if err != nil {
-			return errors.Join(pendingErr, err)
+			pendingErr = errors.Join(pendingErr, err)
+			if !onlyCompatibility(err) || ctx.Err() != nil {
+				return pendingErr
+			}
+			if compatibilityLimit == 0 {
+				// Bound retries even if an adapter fails to remove blocked work from its claim queue.
+				ids, listErr := f.store.ActiveExecutionIDs(ctx)
+				if listErr != nil {
+					return errors.Join(pendingErr, listErr)
+				}
+				compatibilityLimit = len(ids)
+			}
+			compatibilityFailures++
+			if compatibilityFailures > compatibilityLimit {
+				return pendingErr
+			}
 		}
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
-		return errors.Join(pendingErr, err)
+		pendingErr = errors.Join(pendingErr, err)
+		if !onlyCompatibility(err) || ctx.Err() != nil {
+			return pendingErr
+		}
 	}
 	commits, err := transition.NewCommitCoordinator[string, string](f.store, membershipCommitHost{fixture: f}, config)
 	if err != nil {
 		return errors.Join(pendingErr, err)
 	}
 	if err := commits.Reconcile(ctx); err != nil {
-		return errors.Join(pendingErr, err)
+		pendingErr = errors.Join(pendingErr, err)
+		if !onlyCompatibility(err) || ctx.Err() != nil {
+			return pendingErr
+		}
 	}
 	return errors.Join(pendingErr, f.driveExpiryTimers(ctx), f.driveNotifications(ctx))
 }

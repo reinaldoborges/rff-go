@@ -165,7 +165,7 @@ func (i *InputIngress[Value]) process(ctx context.Context, record InputRecord) (
 		if ctx.Err() != nil {
 			return InputOutcome{}, ctx.Err()
 		}
-		return InputOutcome{}, err
+		return InputOutcome{}, compatibilityError(CompatibilityInputCodec, record.Value.Codec.Name, record.Value.Codec.Version, err)
 	}
 	value, err := codec.Decode(ctx, slices.Clone(record.Value.Data))
 	if err != nil {
