@@ -29,6 +29,12 @@ func TestOwnershipTransferIsAtomicAuditedAndReplayable(t *testing.T) {
 	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
 		t.Fatal(err)
 	}
+	if err := fixture.CreateGroup(ctx, "outsider", "other-group", "outsider-membership"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.TransferOwnership(ctx, "owner", "group", "outsider", "cross-group"); !errors.Is(err, taskmanager.ErrConflict) {
+		t.Fatalf("cross-group member became owner: %v", err)
+	}
 	if _, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "too-early"); !errors.Is(err, taskmanager.ErrConflict) {
 		t.Fatalf("non-member became owner: %v", err)
 	}
@@ -75,5 +81,28 @@ func TestOwnershipTransferIsAtomicAuditedAndReplayable(t *testing.T) {
 	}
 	if _, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "new"); !errors.Is(err, taskmanager.ErrDenied) {
 		t.Fatalf("former owner retained transfer authority: %v", err)
+	}
+	if _, err := fixture.RemoveMember(ctx, "member", "owner-membership", "remove-former-owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Group(ctx, "owner", "group"); !errors.Is(err, taskmanager.ErrDenied) {
+		t.Fatalf("removed former owner retained group access: %v", err)
+	}
+	replayed, err = fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+	if err != nil || replayed != receipt {
+		t.Fatalf("removed original actor could not replay: receipt=%+v error=%v", replayed, err)
+	}
+	if _, err := fixture.TransferOwnership(ctx, "owner", "group", "outsider", "transfer"); !errors.Is(err, taskmanager.ErrConflict) {
+		t.Fatalf("removed actor changed transfer replay: %v", err)
+	}
+	if err := fixture.CloseGroup(ctx, "member", "group"); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err = fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+	if err != nil || replayed != receipt {
+		t.Fatalf("original actor could not replay after closure: receipt=%+v error=%v", replayed, err)
 	}
 }
