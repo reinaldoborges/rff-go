@@ -130,3 +130,53 @@ go test ./runtime -run TestNotificationWorker
 go test ./runtime
 go test ./internal/taskmanager
 ```
+
+## Local task-manager fixture
+
+The fixture CLI is for local development and conformance testing only. Seeded
+identities are opaque test values, not authentication. The test-only operator
+can inspect and control executions but has no task-manager permissions.
+Each invocation opens the same file-backed fixture; `drive` performs one
+reconciliation round and must be run again when more work or timers are due.
+No background service or real notification provider is started.
+
+```sh
+go run ./cmd/taskmanager -db ./fixture.db seed-user owner invitee
+go run ./cmd/taskmanager -db ./fixture.db seed-operator operator
+go run ./cmd/taskmanager -db ./fixture.db create-group owner group owner-membership
+go run ./cmd/taskmanager -db ./fixture.db start-invitation owner group invitee membership invite-1 2099-01-01T00:00:00Z
+go run ./cmd/taskmanager -db ./fixture.db drive
+go run ./cmd/taskmanager -db ./fixture.db signal-invitation invitee membership decision-1 accept
+go run ./cmd/taskmanager -db ./fixture.db drive
+go run ./cmd/taskmanager -db ./fixture.db start-task invitee group task "Example task" create-task-1
+go run ./cmd/taskmanager -db ./fixture.db drive
+go run ./cmd/taskmanager -db ./fixture.db signal-task invitee task start-1 start
+go run ./cmd/taskmanager -db ./fixture.db drive
+go run ./cmd/taskmanager -db ./fixture.db list operator
+go run ./cmd/taskmanager -db ./fixture.db show operator EXECUTION_ID
+```
+
+Commands print JSON on success and return nonzero on errors. Invitation signals
+are `accept`, `decline`, or `revoke`; task signals are `start`, `complete`, or
+`cancel`. `control OPERATOR EXECUTION_ID REQUEST_ID ACTION` supports `retry`,
+`abort`, `notification-retry`, and `notification-waive`, subject to runtime
+phase gates and fixture authorization. The fixture records operator actions in
+its application-owned audit.
+
+Additional commands are `group ACTOR GROUP`, `membership ACTOR MEMBERSHIP`,
+`task ACTOR TASK`, `update-task ACTOR TASK TITLE`,
+`assign-task ACTOR TASK MEMBERSHIP`, `remove-member ACTOR MEMBERSHIP KEY`,
+`transfer ACTOR GROUP NEW_OWNER KEY`, and `close-group ACTOR GROUP`. Pass an
+empty membership argument to unassign a task. Assignment history retains the
+original Membership identity after unassignment or removal.
+
+Run the CLI and fixture checks, including a real subprocess recovery test, with:
+
+```sh
+go test ./cmd/taskmanager ./internal/taskmanager
+go test ./internal/taskmanager -run TestFixtureRecoversExpiryAndNotificationAcrossProcessRestart
+./scripts/check.sh
+```
+
+These are local checks, not a claim that the full acceptance matrix or CI gate
+has passed.
