@@ -72,6 +72,9 @@ func Run(t *testing.T, newStore func(*testing.T) Store) {
 	t.Run("wakeup and polling", func(t *testing.T) {
 		RunWakeup(t, newStore)
 	})
+	t.Run("transition event replay", func(t *testing.T) {
+		RunTransitionReplay(t, newStore)
+	})
 	t.Run("shutdown recovery", func(t *testing.T) {
 		RunShutdownRecovery(t, newStore)
 	})
