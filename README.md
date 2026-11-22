@@ -81,7 +81,7 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 through 6 stores
+without writes for unsupported schemas. It migrates version 1 through 7 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
@@ -89,7 +89,12 @@ record a commit-pending work-success marker, and finish authorized abort
 recovery. `AuthorizedControls` and `AuthorizedMigration` call host authorization
 for every request, including replay; hosts own actor attribution and audit.
 The host may use low-level control stores directly only after authorization.
-Typed external-input ingress is not yet implemented.
+`InputIngress` persists typed commands, events, and human decisions before
+calling the host, deduplicates their semantic payloads, and replays durable
+outcomes. The host must authorize every submission and persist enough approved
+context to reconcile it after restart. Its handler must atomically record and
+deduplicate outcomes with domain effects by input ID; transient errors leave
+inputs pending for host-scheduled reconciliation.
 The host provides domain commits; automatic rejection recovery is supported.
 `sqlite.NewNotificationOutbox` provides fenced local handoff and durable delivery
 claims, including recovery after claim expiry. Incompatible delivery records
@@ -116,6 +121,7 @@ go test ./adapters/sqlite -run TestAtomicCommit
 go test ./adapters/sqlite -run TestIncompatibleExecution
 go test ./adapters/sqlite -run TestMigration
 go test ./adapters/sqlite -run TestTimer
+go test ./adapters/sqlite -run 'TestTypedInput|TestTypedCommand'
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
 ```

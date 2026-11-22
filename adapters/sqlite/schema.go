@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 7
+	adapterSchemaVersion = 8
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -21,6 +21,7 @@ const (
 	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -34,7 +35,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
@@ -43,24 +44,26 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		"rff_hook_work":         &hookWorkExists,
 		"rff_notification_work": &notificationWorkExists,
 		"rff_timers":            &timersExist,
+		"rff_inputs":            &inputsExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (7)`,
+			`INSERT INTO rff_schema_version (version) VALUES (8)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
 			hookWorkDDL,
 			notificationWorkDDL,
 			timersDDL,
+			inputsDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -214,6 +217,31 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 				return fmt.Errorf("%w: incompatible timers table", ErrUnsupportedSchema)
 			}
 			if err := validateTimers(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if schemaVersion < 8 {
+			if inputsExist {
+				return fmt.Errorf("%w: unexpected inputs table", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, inputsDDL); err != nil {
+				return fmt.Errorf("migrate inputs: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 8`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		} else {
+			var definition string
+			if !inputsExist {
+				return fmt.Errorf("%w: inputs table missing", ErrUnsupportedSchema)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_inputs'`).Scan(&definition); err != nil {
+				return fmt.Errorf("%w: inspect inputs: %w", ErrUnsupportedSchema, err)
+			}
+			if definition != inputsDDL {
+				return fmt.Errorf("%w: incompatible inputs table", ErrUnsupportedSchema)
+			}
+			if err := validateInputs(ctx, tx); err != nil {
 				return err
 			}
 		}
