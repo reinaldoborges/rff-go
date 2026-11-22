@@ -112,34 +112,37 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := ingress.Reconcile(ctx); err != nil {
-		return err
+	pendingErr := ingress.Reconcile(ctx)
+	if pendingErr != nil && (!errors.Is(pendingErr, transition.ErrCompatibility) || ctx.Err() != nil) {
+		return pendingErr
 	}
 	tasks, err := f.taskIngress()
 	if err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
-	if err := tasks.Reconcile(ctx); err != nil {
-		return err
+	taskErr := tasks.Reconcile(ctx)
+	if taskErr != nil && (!errors.Is(taskErr, transition.ErrCompatibility) || ctx.Err() != nil) {
+		return errors.Join(pendingErr, taskErr)
 	}
+	pendingErr = errors.Join(pendingErr, taskErr)
 	decisions, err := f.decisionIngress()
 	if err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
-	pendingErr := decisions.Reconcile(ctx)
+	pendingErr = errors.Join(pendingErr, decisions.Reconcile(ctx))
 	config := transition.CoordinatorConfig{ID: "taskmanager", Clock: f.clock, LeaseTTL: time.Minute}
 	coordinator, err := transition.NewCoordinator[string, string](f.store, f.runner, config)
 	if err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
 	worker, err := transition.NewHookWorker[string, string, string, fixtureInput](f.store, f.runner, transition.WorkerConfig{
 		ID: "taskmanager-hook", Capacity: 1, LeaseTTL: time.Minute, RenewalInterval: 10 * time.Second, Clock: fixtureClock{now: f.clock},
 	})
 	if err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
 	for {
 		err := worker.RunOne(ctx)
@@ -147,15 +150,15 @@ func (f *Fixture) Drive(ctx context.Context) error {
 			break
 		}
 		if err != nil {
-			return err
+			return errors.Join(pendingErr, err)
 		}
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
 	commits, err := transition.NewCommitCoordinator[string, string](f.store, membershipCommitHost{fixture: f}, config)
 	if err != nil {
-		return err
+		return errors.Join(pendingErr, err)
 	}
 	if err := commits.Reconcile(ctx); err != nil {
 		return errors.Join(pendingErr, err)
