@@ -199,6 +199,10 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	if _, err := store.MarkWorkSuccess(ctx, lease, clock); err != nil {
 		t.Fatal(err)
 	}
+	late := transition.MigrationRequest{ID: "late", MachineID: "machine", MachineVersion: "2"}
+	if _, err := authorized.Migrate(ctx, lease, clock, late); !errors.Is(err, transition.ErrInvalidHook) || conversions != 2 {
+		t.Fatalf("commit-pending migration was not rejected before conversion: conversions=%d error=%v", conversions, err)
+	}
 	config := transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Hour, Clock: clock}
 	commits, err := transition.NewCommitCoordinator[string, string](store, &host{}, config)
 	if err != nil {
@@ -206,6 +210,9 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	}
 	if err := commits.Reconcile(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := authorized.Migrate(ctx, lease, clock, late); !errors.Is(err, transition.ErrInvalidHook) || conversions != 2 {
+		t.Fatalf("notifying migration was not rejected before conversion: conversions=%d error=%v", conversions, err)
 	}
 	notifications, err := transition.NewNotificationCoordinator[string, string](store, &repairHandoff{available: true}, config)
 	if err != nil {
