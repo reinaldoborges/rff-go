@@ -1,31 +1,28 @@
-package sqlite_test
+package runtimecontract
 
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/reinaldoborges/rff-go/adapters/sqlite"
 	"github.com/reinaldoborges/rff-go/fsm"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
-func TestCoordinatorWakeupAndPollingDiscoverDurableWork(t *testing.T) {
+type wakeupTicker struct{ ticks chan time.Time }
+
+func (t wakeupTicker) Ticks() <-chan time.Time { return t.ticks }
+func (wakeupTicker) Stop()                     {}
+
+// RunWakeup checks that transient notifications and polling discover durable work.
+func RunWakeup(t *testing.T, newStore func(*testing.T) Store) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "wakeup.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+	store := newStore(t)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	clock := fixedClock(now)
+	clock := func() time.Time { return now }
 	coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
 		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
 	})
@@ -37,7 +34,7 @@ func TestCoordinatorWakeupAndPollingDiscoverDurableWork(t *testing.T) {
 	scans := make(chan error, 3)
 	done := make(chan error, 1)
 	go func() {
-		done <- transition.RunReconciliation(ctx, queue, timerTestTicker{ticks}, func(ctx context.Context) error {
+		done <- transition.RunReconciliation(ctx, queue, wakeupTicker{ticks}, func(ctx context.Context) error {
 			err := coordinator.Reconcile(ctx)
 			select {
 			case scans <- err:
