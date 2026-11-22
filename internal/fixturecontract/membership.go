@@ -105,6 +105,67 @@ func RunMembership(t *testing.T, newFixture func(*testing.T, func() time.Time) M
 			t.Fatalf("persisted deadline did not determine expiry: %+v, %v", membership, err)
 		}
 	})
+	t.Run("competing terminal decisions", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		if err := fixture.SeedUsers(ctx, "owner", "invitee"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "membership", "invite", now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		type outcome struct {
+			status taskmanager.MembershipStatus
+			id     string
+			err    error
+		}
+		start := make(chan struct{})
+		results := make(chan outcome, 2)
+		for _, decision := range []struct {
+			event  taskmanager.InvitationDecision
+			status taskmanager.MembershipStatus
+		}{{taskmanager.AcceptInvitation, taskmanager.Active}, {taskmanager.DeclineInvitation, taskmanager.Declined}} {
+			go func() {
+				<-start
+				id, err := fixture.Decide(ctx, "invitee", "membership", string(decision.event), decision.event)
+				results <- outcome{status: decision.status, id: id, err: err}
+			}()
+		}
+		close(start)
+		var winner taskmanager.MembershipStatus
+		conflicts := 0
+		for range 2 {
+			result := <-results
+			switch {
+			case result.err == nil && result.id != "":
+				if winner != "" {
+					t.Fatal("both decisions were accepted")
+				}
+				winner = result.status
+			case errors.Is(result.err, taskmanager.ErrConflict):
+				conflicts++
+			default:
+				t.Fatalf("unexpected competing decision outcome: %+v", result)
+			}
+		}
+		if winner == "" || conflicts != 1 {
+			t.Fatalf("competing decisions did not serialize: winner=%q conflicts=%d", winner, conflicts)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		membership, err := fixture.Membership(ctx, "owner", "membership")
+		if err != nil || membership.Status != winner {
+			t.Fatalf("committed decision differed from the accepted winner: %+v, %v", membership, err)
+		}
+	})
 	t.Run("closure revokes pending invitations", func(t *testing.T) {
 		ctx := context.Background()
 		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
