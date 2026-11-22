@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/reinaldoborges/rff-go/adapters/sqlite"
 	"github.com/reinaldoborges/rff-go/fsm"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
@@ -219,6 +220,20 @@ func (f *Fixture) Drive(ctx context.Context) error {
 		return errors.Join(pendingErr, err)
 	}
 	if err := commits.Reconcile(ctx); err != nil {
+		pendingErr = errors.Join(pendingErr, err)
+		if !onlyCompatibility(err) || ctx.Err() != nil {
+			return pendingErr
+		}
+	}
+	outbox, err := sqlite.NewNotificationOutbox(f.store, f.clock)
+	if err != nil {
+		return errors.Join(pendingErr, err)
+	}
+	notifications, err := transition.NewNotificationCoordinator[string, string](f.store, outbox, config)
+	if err != nil {
+		return errors.Join(pendingErr, err)
+	}
+	if err := notifications.Reconcile(ctx); err != nil {
 		pendingErr = errors.Join(pendingErr, err)
 		if !onlyCompatibility(err) || ctx.Err() != nil {
 			return pendingErr
