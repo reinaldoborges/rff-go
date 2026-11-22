@@ -177,6 +177,10 @@ can inspect and control executions but has no task-manager permissions.
 Each invocation opens the same file-backed fixture; `drive` performs one
 reconciliation round and must be run again when more work or timers are due.
 No background service or real notification provider is started.
+The typed fixture's `MigrateExecution` demonstrates operator-authorized migration
+of pre-commit task work to behavior version 2. It verifies the authoritative
+task source while SQLite holds the same-file write transaction; this does not
+make migrations across separate stores atomic.
 Task and Membership runtime identities are stored separately. Existing active
 work and interrupted input replays are preserved on upgrade. Once a fixture
 database has been opened by this version, do not use older fixture binaries

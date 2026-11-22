@@ -12,7 +12,7 @@ import (
 
 func (f *Fixture) registerTaskMachine(policy fsm.Policy) error {
 	handler := fsm.NoopHandler[string, string, string, fixtureInput]{}
-	machine, err := fsm.NewMachine(fsm.Config[string, string, string, fixtureInput]{
+	config := fsm.Config[string, string, string, fixtureInput]{
 		ID: "taskmanager-task", Version: "1",
 		InitialStates: []string{string(TaskOpen)}, TerminalStates: []string{string(TaskDone), string(TaskCancelled)},
 		Handlers: map[string]fsm.Handler[string, string, string, fixtureInput]{
@@ -44,11 +44,18 @@ func (f *Fixture) registerTaskMachine(policy fsm.Policy) error {
 		ClassifyFailure: func(error) (fsm.Failure, fsm.Disposition) {
 			return fsm.Failure{Code: "task-hook-failed"}, fsm.DispositionIntervention
 		},
-	})
-	if err != nil {
-		return err
 	}
-	return f.machines.Register(machine)
+	for _, version := range []string{"1", "2"} {
+		config.Version = version
+		machine, err := fsm.NewMachine(config)
+		if err != nil {
+			return err
+		}
+		if err := f.machines.Register(machine); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type taskAcceptanceStore struct {

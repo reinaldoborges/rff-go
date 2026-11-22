@@ -146,12 +146,14 @@ func (f *Fixture) entityForInput(ctx context.Context, kind, id, key string) (str
 	return legacy, nil
 }
 
-func validRuntimeEntity(ctx context.Context, tx *sql.Tx, kind, id, entity string) (bool, error) {
+func validRuntimeEntity(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, kind, id, entity string) (bool, error) {
 	if entity == legacyEntity(kind, id) {
 		return true, nil
 	}
 	var valid bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_runtime_entities WHERE kind = ? AND domain_id = ? AND entity = ?)`,
+	err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_runtime_entities WHERE kind = ? AND domain_id = ? AND entity = ?)`,
 		kind, id, entity).Scan(&valid)
 	return valid, err
 }
