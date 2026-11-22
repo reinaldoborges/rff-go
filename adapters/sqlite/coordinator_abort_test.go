@@ -105,6 +105,19 @@ func TestAbortRecoveryRequiresSuccessAndCanResumeAfterExhaustion(t *testing.T) {
 	if err := store.ReportHook(ctx, retried, transition.HookResult{Success: true}, clock); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err = transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
