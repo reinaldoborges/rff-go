@@ -105,6 +105,9 @@ func (i *InputIngress[Value]) Submit(ctx context.Context, request InputRequest[V
 			}
 			equal, err := codec.Equal(ctx, slices.Clone(existing.Value.Data), request.Value)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				return nil, fmt.Errorf("%w: input equality: %w", ErrCompatibility, err)
 			}
 			if !equal {
@@ -163,6 +166,9 @@ func (i *InputIngress[Value]) process(ctx context.Context, record InputRecord) (
 	}
 	value, err := codec.Decode(ctx, slices.Clone(record.Value.Data))
 	if err != nil {
+		if ctx.Err() != nil {
+			return InputOutcome{}, ctx.Err()
+		}
 		return InputOutcome{}, compatibilityError(CompatibilityInputCodec, record.Value.Codec.Name, record.Value.Codec.Version, err)
 	}
 	outcome, err := i.handle(ctx, InputDelivery[Value]{
