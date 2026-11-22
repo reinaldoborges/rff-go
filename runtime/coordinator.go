@@ -19,6 +19,7 @@ type CoordinatorStore[EntityID comparable, StateID comparable] interface {
 	WorkSuccessStore[EntityID]
 	InterventionStore[EntityID]
 	AbortStore[EntityID]
+	BlockExecutionCompatibility(context.Context, TransitionLease[EntityID], func() time.Time, CompatibilityDiagnostic) error
 }
 
 // HookFailureClassifier resolves the application's pinned failure classifier.
@@ -138,7 +139,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 		if progress.Started && !c.config.Clock().Before(progress.LeaseExpiresAt) {
 			result, err := c.classifier.ClassifyHookFailure(execution, ErrAttemptUnknown)
 			if err != nil {
-				return err
+				return c.recordCompatibilityError(ctx, lease, execution, CompatibilityUnknownAttempt, err)
 			}
 			if len(progress.Attempts) == 0 {
 				return ErrInvalidHook
@@ -251,7 +252,25 @@ func (c *Coordinator[EntityID, StateID]) enterDeadlineIntervention(
 ) error {
 	result, err := c.classifier.ClassifyHookFailure(execution, ErrTransitionDeadline)
 	if err != nil {
-		return err
+		return c.recordCompatibilityError(ctx, lease, execution, CompatibilityDeadline, err)
 	}
 	return c.store.EnterDeadlineIntervention(ctx, lease, c.config.Clock, result)
+}
+
+func (c *Coordinator[EntityID, StateID]) recordCompatibilityError(
+	ctx context.Context, lease TransitionLease[EntityID], execution Execution[EntityID, StateID], check CompatibilityCheck, err error,
+) error {
+	if !errors.Is(err, ErrCompatibility) {
+		return err
+	}
+	diagnostic := CompatibilityDiagnostic{Component: CompatibilityClassifier, Name: execution.MachineID, Version: execution.MachineVersion}
+	var compatibility *CompatibilityError
+	if errors.As(err, &compatibility) {
+		diagnostic = compatibility.Diagnostic
+	}
+	diagnostic.Check = check
+	if blockErr := c.store.BlockExecutionCompatibility(ctx, lease, c.config.Clock, diagnostic); blockErr != nil {
+		return errors.Join(err, fmt.Errorf("record compatibility block: %w", blockErr))
+	}
+	return err
 }

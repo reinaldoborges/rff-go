@@ -14,6 +14,9 @@ func validDiagnostic(record diskRecord, diagnostic transition.CompatibilityDiagn
 	if diagnostic.Name == "" || diagnostic.Version == "" {
 		return false
 	}
+	if diagnostic.Check != "" && diagnostic.Check != transition.CompatibilityUnknownAttempt && diagnostic.Check != transition.CompatibilityDeadline {
+		return false
+	}
 	switch diagnostic.Component {
 	case transition.CompatibilityMachine, transition.CompatibilityClassifier, transition.CompatibilityHandler:
 		return diagnostic.Name == record.MachineID && diagnostic.Version == record.MachineVersion
@@ -57,6 +60,29 @@ func (s *Store[EntityID, StateID]) BlockHookCompatibility(
 		if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 			return err
 		}
+		return saveExecution(ctx, tx, lease.ExecutionID, record)
+	})
+}
+
+// BlockExecutionCompatibility records a coordinator-detected compatibility failure.
+func (s *Store[EntityID, StateID]) BlockExecutionCompatibility(
+	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time, diagnostic transition.CompatibilityDiagnostic,
+) error {
+	if clock == nil {
+		return transition.ErrInvalidLease
+	}
+	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		_, record, err := s.fencedExecution(ctx, tx, lease, clock)
+		if err != nil {
+			return err
+		}
+		if !validDiagnostic(record, diagnostic) {
+			return transition.ErrInvalidHook
+		}
+		if record.Compatibility != nil && *record.Compatibility != diagnostic {
+			return transition.ErrConflict
+		}
+		record.Compatibility = &diagnostic
 		return saveExecution(ctx, tx, lease.ExecutionID, record)
 	})
 }

@@ -144,4 +144,63 @@ func TestIncompatibleExecutionBlocksWithoutStoppingOthersAndRecovers(t *testing.
 	if err := newWorker().RunOne(ctx); err != nil || calls != 2 {
 		t.Fatalf("restored execution did not proceed: calls=%d error=%v", calls, err)
 	}
+	t.Run("unknown attempt requires its pinned classifier", func(t *testing.T) {
+		_, _, err := store.Accept(ctx, "c", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "c", Entity: "c", Key: "key",
+				Operation: transition.Initialize, MachineID: "task", MachineVersion: "3",
+				Target: "open", Input: transition.EncodedValue{Codec: transition.CodecVersion{Name: "string", Version: "1"}, Data: []byte("payload")},
+				Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+				Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence, err := store.AcquireTransitionLease(ctx, "c", "c", "coordinator", fixedClock(now), time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DispatchHook(ctx, fence, fixedClock(now), transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "lost-worker", fixedClock(now), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, fixedClock(now)); err != nil {
+			t.Fatal(err)
+		}
+		later := fixedClock(now.Add(2 * time.Minute))
+		coordinator, err := transition.NewCoordinator[string, string](store, runner, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: later,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+			t.Fatalf("missing classifier was not reported: %v", err)
+		}
+		blocked, err := store.ReadActiveExecution(ctx, "c")
+		if err != nil || blocked.Compatibility == nil || blocked.Compatibility.Version != "3" {
+			t.Fatalf("unknown attempt compatibility was not recorded: execution=%+v error=%v", blocked, err)
+		}
+		register("3")
+		manager, err := transition.NewCompatibilityCoordinator[string, string, string, string](store, runner, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: later,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		progress, err := store.ReadHookProgress(ctx, "c")
+		if err != nil || len(progress.Attempts) != 1 || !progress.Attempts[0].Unknown || progress.BudgetUsed != 1 {
+			t.Fatalf("unknown attempt was not counted: progress=%+v error=%v", progress, err)
+		}
+	})
 }

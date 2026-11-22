@@ -25,7 +25,16 @@ type CompatibilityDiagnostic struct {
 	Component CompatibilityComponent
 	Name      string
 	Version   string
+	Check     CompatibilityCheck
 }
+
+// CompatibilityCheck identifies a coordinator action requiring revalidation.
+type CompatibilityCheck string
+
+const (
+	CompatibilityUnknownAttempt CompatibilityCheck = "unknown-attempt"
+	CompatibilityDeadline       CompatibilityCheck = "deadline"
+)
 
 // CompatibilityError retains the underlying error for programmatic inspection,
 // while its message contains only the safe component identity.
@@ -111,10 +120,26 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		return err
 	}
 	progress, err := c.store.ReadHookProgress(ctx, id)
-	if err != nil {
+	hasProgress := err == nil
+	if err != nil && !errors.Is(err, ErrNoHookActivity) {
 		return err
 	}
-	_, err = c.runner.prepare(ctx, execution, HookCall{Kind: progress.Dispatch.Kind, Failure: progress.Dispatch.Failure})
+	call := HookCall{Kind: progress.Dispatch.Kind, Failure: progress.Dispatch.Failure}
+	if !hasProgress {
+		call.Kind = HookEnter
+		if execution.Operation == Transition {
+			call.Kind = HookTransition
+		}
+	}
+	_, err = c.runner.prepare(ctx, execution, call)
+	if err == nil {
+		switch execution.Compatibility.Check {
+		case CompatibilityUnknownAttempt:
+			_, err = c.runner.ClassifyHookFailure(execution, ErrAttemptUnknown)
+		case CompatibilityDeadline:
+			_, err = c.runner.ClassifyHookFailure(execution, ErrTransitionDeadline)
+		}
+	}
 	var next *CompatibilityDiagnostic
 	if err != nil {
 		var compatibility *CompatibilityError
@@ -122,6 +147,7 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 			return err
 		}
 		next = &compatibility.Diagnostic
+		next.Check = execution.Compatibility.Check
 	}
 	return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, next)
 }
