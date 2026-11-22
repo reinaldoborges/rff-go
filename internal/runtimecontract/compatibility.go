@@ -14,6 +14,7 @@ import (
 type CompatibilityStore interface {
 	Store
 	transition.CompatibilityStore[string, string]
+	transition.CheckedHookControlStore[string, string]
 }
 
 // RunCompatibility checks isolation and restoration of pinned behavior.
@@ -255,4 +256,71 @@ func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore
 		!restored.Deadline.Equal(retry.Deadline) {
 		t.Fatalf("retry restoration changed phase or deadline: %+v, %v", restored, err)
 	}
+	t.Run("quiesced recovery", func(t *testing.T) {
+		store := newStore(t)
+		manager, err := transition.NewCompatibilityCoordinator(store, runner, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = store.Accept(ctx, "f", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "f", Entity: "f", Key: "key",
+				Operation: transition.Initialize, MachineID: "machine", MachineVersion: "6", Target: "open",
+				Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
+				Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+				Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireTransitionLease(ctx, "f", "f", "coordinator", clock.Now, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DispatchHook(ctx, lease, clock.Now, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock.Now, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, clock.Now); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReportHook(ctx, claim, transition.HookResult{
+			Failure: fsm.Failure{Code: "failed"}, Disposition: fsm.DispositionIntervention,
+		}, clock.Now); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EnterHookIntervention(ctx, lease, clock.Now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ApplyCheckedHookControl(ctx, lease, clock.Now,
+			transition.HookControl{ID: "abort", Action: transition.AbortIntervention},
+			func(transition.Execution[string, string], transition.HookCall) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+			t.Fatalf("unavailable recovery behavior was not reported: %v", err)
+		}
+		recovery, err := store.ReadActiveExecution(ctx, "f")
+		progress, progressErr := store.ReadHookProgress(ctx, "f")
+		if err != nil || progressErr != nil || recovery.Status != transition.Aborting || recovery.Compatibility == nil ||
+			progress.Dispatch.Kind != transition.HookRecover || len(progress.Attempts) != 1 {
+			t.Fatalf("recovery discovery changed phase or attempt history: execution=%+v progress=%+v errors=%v, %v",
+				recovery, progress, err, progressErr)
+		}
+		register("6")
+		if err := manager.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		restored, err := store.ReadActiveExecution(ctx, "f")
+		if err != nil || restored.Status != transition.Aborting || restored.Compatibility != nil ||
+			!restored.CycleDeadline.Equal(recovery.CycleDeadline) {
+			t.Fatalf("recovery restoration changed phase or deadline: %+v, %v", restored, err)
+		}
+	})
 }
