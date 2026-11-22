@@ -95,6 +95,9 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 		fixture := newFixture(t, func() time.Time { return now })
 		activeMember(t, fixture, now)
+		if _, err := fixture.Invite(ctx, "owner", "group", "member", "duplicate-active", "duplicate-active", now.Add(time.Hour)); !errors.Is(err, taskmanager.ErrConflict) {
+			t.Fatalf("active member received another live invitation: %v", err)
+		}
 		if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "task"); err != nil {
 			t.Fatal(err)
 		}
@@ -145,6 +148,13 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 		}
 		if err := fixture.Drive(ctx); err != nil {
 			t.Fatal(err)
+		}
+		reinvited, err := fixture.InspectMembership(ctx, "operator", "new-membership")
+		if err != nil || reinvited.Status != taskmanager.Invited {
+			t.Fatalf("removed member was not reinvited: %+v, %v", reinvited, err)
+		}
+		if _, err := fixture.Invite(ctx, "owner", "group", "member", "duplicate-invited", "duplicate-invited", now.Add(time.Hour)); !errors.Is(err, taskmanager.ErrConflict) {
+			t.Fatalf("invited member received another live invitation: %v", err)
 		}
 		retained, err := fixture.InspectMembership(ctx, "operator", "member-membership")
 		if err != nil || retained != membership {
