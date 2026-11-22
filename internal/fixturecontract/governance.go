@@ -168,6 +168,22 @@ func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) G
 		if _, err := fixture.Group(ctx, "member", "group"); !errors.Is(err, taskmanager.ErrDenied) {
 			t.Fatalf("removed member retained access: %v", err)
 		}
+		if _, err := fixture.Task(ctx, "member", "task"); !errors.Is(err, taskmanager.ErrDenied) {
+			t.Fatalf("removed member could read a task: %v", err)
+		}
+		if id, err := fixture.CreateTask(ctx, "member", "group", "denied-task", "Task", "denied-create"); !errors.Is(err, taskmanager.ErrDenied) || id != "" {
+			t.Fatalf("removed member created a task: id=%q error=%v", id, err)
+		}
+		if id, err := fixture.TransitionTask(ctx, "member", "task", "denied-start", taskmanager.StartTask); !errors.Is(err, taskmanager.ErrDenied) || id != "" {
+			t.Fatalf("removed member changed a task: id=%q error=%v", id, err)
+		}
+		if err := fixture.AssignTask(ctx, "owner", "task", "member-membership"); !errors.Is(err, taskmanager.ErrConflict) {
+			t.Fatalf("task was assigned to a removed member: %v", err)
+		}
+		task, err := fixture.Task(ctx, "owner", "task")
+		if err != nil || task.Status != taskmanager.TaskOpen || task.Assignee != "" {
+			t.Fatalf("denied removed-member operations changed task: %+v, %v", task, err)
+		}
 		replayed, err := fixture.RemoveMember(ctx, "owner", "member-membership", "remove")
 		if err != nil || replayed != id {
 			t.Fatalf("removal replay changed: %q, %v", replayed, err)
