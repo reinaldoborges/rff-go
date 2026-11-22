@@ -66,6 +66,9 @@ func (h *host) Commit(_ context.Context, _ transition.TransitionLease[string],
 // Run checks a typed execution, durable commit and idempotent replay at runtime ports.
 func Run(t *testing.T, newStore func(*testing.T) Store) {
 	t.Helper()
+	t.Run("shutdown recovery", func(t *testing.T) {
+		RunShutdownRecovery(t, newStore)
+	})
 	t.Run("typed execution and commit", func(t *testing.T) {
 		ctx := context.Background()
 		store := newStore(t)
