@@ -20,6 +20,9 @@ type CompatibilityStore interface {
 // RunCompatibility checks isolation and restoration of pinned behavior.
 func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore) {
 	t.Helper()
+	t.Run("unsupported pinned dependencies", func(t *testing.T) {
+		RunUnsupportedBehavior(t, newStore)
+	})
 	store := newStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
