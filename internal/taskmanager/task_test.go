@@ -110,6 +110,12 @@ func TestTaskAssignmentRequiresActiveSameGroupMembershipAndRetainsHistory(t *tes
 	if err := fixture.Drive(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fixture.CreateTask(ctx, "invitee", "group", "unauthorized", "Task", "denied"); !errors.Is(err, taskmanager.ErrDenied) {
+		t.Fatalf("invited user created task: %v", err)
+	}
+	if err := fixture.UpdateTask(ctx, "invitee", "task", "Unauthorized"); !errors.Is(err, taskmanager.ErrDenied) {
+		t.Fatalf("invited user updated task: %v", err)
+	}
 	for _, invalid := range []string{"invitee-membership", "other-membership", "missing"} {
 		if err := fixture.AssignTask(ctx, "member", "task", invalid); !errors.Is(err, taskmanager.ErrConflict) {
 			t.Fatalf("assignment to %q was accepted: %v", invalid, err)
@@ -134,6 +140,22 @@ func TestTaskAssignmentRequiresActiveSameGroupMembershipAndRetainsHistory(t *tes
 	history, err := fixture.TaskAssignmentHistory(ctx, "owner", "task")
 	if err != nil || len(history) != 1 || history[0].MembershipID != "member-membership" {
 		t.Fatalf("unassignment lost historical membership reference: %+v, %v", history, err)
+	}
+	if _, err := fixture.TransitionTask(ctx, "member", "task", "start", taskmanager.StartTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.TransitionTask(ctx, "member", "task", "complete", taskmanager.CompleteTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := fixture.Task(ctx, "member", "task")
+	if err != nil || completed.Status != taskmanager.TaskDone {
+		t.Fatalf("active member could not complete task: %+v, %v", completed, err)
 	}
 }
 
