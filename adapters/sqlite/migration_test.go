@@ -62,7 +62,7 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 	}
 	request := transition.Request[string, string, string, string]{
 		Entity: "entity", Key: "key", Operation: transition.Initialize, MachineID: "task", MachineVersion: "1",
-		Input: "payload", InputCodec: ref, Notification: transition.NotifyInherit,
+		Input: "payload", InputCodec: ref, Notification: transition.NotifyEnable,
 	}
 	accepted, created, err := acceptor.Accept(ctx, request)
 	if err != nil || !created {
@@ -115,6 +115,19 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 		blocked.Compatibility.Component != transition.CompatibilityMigration {
 		t.Fatalf("failed migration did not preserve and block the original snapshot: execution=%+v error=%v", blocked, err)
 	}
+	manager, err := transition.NewCompatibilityCoordinator[string, string, string, string](store, runner, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err = store.ReadActiveExecution(ctx, accepted.ID)
+	if err != nil || blocked.Compatibility == nil {
+		t.Fatalf("revalidation cleared a failed migration without domain verification: execution=%+v error=%v", blocked, err)
+	}
 	verificationBlocked = false
 	receipt, err := migrator.Migrate(ctx, fence, clock, migration)
 	if err != nil || receipt.Request.ID != migration.ID {
@@ -124,7 +137,7 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 		t.Fatalf("old worker claim survived migration: %v", err)
 	}
 	migrated, err := store.ReadActiveExecution(ctx, accepted.ID)
-	if err != nil || migrated.MachineVersion != "2" || migrated.ID != accepted.ID || !migrated.Deadline.Equal(accepted.Deadline) {
+	if err != nil || migrated.MachineVersion != "2" || migrated.ID != accepted.ID || !migrated.Notify || !migrated.Deadline.Equal(accepted.Deadline) {
 		t.Fatalf("migrated execution lost identity or deadline: execution=%+v error=%v", migrated, err)
 	}
 	replayed, created, err := acceptor.Accept(ctx, request)
@@ -166,6 +179,22 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 	if err := store.RecordCommitReceipt(ctx, fence, clock, transition.CommitReceipt{
 		ExecutionID: accepted.ID, OperationID: operation, Outcome: transition.CommitSucceeded,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Migrate(ctx, fence, clock, late); !errors.Is(err, transition.ErrInvalidHook) {
+		t.Fatalf("notifying execution was migrated: %v", err)
+	}
+	outbox, err := sqlite.NewNotificationOutbox(store, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier, err := transition.NewNotificationCoordinator[string, string](store, outbox, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := notifier.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := migrator.Migrate(ctx, fence, clock, migration); err != nil || calls != 2 {
