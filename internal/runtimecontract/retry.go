@@ -13,6 +13,117 @@ import (
 // RunRetryBudget checks unstarted claim loss and the shared hook-attempt budget.
 func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 	t.Helper()
+	t.Run("retry schedule exhaustion", func(t *testing.T) {
+		ctx := context.Background()
+		store := newStore(t)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		clock := func() time.Time { return now }
+		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
+					MaxAttempts: 5, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
+					RetryDelays: []time.Duration{time.Second, 3 * time.Second},
+				},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for i, delay := range []time.Duration{time.Second, 3 * time.Second, 3 * time.Second} {
+			claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, call, err := store.InspectHook(ctx, claim, clock)
+			if err != nil || (i == 0 && call.Kind != transition.HookEnter) || (i > 0 && call.Kind != transition.HookRetry) {
+				t.Fatalf("unexpected hook before retry %d: %+v, %v", i, call, err)
+			}
+			if _, err := store.StartHook(ctx, claim, clock); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReportHook(ctx, claim, transition.HookResult{
+				Failure: fsm.Failure{Code: "retryable"}, Disposition: fsm.DispositionRetry,
+			}, clock); err != nil {
+				t.Fatal(err)
+			}
+			if err := coordinator.Reconcile(ctx); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(delay - time.Nanosecond)
+			if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
+				t.Fatalf("retry %d ran before its configured delay: %v", i, err)
+			}
+			now = now.Add(time.Nanosecond)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatalf("retry after repeated final delay was not due: %v", err)
+		}
+		_, call, err := store.InspectHook(ctx, claim, clock)
+		if err != nil || call.Kind != transition.HookRetry {
+			t.Fatalf("final retry was not the retry hook: %+v, %v", call, err)
+		}
+	})
+	t.Run("empty retry schedule requires intervention", func(t *testing.T) {
+		ctx := context.Background()
+		store := newStore(t)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		clock := func() time.Time { return now }
+		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
+					MaxAttempts: 5, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
+				},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReportHook(ctx, claim, transition.HookResult{
+			Failure: fsm.Failure{Code: "retryable"}, Disposition: fsm.DispositionRetry,
+		}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.InspectExecution(ctx, "execution")
+		if err != nil || record.Status != transition.NeedsIntervention {
+			t.Fatalf("empty retry schedule did not require intervention: %+v, %v", record, err)
+		}
+		if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
+			t.Fatalf("empty retry schedule started work: %v", err)
+		}
+	})
 	t.Run("unstarted claim loss", func(t *testing.T) {
 		ctx := context.Background()
 		store := newStore(t)
