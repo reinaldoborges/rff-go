@@ -61,10 +61,12 @@ func RunShutdownRecovery(t *testing.T, newStore func(*testing.T) Store) {
 	store := newStore(t)
 	clock := &shutdownClock{timerClock: timerClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}, ticks: make(chan time.Time, 1)}
 	attempts := make(chan fsm.AttemptMetadata, 2)
+	selections := 0
 	machine, err := fsm.NewMachine(fsm.Config[string, string, string, string]{
 		ID: "machine", Version: "1", InitialStates: []string{"open"},
 		Handlers: map[string]fsm.Handler[string, string, string, string]{"open": shutdownHandler{attempts: attempts}},
 		SelectInitial: func(string) (fsm.Selection[string], error) {
+			selections++
 			return fsm.Selection[string]{Target: "open", Policy: fsm.Policy{
 				MaxAttempts: 3, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 				RetryDelays: []time.Duration{0},
@@ -224,7 +226,7 @@ func RunShutdownRecovery(t *testing.T, newStore func(*testing.T) Store) {
 		t.Fatal(err)
 	}
 	record, err := store.InspectExecution(ctx, "execution")
-	if err != nil || record.Status != transition.Complete || domain.writes != 1 || domain.current != "open" {
-		t.Fatalf("recovered execution did not commit: %+v host=%+v error=%v", record, domain, err)
+	if err != nil || record.Status != transition.Complete || domain.writes != 1 || domain.current != "open" || selections != 1 {
+		t.Fatalf("recovered execution changed selection or commit: %+v host=%+v selections=%d error=%v", record, domain, selections, err)
 	}
 }
