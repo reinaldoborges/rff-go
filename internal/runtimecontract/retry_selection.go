@@ -94,12 +94,22 @@ func RunRetrySelection(t *testing.T, newStore func(*testing.T) ControlStore) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 4 {
+	domain := &host{}
+	commits, err := transition.NewCommitCoordinator[string, string](store, domain, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := range 4 {
 		if err := coordinator.Reconcile(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if err := worker.RunOne(ctx); err != nil {
 			t.Fatal(err)
+		}
+		if attempt < 3 {
+			if err := commits.Reconcile(ctx); err != nil || domain.writes != 0 || domain.current != "" {
+				t.Fatalf("failed initial work committed state: %+v, %v", domain, err)
+			}
 		}
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
@@ -117,11 +127,6 @@ func RunRetrySelection(t *testing.T, newStore func(*testing.T) ControlStore) {
 	record, err := store.ReadActiveExecution(ctx, "execution")
 	if err != nil || record.Target != "open" || !reflect.DeepEqual(record.Policy, policy) || selections != 1 {
 		t.Fatalf("retry changed selection or policy: %+v selections=%d error=%v", record, selections, err)
-	}
-	domain := &host{}
-	commits, err := transition.NewCommitCoordinator[string, string](store, domain, config)
-	if err != nil {
-		t.Fatal(err)
 	}
 	if err := commits.Reconcile(ctx); err != nil || domain.writes != 1 || domain.current != "open" {
 		t.Fatalf("retried execution did not commit selected state: %+v, %v", domain, err)
