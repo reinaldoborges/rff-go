@@ -227,7 +227,7 @@ Run the CLI and fixture checks, including a real subprocess recovery test, with:
 go test ./internal/taskmanager -run 'Test.*FixtureContract'
 go test ./cmd/taskmanager ./internal/taskmanager
 go test ./internal/taskmanager -run TestFixtureRecoversExpiryAndNotificationAcrossProcessRestart
-go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLoss
+go test ./adapters/sqlite -run 'Test(AcceptedAndStartedWork|DomainCommit)SurvivesActualProcessLoss'
 ./scripts/check.sh
 ```
 
