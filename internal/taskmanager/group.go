@@ -44,6 +44,7 @@ func (f *Fixture) Group(ctx context.Context, actor, id string) (Group, error) {
 	if actor == "" || id == "" {
 		return Group{}, ErrInvalidRequest
 	}
+
 	var group Group
 	err := f.db.QueryRowContext(ctx, `SELECT g.id, g.owner_id, g.closed FROM tm_groups AS g
 		JOIN tm_memberships AS m ON m.group_id = g.id AND m.user_id = ? AND m.status = 'Active'

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -36,6 +37,8 @@ type Fixture struct {
 	store    *sqlite.Store[string, string]
 	machines fsm.Registry[string, string, string, membershipInput]
 	runner   *transition.HookRunner[string, string, string, membershipInput]
+	sinkMu   sync.RWMutex
+	sink     func(context.Context, InvitationNotification) error
 }
 
 func Open(path string, clock func() time.Time) (*Fixture, error) {
@@ -63,9 +66,11 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 	if err := fixture.transaction(context.Background(), func(tx *sql.Tx) error {
 		for _, statement := range []string{
 			`CREATE TABLE IF NOT EXISTS tm_users (id TEXT PRIMARY KEY NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS tm_operators (id TEXT PRIMARY KEY NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_groups (id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL REFERENCES tm_users(id), closed INTEGER NOT NULL CHECK (closed IN (0, 1)))`,
 			`CREATE TABLE IF NOT EXISTS tm_memberships (id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES tm_groups(id), user_id TEXT NOT NULL REFERENCES tm_users(id), status TEXT NOT NULL, deadline TEXT, reason TEXT NOT NULL)`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS tm_live_membership ON tm_memberships (group_id, user_id) WHERE status IN ('Invited', 'Active')`,
+			`CREATE TABLE IF NOT EXISTS tm_ownership_transfers (group_id TEXT NOT NULL REFERENCES tm_groups(id), actor_id TEXT NOT NULL REFERENCES tm_users(id), request_key TEXT NOT NULL, former_owner TEXT NOT NULL, new_owner TEXT NOT NULL, occurred_at TEXT NOT NULL, PRIMARY KEY (group_id, actor_id, request_key))`,
 		} {
 			if _, err := tx.Exec(statement); err != nil {
 				return fmt.Errorf("initialize fixture schema: %w", err)
@@ -115,6 +120,13 @@ func (f *Fixture) SeedUsers(ctx context.Context, users ...string) error {
 	}
 	return f.transaction(ctx, func(tx *sql.Tx) error {
 		for _, user := range users {
+			var operator bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_operators WHERE id = ?)`, user).Scan(&operator); err != nil {
+				return fmt.Errorf("check operator identity: %w", err)
+			}
+			if operator {
+				return ErrConflict
+			}
 			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO tm_users (id) VALUES (?)`, user); err != nil {
 				return fmt.Errorf("seed user: %w", err)
 			}

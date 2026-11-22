@@ -143,5 +143,5 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	if err := commits.Reconcile(ctx); err != nil {
 		return errors.Join(pendingErr, err)
 	}
-	return errors.Join(pendingErr, f.driveExpiryTimers(ctx))
+	return errors.Join(pendingErr, f.driveExpiryTimers(ctx), f.driveNotifications(ctx))
 }

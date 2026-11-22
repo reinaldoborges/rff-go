@@ -74,6 +74,17 @@ func (f *Fixture) Membership(ctx context.Context, actor, id string) (Membership,
 	if actor == "" || id == "" {
 		return Membership{}, ErrInvalidRequest
 	}
+	membership, owner, closed, err := f.readMembership(ctx, id)
+	if err != nil {
+		return Membership{}, err
+	}
+	if closed || actor != owner && actor != membership.UserID {
+		return Membership{}, ErrDenied
+	}
+	return membership, nil
+}
+
+func (f *Fixture) readMembership(ctx context.Context, id string) (Membership, string, bool, error) {
 	var membership Membership
 	var deadline sql.NullString
 	var owner string
@@ -82,19 +93,16 @@ func (f *Fixture) Membership(ctx context.Context, actor, id string) (Membership,
 		FROM tm_memberships AS m JOIN tm_groups AS g ON g.id = m.group_id WHERE m.id = ?`, id).
 		Scan(&membership.ID, &membership.GroupID, &membership.UserID, &membership.Status, &deadline, &membership.Reason, &owner, &closed)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Membership{}, ErrNotFound
+		return Membership{}, "", false, ErrNotFound
 	}
 	if err != nil {
-		return Membership{}, fmt.Errorf("read membership: %w", err)
-	}
-	if closed || actor != owner && actor != membership.UserID {
-		return Membership{}, ErrDenied
+		return Membership{}, "", false, fmt.Errorf("read membership: %w", err)
 	}
 	if deadline.Valid {
 		membership.Deadline, err = time.Parse(time.RFC3339Nano, deadline.String)
 		if err != nil {
-			return Membership{}, fmt.Errorf("decode membership deadline: %w", err)
+			return Membership{}, "", false, fmt.Errorf("decode membership deadline: %w", err)
 		}
 	}
-	return membership, nil
+	return membership, owner, closed, nil
 }
