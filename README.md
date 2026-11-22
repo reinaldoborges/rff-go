@@ -82,12 +82,12 @@ go test ./runtime -run TestAcceptanceStoreContract
 
 `internal/runtimecontract` provides reusable execution, worker-loss,
 commit-rejection, notification-handoff and repair, timer-compatibility,
-typed-ingress, authorized-control, migration, capacity, and retry-budget
-contracts over the runtime ports.
+typed-ingress, authorized-control, migration, capacity, retry-budget, and
+execution-compatibility contracts over the runtime ports.
 Run them against the SQLite adapter with:
 
 ```sh
-go test ./adapters/sqlite -run 'TestRuntime(Store|TimerCompatibility|InputIngress|AuthorizedControl|NotificationRepair|Migration|Capacity|RetryBudget)Contract'
+go test ./adapters/sqlite -run 'TestRuntime.*Contract'
 ```
 
 ## SQLite acceptance store
