@@ -39,6 +39,8 @@ func validDiagnostic(record diskRecord, diagnostic transition.CompatibilityDiagn
 		return false
 	}
 	switch diagnostic.Component {
+	case transition.CompatibilityMigration:
+		return true
 	case transition.CompatibilityMachine, transition.CompatibilityClassifier, transition.CompatibilityHandler,
 		transition.CompatibilityEntity, transition.CompatibilityState:
 		return diagnostic.Name == record.MachineID && diagnostic.Version == record.MachineVersion
@@ -125,6 +127,9 @@ func (s *Store[EntityID, StateID]) RevalidateCompatibility(
 		}
 		if record.Compatibility == nil || *record.Compatibility != expected {
 			return transition.ErrConflict
+		}
+		if record.Compatibility.Component == transition.CompatibilityMigration {
+			return transition.ErrInvalidHook
 		}
 		if next != nil && !validDiagnostic(record, *next) {
 			return transition.ErrInvalidHook

@@ -106,6 +106,11 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) prepare(
 	if err != nil {
 		return prepared, compatibilityError(CompatibilityHandler, execution.MachineID, execution.MachineVersion, err)
 	}
+	if execution.HasPrevious {
+		if _, err := machine.HandlerFor(execution.Previous); err != nil {
+			return prepared, compatibilityError(CompatibilityState, execution.MachineID, execution.MachineVersion, err)
+		}
+	}
 	inputCodec, err := resolveCodec(r.inputCodec, execution.Input.Codec)
 	if err != nil {
 		return prepared, compatibilityError(CompatibilityInputCodec, execution.Input.Codec.Name, execution.Input.Codec.Version, err)

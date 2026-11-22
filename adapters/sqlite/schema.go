@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 4
+	adapterSchemaVersion = 5
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -52,7 +52,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (4)`,
+			`INSERT INTO rff_schema_version (version) VALUES (5)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -179,6 +179,11 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 				return err
 			}
 		}
+		if schemaVersion < 5 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 5`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema initialization: %w", err)
@@ -260,6 +265,18 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		}
 		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
 			return fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
+		}
+		if (record.OriginalRequest == nil) != (len(record.Migrations) == 0) {
+			return fmt.Errorf("%w: inconsistent original request", ErrUnsupportedSchema)
+		}
+		seenMigrations := make(map[string]bool)
+		for _, migration := range record.Migrations {
+			if migration.Request.ID == "" || migration.Request.MachineID == "" || migration.Request.MachineVersion == "" ||
+				len(migration.ParametersDigest) != 64 || len(migration.Request.Parameters) != 0 ||
+				migration.AcceptedAt.IsZero() || seenMigrations[migration.Request.ID] {
+				return fmt.Errorf("%w: invalid migration history", ErrUnsupportedSchema)
+			}
+			seenMigrations[migration.Request.ID] = true
 		}
 		terminal := record.Status == transition.Complete || record.Status == transition.Aborted
 		if terminal == reservation.Valid {

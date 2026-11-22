@@ -20,6 +20,7 @@ const (
 	CompatibilityEventCodec CompatibilityComponent = "event-codec"
 	CompatibilityEntity     CompatibilityComponent = "entity"
 	CompatibilityState      CompatibilityComponent = "state"
+	CompatibilityMigration  CompatibilityComponent = "migration"
 )
 
 // CompatibilityDiagnostic contains safe identity data, never input or raw errors.
@@ -113,6 +114,9 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 	execution, err := c.store.ReadActiveExecution(ctx, id)
 	if err != nil || execution.Compatibility == nil {
 		return err
+	}
+	if execution.Compatibility.Component == CompatibilityMigration {
+		return nil
 	}
 	lease, err := c.store.AcquireTransitionLease(ctx, execution.Entity, id, c.config.ID, c.config.Clock, c.config.LeaseTTL)
 	if err != nil {

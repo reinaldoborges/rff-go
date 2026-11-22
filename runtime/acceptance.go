@@ -90,15 +90,22 @@ func validateRequest[EntityID comparable, StateID comparable, Event, Input any](
 }
 
 func (a *Acceptor[EntityID, StateID, Event, Input]) match(ctx context.Context, existing Execution[EntityID, StateID], request Request[EntityID, StateID, Event, Input]) error {
-	if existing.Operation != request.Operation || existing.MachineID != request.MachineID ||
-		existing.MachineVersion != request.MachineVersion || existing.NotificationOverride != request.Notification {
+	original := OriginalRequest{
+		Operation: existing.Operation, MachineID: existing.MachineID, MachineVersion: existing.MachineVersion,
+		Event: existing.Event, Input: existing.Input, NotificationOverride: existing.NotificationOverride,
+	}
+	if existing.OriginalRequest != nil {
+		original = *existing.OriginalRequest
+	}
+	if original.Operation != request.Operation || original.MachineID != request.MachineID ||
+		original.MachineVersion != request.MachineVersion || original.NotificationOverride != request.Notification {
 		return ErrConflict
 	}
-	input, err := resolveCodec(a.inputCodec, existing.Input.Codec)
+	input, err := resolveCodec(a.inputCodec, original.Input.Codec)
 	if err != nil {
 		return err
 	}
-	equal, err := input.Equal(ctx, slices.Clone(existing.Input.Data), request.Input)
+	equal, err := input.Equal(ctx, slices.Clone(original.Input.Data), request.Input)
 	if err != nil {
 		return fmt.Errorf("%w: input equality: %w", ErrCompatibility, err)
 	}
@@ -106,11 +113,11 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) match(ctx context.Context, e
 		return ErrConflict
 	}
 	if request.Operation == Transition {
-		event, err := resolveCodec(a.eventCodec, existing.Event.Codec)
+		event, err := resolveCodec(a.eventCodec, original.Event.Codec)
 		if err != nil {
 			return err
 		}
-		equal, err = event.Equal(ctx, slices.Clone(existing.Event.Data), request.Event)
+		equal, err = event.Equal(ctx, slices.Clone(original.Event.Data), request.Event)
 		if err != nil {
 			return fmt.Errorf("%w: event equality: %w", ErrCompatibility, err)
 		}

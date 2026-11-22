@@ -25,7 +25,7 @@ func TestIncompatibleStateDiagnosticDoesNotBlockOtherWork(t *testing.T) {
 		}
 	})
 	now := time.Now().UTC()
-	for _, item := range []struct{ id, target string }{{"a", "incompatible"}, {"b", "compatible"}} {
+	for _, item := range []struct{ id, target string }{{"a", "incompatible"}, {"b", "compatible"}, {"c", "incompatible"}} {
 		_, _, err := store.Accept(ctx, item.id, "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			return &transition.Execution[string, string]{
 				SchemaVersion: transition.CurrentSchemaVersion, ID: item.id, Entity: item.id, Key: "key",
@@ -100,6 +100,36 @@ func TestIncompatibleStateDiagnosticDoesNotBlockOtherWork(t *testing.T) {
 	if err := worker.RunOne(ctx); err != nil || calls != 1 {
 		t.Fatalf("compatible execution could not proceed: calls=%d error=%v", calls, err)
 	}
+	if err := worker.RunOne(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("second incompatible state was not reported: %v", err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "c", "c", "coordinator", time.Now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrator, err := transition.NewExecutionMigrator[string, string, string, string](store, runner,
+		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationRequest) (transition.MigrationSnapshot[string], error) {
+			if string(source.Target) != "incompatible" {
+				t.Fatalf("converter lost old state encoding: %q", source.Target)
+			}
+			return transition.MigrationSnapshot[string]{
+				MachineID: "task", MachineVersion: "1", Target: "compatible",
+				Input: source.Input, Event: source.Event, Policy: source.Policy,
+			}, nil
+		},
+		func(context.Context, transition.MigrationSource[string], transition.MigrationSnapshot[string]) error {
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Migrate(ctx, fence, time.Now, transition.MigrationRequest{ID: "fix-state", MachineID: "task", MachineVersion: "1"}); err != nil {
+		t.Fatalf("could not migrate unavailable state encoding: %v", err)
+	}
+	if err := worker.RunOne(ctx); err != nil || calls != 2 {
+		t.Fatalf("migrated state could not run: calls=%d error=%v", calls, err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +146,7 @@ func TestIncompatibleStateDiagnosticDoesNotBlockOtherWork(t *testing.T) {
 	if err := manager.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := newWorker().RunOne(ctx); err != nil || calls != 2 {
+	if err := newWorker().RunOne(ctx); err != nil || calls != 3 {
 		t.Fatalf("restored state could not run: calls=%d error=%v", calls, err)
 	}
 }

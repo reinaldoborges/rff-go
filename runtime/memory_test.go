@@ -57,7 +57,7 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
 		next.CommitOperationID != "" || next.CommitReceipt != nil || next.NotificationIntentID != "" || next.NotificationFailure != nil ||
 		next.NotificationWaived || len(next.NotificationControls) != 0 ||
-		next.Compatibility != nil ||
+		next.Compatibility != nil || next.OriginalRequest != nil || len(next.Migrations) != 0 ||
 		next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
@@ -77,6 +77,16 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.OriginalRequest != nil {
+		original := *record.OriginalRequest
+		original.Input.Data = slices.Clone(original.Input.Data)
+		original.Event.Data = slices.Clone(original.Event.Data)
+		record.OriginalRequest = &original
+	}
+	record.Migrations = slices.Clone(record.Migrations)
+	for i := range record.Migrations {
+		record.Migrations[i].Request.Parameters = slices.Clone(record.Migrations[i].Request.Parameters)
+	}
 	if record.Compatibility != nil {
 		diagnostic := *record.Compatibility
 		record.Compatibility = &diagnostic

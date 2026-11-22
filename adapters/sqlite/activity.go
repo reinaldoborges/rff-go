@@ -26,6 +26,7 @@ type hookWork struct {
 	Generation        int64
 	ExpiresAt         time.Time
 	Started           bool
+	FencedUnknown     bool
 	BudgetUsed        uint
 }
 
@@ -112,7 +113,8 @@ func validateWork(executionID string, work hookWork) error {
 		expectedID := hookID(executionID, transition.HookDispatch{Kind: attempt.Kind, RetryCycle: attempt.Metadata.RetryCycle})
 		if !seen[expectedID] || attempt.Metadata.ActivityID != expectedID || attempt.Metadata.ActivityIdempotencyKey != expectedID ||
 			(attempt.Result != nil && (!validHookResult(*attempt.Result) || attempt.CompletedAt.Before(attempt.StartedAt))) ||
-			(attempt.Unknown && (attempt.Result == nil || attempt.Result.Success)) {
+			(attempt.Unknown && attempt.Result != nil && attempt.Result.Success) ||
+			(attempt.Unknown && attempt.Result == nil && (!work.FencedUnknown || i != len(progress.Attempts)-1)) {
 			return fmt.Errorf("%w: inconsistent hook attempt history", ErrUnsupportedSchema)
 		}
 		switch attempt.Kind {
@@ -153,6 +155,10 @@ func validateWork(executionID string, work hookWork) error {
 		}
 	} else if progress.Completed {
 		return fmt.Errorf("%w: completed hook did not start", ErrUnsupportedSchema)
+	}
+	if work.FencedUnknown && (!work.Started || progress.Completed || len(progress.Attempts) == 0 ||
+		!progress.Attempts[len(progress.Attempts)-1].Unknown || progress.Attempts[len(progress.Attempts)-1].Result != nil) {
+		return fmt.Errorf("%w: invalid fenced unknown attempt", ErrUnsupportedSchema)
 	}
 	return nil
 }
@@ -480,7 +486,7 @@ func (s *Store[EntityID, StateID]) ResolveUnknownHook(
 			return err
 		}
 		for _, attempt := range work.Progress.Attempts {
-			if attempt.Metadata.ActivityID == activityID && attempt.Metadata.LeaseGeneration == generation && attempt.Unknown {
+			if attempt.Metadata.ActivityID == activityID && attempt.Metadata.LeaseGeneration == generation && attempt.Unknown && attempt.Result != nil {
 				if *attempt.Result == result {
 					return nil
 				}
@@ -498,6 +504,7 @@ func (s *Store[EntityID, StateID]) ResolveUnknownHook(
 		last.CompletedAt = now.UTC()
 		last.Result = &result
 		last.Unknown = true
+		work.FencedUnknown = false
 		work.Progress.Completed = true
 		work.Progress.Result = result
 		return saveHook(ctx, tx, lease.ExecutionID, work)

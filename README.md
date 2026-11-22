@@ -72,7 +72,7 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1, 2, and 3 stores
+without writes for unsupported schemas. It migrates version 1 through 4 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
@@ -87,8 +87,11 @@ tables in the adapter transaction, atomically recording the receipt and enabled
 notification intent. Its callback must use only the provided transaction and
 must not control or retain it. Rejection discards callback writes. Separate
 stores use the host commit and handoff reconciliation interfaces instead.
-Other compatibility failure paths and explicit execution migration are not yet
-implemented.
+`ExecutionMigrator` supports host-authorized pre-commit conversion with pinned
+destination validation, original-request replay, and worker fencing. Converters
+receive the old encoded state; domain verification and audit remain host-owned.
+Migration preserves policy and deadlines, and fenced started attempts are
+recorded as unknown. Some compatibility discovery paths remain incomplete.
 
 ```sh
 go test ./adapters/sqlite
@@ -98,6 +101,7 @@ go test ./adapters/sqlite -run 'TestNotificationHandoff|TestNotificationRepair'
 go test ./adapters/sqlite -run TestNotificationDelivery
 go test ./adapters/sqlite -run TestAtomicCommit
 go test ./adapters/sqlite -run TestIncompatibleExecution
+go test ./adapters/sqlite -run TestMigration
 go test ./runtime -run TestNotificationWorker
 go test ./runtime
 ```
