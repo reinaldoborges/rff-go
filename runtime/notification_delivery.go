@@ -140,7 +140,22 @@ func (w *NotificationWorker[EntityID, StateID]) RunOne(ctx context.Context) erro
 			}
 		}
 	}()
-	deliveryErr := w.deliver(attemptCtx, delivery)
+	deliveryDone := make(chan error, 1)
+	go func() {
+		if err := attemptCtx.Err(); err != nil {
+			deliveryDone <- err
+			return
+		}
+		deliveryDone <- w.deliver(attemptCtx, delivery)
+	}()
+	var deliveryErr error
+	select {
+	case deliveryErr = <-deliveryDone:
+	case <-attemptCtx.Done():
+		deliveryErr = attemptCtx.Err()
+	case <-workCtx.Done():
+		deliveryErr = workCtx.Err()
+	}
 	if deliveryErr == nil {
 		deliveryErr = attemptCtx.Err()
 	}

@@ -54,6 +54,7 @@ func TestNotificationWorkerRetriesWithStableIntent(t *testing.T) {
 			if len(seen) == 1 {
 				return unavailable
 			}
+
 			return nil
 		}, transition.NotificationWorkerConfig{
 			ID: "worker", LeaseTTL: time.Minute, RenewalInterval: time.Second,
@@ -71,5 +72,51 @@ func TestNotificationWorkerRetriesWithStableIntent(t *testing.T) {
 	}
 	if len(seen) != 2 || seen[0].Intent.ID != seen[1].Intent.ID || seen[0].Attempt != 1 || seen[1].Attempt != 2 {
 		t.Fatalf("delivery identity or attempt changed incorrectly: %+v", seen)
+	}
+}
+
+func TestNotificationTimeoutDoesNotWaitForUncooperativeDelivery(t *testing.T) {
+	started, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	store := &deliveryStore{delivery: transition.NotificationDelivery[string, string]{
+		Intent: transition.NotificationIntent[string, string]{ID: "intent", ExecutionID: "execution"},
+		Lease:  transition.NotificationLease{IntentID: "intent", ExecutionID: "execution"},
+	}}
+	now := time.Now()
+	clock := &controlledTimeoutClock{
+		manualWorkerClock: &manualWorkerClock{now: now, ticker: &manualTicker{ticks: make(chan time.Time, 1)}},
+		deadline:          &controlledDeadline{done: make(chan struct{})},
+	}
+	worker, err := transition.NewNotificationWorker[string, string](
+		store, func(context.Context, transition.NotificationDelivery[string, string]) error {
+			close(started)
+			<-release
+			close(exited)
+			return nil
+		}, transition.NotificationWorkerConfig{
+			ID: "worker", LeaseTTL: time.Minute, RenewalInterval: time.Second,
+			AttemptTimeout: time.Minute, RetryDelay: time.Second, Clock: clock,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workDone := make(chan error, 1)
+	go func() { workDone <- worker.RunOne(context.Background()) }()
+	<-started
+	close(clock.deadline.done)
+	select {
+	case err := <-workDone:
+		if !errors.Is(err, context.DeadlineExceeded) || !store.retried || store.done {
+			t.Errorf("timeout did not schedule delivery retry: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		<-workDone
+		t.Fatal("notification worker remained blocked after attempt timeout")
+	}
+	close(release)
+	<-exited
+	if store.done {
+		t.Fatal("late delivery success completed the timed-out attempt")
 	}
 }

@@ -55,6 +55,8 @@ outbox. Use the same coordinator owner for all scans.
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by
 intent ID. A delivery error is returned even when retry scheduling succeeds.
+Timed-out deliveries may continue if the provider ignores context cancellation;
+their late results cannot complete the timed-out claim.
 When a worker cannot rehydrate a pinned hook before starting it, the adapter
 persists a safe compatibility diagnostic without consuming an attempt.
 `CompatibilityCoordinator` revalidates these blocks after behavior is restored;
