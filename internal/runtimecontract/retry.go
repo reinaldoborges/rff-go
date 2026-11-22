@@ -232,11 +232,16 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = store.ApplyCheckedHookControl(ctx, lease, clock,
-			transition.HookControl{ID: "retry", Action: transition.RetryIntervention},
+		originalDeadline := now.Add(time.Hour)
+		now = now.Add(time.Second)
+		control := transition.HookControl{ID: "retry", Action: transition.RetryIntervention}
+		receipt, err := store.ApplyCheckedHookControl(ctx, lease, clock, control,
 			func(transition.Execution[string, string], transition.HookCall) error { return nil })
 		if err != nil {
 			t.Fatal(err)
+		}
+		if !receipt.AcceptedAt.Equal(now) || !receipt.Deadline.Equal(now.Add(time.Hour)) {
+			t.Fatalf("new control cycle has the wrong deadline: %+v", receipt)
 		}
 		if err := coordinator.Reconcile(ctx); err != nil {
 			t.Fatal(err)
@@ -248,6 +253,18 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		started, err := store.StartHook(ctx, resumed, clock)
 		if err != nil || started.Attempt.Number != 3 {
 			t.Fatalf("new control cycle lost attempt history: %+v, %v", started, err)
+		}
+		now = now.Add(time.Second)
+		replayed, err := store.ApplyCheckedHookControl(ctx, lease, clock, control,
+			func(transition.Execution[string, string], transition.HookCall) error { return nil })
+		progress, progressErr := store.ReadHookProgress(ctx, "execution")
+		execution, executionErr := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || !replayed.AcceptedAt.Equal(receipt.AcceptedAt) || !replayed.Deadline.Equal(receipt.Deadline) ||
+			progressErr != nil || progress.BudgetUsed != 1 || len(progress.Attempts) != 3 ||
+			executionErr != nil || !execution.Deadline.Equal(originalDeadline) ||
+			!execution.CycleDeadline.Equal(receipt.Deadline) {
+			t.Fatalf("control replay changed budget, deadlines, or history: receipt=%+v progress=%+v execution=%+v errors=%v, %v, %v",
+				replayed, progress, execution, err, progressErr, executionErr)
 		}
 	})
 	t.Run("abort recovery exhaustion and retry", func(t *testing.T) {
