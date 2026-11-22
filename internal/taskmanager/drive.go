@@ -131,6 +131,13 @@ func (f *Fixture) Drive(ctx context.Context) error {
 	}
 	pendingErr = errors.Join(pendingErr, decisions.Reconcile(ctx))
 	config := transition.CoordinatorConfig{ID: "taskmanager", Clock: f.clock, LeaseTTL: time.Minute}
+	compatibility, err := transition.NewCompatibilityCoordinator(f.store, f.runner, config)
+	if err != nil {
+		return errors.Join(pendingErr, err)
+	}
+	if err := compatibility.Reconcile(ctx); err != nil {
+		return errors.Join(pendingErr, err)
+	}
 	coordinator, err := transition.NewCoordinator[string, string](f.store, f.runner, config)
 	if err != nil {
 		return errors.Join(pendingErr, err)
