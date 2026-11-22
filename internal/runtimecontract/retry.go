@@ -175,7 +175,7 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			return &transition.Execution[string, string]{
 				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
-				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				Operation: transition.Transition, Previous: "open", HasPrevious: true, Target: "done", Status: transition.Waiting,
 				AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
 					MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 					RetryDelays: []time.Duration{0},
@@ -224,6 +224,16 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		record, err := store.ReadActiveExecution(ctx, "execution")
 		if err != nil || record.Status != transition.NeedsIntervention || record.Failure == nil || *record.Failure != failure {
 			t.Fatalf("exhausted execution did not retain failure: %+v, %v", record, err)
+		}
+		domain := &host{current: "open"}
+		commits, err := transition.NewCommitCoordinator[string, string](store, domain, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := commits.Reconcile(ctx); err != nil || domain.writes != 0 || domain.current != "open" {
+			t.Fatalf("exhausted transition changed current state: %+v, %v", domain, err)
 		}
 		if _, err := store.ClaimHook(ctx, "worker", clock, time.Minute); !errors.Is(err, transition.ErrNoHookActivity) {
 			t.Fatalf("work ran after shared budget exhaustion: %v", err)
