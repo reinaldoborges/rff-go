@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -78,7 +79,16 @@ func TestLocalFixtureCLIStartsSignalsInspectsAndAuthorizes(t *testing.T) {
 	}
 }
 
-func TestLocalFixtureCLIAuthorizedRetry(t *testing.T) {
+func TestLocalFixtureCLIAuthorizedRetryAndAbort(t *testing.T) {
+	for _, action := range []string{"retry", "abort"} {
+		t.Run(action, func(t *testing.T) {
+			testLocalFixtureCLIControl(t, action)
+		})
+	}
+}
+
+func testLocalFixtureCLIControl(t *testing.T, action string) {
+	t.Helper()
 	ctx := context.Background()
 	db := filepath.Join(t.TempDir(), "retry.db")
 	past := time.Now().Add(-2 * time.Hour)
@@ -109,11 +119,16 @@ func TestLocalFixtureCLIAuthorizedRetry(t *testing.T) {
 	if err := invoke("drive"); err != nil {
 		t.Fatal(err)
 	}
-	if err := invoke("control", "operator", id, "retry", "retry"); err != nil {
-		t.Fatalf("authorized retry failed: %v", err)
+	if err := invoke("control", "operator", id, action, action); err != nil {
+		t.Fatalf("authorized %s failed: %v", action, err)
 	}
 	if err := invoke("drive"); err != nil {
 		t.Fatal(err)
+	}
+	if action == "abort" {
+		if err := invoke("drive"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	fixture, err = taskmanager.Open(db, time.Now)
 	if err != nil {
@@ -125,7 +140,11 @@ func TestLocalFixtureCLIAuthorizedRetry(t *testing.T) {
 		}
 	})
 	membership, err := fixture.Membership(ctx, "owner", "membership")
-	if err != nil || membership.Status != taskmanager.Invited {
+	if action == "abort" {
+		if !errors.Is(err, taskmanager.ErrNotFound) {
+			t.Fatalf("aborted execution committed membership: %+v, %v", membership, err)
+		}
+	} else if err != nil || membership.Status != taskmanager.Invited {
 		t.Fatalf("retried execution did not commit: %+v, %v", membership, err)
 	}
 }
