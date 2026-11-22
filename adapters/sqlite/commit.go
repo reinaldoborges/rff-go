@@ -2,8 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
-	"fmt"
+	"encoding/hex"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -47,6 +48,8 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			execution.Status = transition.CommitRejected
 		case transition.CommitSucceeded:
 			if execution.Notify {
+				sum := sha256.Sum256([]byte("rff-notification:" + execution.ID))
+				execution.NotificationIntentID = "rff-notification:" + hex.EncodeToString(sum[:])
 				execution.Status = transition.Notifying
 			} else {
 				execution.Status = transition.Complete
@@ -56,17 +59,7 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			return err
 		}
 		if execution.Status == transition.Complete {
-			result, err := tx.ExecContext(ctx, `DELETE FROM rff_active WHERE execution_id = ?`, lease.ExecutionID)
-			if err != nil {
-				return fmt.Errorf("release committed execution: %w", err)
-			}
-			count, err := result.RowsAffected()
-			if err != nil {
-				return fmt.Errorf("inspect committed reservation: %w", err)
-			}
-			if count != 1 {
-				return transition.ErrStaleLease
-			}
+			return releaseReservation(ctx, tx, lease.ExecutionID)
 		}
 		return nil
 	})

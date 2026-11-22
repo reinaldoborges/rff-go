@@ -1,12 +1,9 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -24,24 +21,9 @@ func (s *Store[EntityID, StateID]) ApplyHookControl(
 		return receipt, transition.ErrInvalidHook
 	}
 	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		entity, err := s.encodeEntity(lease.Entity)
+		stored, err := s.readControlExecution(ctx, tx, lease)
 		if err != nil {
 			return err
-		}
-		var data []byte
-		err = tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ? AND entity = ?`, lease.ExecutionID, entity).Scan(&data)
-		if errors.Is(err, sql.ErrNoRows) {
-			return transition.ErrStaleLease
-		}
-		if err != nil {
-			return fmt.Errorf("read control execution: %w", err)
-		}
-		var stored diskRecord
-		if err := json.Unmarshal(data, &stored); err != nil {
-			return fmt.Errorf("%w: decode control execution: %w", ErrUnsupportedSchema, err)
-		}
-		if stored.SchemaVersion != transition.CurrentSchemaVersion || stored.ID != lease.ExecutionID || !bytes.Equal(stored.Entity, entity) {
-			return fmt.Errorf("%w: invalid control execution", ErrUnsupportedSchema)
 		}
 		for _, prior := range stored.Controls {
 			if prior.Control.ID == control.ID {

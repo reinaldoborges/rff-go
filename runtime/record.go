@@ -108,6 +108,10 @@ type Execution[EntityID comparable, StateID comparable] struct {
 	Status                    Status
 	CommitOperationID         string
 	CommitReceipt             *CommitReceipt
+	NotificationIntentID      string
+	NotificationFailure       *fsm.Failure
+	NotificationWaived        bool
+	NotificationControls      []NotificationControlReceipt
 	RecoveryStarted           bool
 	RejectionRecoveryDeadline time.Time
 	Failure                   *fsm.Failure

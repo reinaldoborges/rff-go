@@ -33,6 +33,10 @@ type diskRecord struct {
 	Status                    transition.Status
 	CommitOperationID         string
 	CommitReceipt             *transition.CommitReceipt
+	NotificationIntentID      string
+	NotificationFailure       *fsm.Failure
+	NotificationWaived        bool
+	NotificationControls      []transition.NotificationControlReceipt
 	RecoveryStarted           bool
 	RejectionRecoveryDeadline time.Time
 	Failure                   *fsm.Failure
@@ -59,6 +63,8 @@ func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[Enti
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
 		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
 		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
+		NotificationIntentID: record.NotificationIntentID,
+		NotificationFailure:  record.NotificationFailure, NotificationWaived: record.NotificationWaived, NotificationControls: record.NotificationControls,
 		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
 		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	})
@@ -95,6 +101,8 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
 		Deadline: record.Deadline, CycleDeadline: record.CycleDeadline, Controls: record.Controls,
 		Status: record.Status, CommitOperationID: record.CommitOperationID, CommitReceipt: record.CommitReceipt, RecoveryStarted: record.RecoveryStarted,
+		NotificationIntentID: record.NotificationIntentID,
+		NotificationFailure:  record.NotificationFailure, NotificationWaived: record.NotificationWaived, NotificationControls: record.NotificationControls,
 		RejectionRecoveryDeadline: record.RejectionRecoveryDeadline,
 		Failure:                   record.Failure, FailureDisposition: record.FailureDisposition,
 	}, nil

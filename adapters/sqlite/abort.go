@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -35,17 +34,6 @@ func (s *Store[EntityID, StateID]) FinishAbort(
 		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return err
 		}
-		result, err := tx.ExecContext(ctx, `DELETE FROM rff_active WHERE execution_id = ?`, lease.ExecutionID)
-		if err != nil {
-			return fmt.Errorf("release aborted execution: %w", err)
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("inspect released reservation: %w", err)
-		}
-		if count != 1 {
-			return transition.ErrStaleLease
-		}
-		return nil
+		return releaseReservation(ctx, tx, lease.ExecutionID)
 	})
 }

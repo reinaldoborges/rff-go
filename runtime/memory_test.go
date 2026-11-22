@@ -55,7 +55,9 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 	}
 	if next == nil || view.Active || next.Entity != entity || next.Key != key || next.ID == "" || s.ids[next.ID] ||
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
-		next.CommitOperationID != "" || next.CommitReceipt != nil || next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
+		next.CommitOperationID != "" || next.CommitReceipt != nil || next.NotificationIntentID != "" || next.NotificationFailure != nil ||
+		next.NotificationWaived || len(next.NotificationControls) != 0 ||
+		next.RecoveryStarted || next.Failure != nil || next.FailureDisposition != "" ||
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
 	}
@@ -74,6 +76,11 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.NotificationFailure != nil {
+		failure := *record.NotificationFailure
+		record.NotificationFailure = &failure
+	}
+	record.NotificationControls = slices.Clone(record.NotificationControls)
 	if record.CommitReceipt != nil {
 		receipt := *record.CommitReceipt
 		if receipt.Failure != nil {
