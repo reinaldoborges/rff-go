@@ -94,7 +94,7 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 			control := transition.NotificationControl{ID: "repair", Action: action}
 			denied := errors.New("not authorized")
 			allowed := true
-			controls, err := transition.NewAuthorizedControls[string](store, func(_ context.Context, request transition.ControlAuthorization) error {
+			authorize := func(_ context.Context, request transition.ControlAuthorization) error {
 				if request.ExecutionID != "execution" || request.RequestID != control.ID {
 					t.Fatalf("incorrect authorization request: %+v", request)
 				}
@@ -102,7 +102,8 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 					return denied
 				}
 				return nil
-			})
+			}
+			controls, err := transition.NewAuthorizedControls[string](store, authorize)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -123,6 +124,28 @@ func TestNotificationRepairRequiresAuthorizedRetryOrWaiver(t *testing.T) {
 			if err != nil || execution.Status != transition.NotificationRepair || execution.NotificationFailure == nil ||
 				execution.NotificationFailure.Code != "outbox-unavailable" {
 				t.Fatalf("definitive failure did not enter repair: execution=%+v error=%v", execution, err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, toggleStateCodec{available: &stateAvailable})
+			if err != nil {
+				t.Fatal(err)
+			}
+			controls, err = transition.NewAuthorizedControls[string](store, authorize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coordinator, err = transition.NewNotificationCoordinator[string, string](store, host, transition.CoordinatorConfig{
+				ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err = store.ReadActiveExecution(ctx, "execution")
+			if err != nil || execution.Status != transition.NotificationRepair || execution.CommitReceipt == nil ||
+				execution.CommitReceipt.Outcome != transition.CommitSucceeded {
+				t.Fatalf("restart lost post-commit repair state: execution=%+v error=%v", execution, err)
 			}
 			stale := fence
 			stale.Generation++
