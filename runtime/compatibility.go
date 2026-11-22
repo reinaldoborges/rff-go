@@ -66,7 +66,9 @@ func NewCompatibilityError(diagnostic CompatibilityDiagnostic, cause error) *Com
 	return &CompatibilityError{Diagnostic: diagnostic, cause: cause}
 }
 
-// CompatibilityStore provides fenced revalidation of persisted diagnostics.
+// CompatibilityStore provides fenced discovery and revalidation of diagnostics.
+// BlockQuiescedCompatibility compares the complete snapshot atomically and
+// fences unstarted hook claims without consuming an attempt.
 type CompatibilityStore[EntityID comparable, StateID comparable] interface {
 	ActiveExecutionReader[EntityID, StateID]
 	TransitionLeaseStore[EntityID]
@@ -92,7 +94,7 @@ func NewCompatibilityCoordinator[EntityID comparable, StateID comparable, Event,
 	return &CompatibilityCoordinator[EntityID, StateID, Event, Input]{store: store, runner: runner, config: config}, nil
 }
 
-// Reconcile discovers incompatible intervention work and revalidates blocked
+// Reconcile discovers incompatible quiesced work and revalidates blocked
 // executions; hosts must schedule this alongside other scans.
 func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) Reconcile(ctx context.Context) error {
 	ids, err := c.store.ActiveExecutionIDs(ctx)
@@ -114,7 +116,7 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) Reconcile(ct
 
 func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne(ctx context.Context, id string) error {
 	execution, err := readForReconciliation(ctx, c.store, id)
-	if err != nil || execution.Compatibility == nil && execution.Status != NeedsIntervention {
+	if err != nil || execution.Compatibility == nil && !compatibilityDiscoverable(execution) {
 		return err
 	}
 	if execution.Compatibility != nil && execution.Compatibility.Component == CompatibilityMigration {
@@ -129,7 +131,7 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		return err
 	}
 	execution, err = readForReconciliation(ctx, c.store, id)
-	if err != nil || execution.Compatibility == nil && execution.Status != NeedsIntervention {
+	if err != nil || execution.Compatibility == nil && !compatibilityDiscoverable(execution) {
 		return err
 	}
 	if execution.Compatibility != nil && execution.Compatibility.Component == CompatibilityMigration {
@@ -175,7 +177,10 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 			if errors.Is(err, ErrConflict) {
 				return nil
 			}
-			return err
+			if err != nil {
+				return errors.Join(compatibility, err)
+			}
+			return compatibility
 		}
 		next.Check = execution.Compatibility.Check
 	}
@@ -183,4 +188,9 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 		return nil
 	}
 	return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, next)
+}
+
+func compatibilityDiscoverable[EntityID comparable, StateID comparable](execution Execution[EntityID, StateID]) bool {
+	return execution.Status == NeedsIntervention ||
+		execution.Status == Waiting && execution.CommitOperationID == ""
 }

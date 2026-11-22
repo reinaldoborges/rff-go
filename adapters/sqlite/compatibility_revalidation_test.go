@@ -272,8 +272,8 @@ func TestRejectedCommitRecoveryRetainsCompatibilityBlockUntilBehaviorReturns(t *
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := manager.Reconcile(ctx); err != nil {
-			t.Fatal(err)
+		if err := manager.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+			t.Fatalf("unavailable behavior was not reported: %v", err)
 		}
 		blocked, err := store.ReadActiveExecution(ctx, "execution")
 		if err != nil || blocked.Status != transition.NeedsIntervention || blocked.Compatibility == nil ||

@@ -150,8 +150,8 @@ func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore
 	if err := store.EnterHookIntervention(ctx, lease, clock.Now); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Reconcile(ctx); err != nil {
-		t.Fatal(err)
+	if err := manager.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("unavailable intervention behavior was not reported: %v", err)
 	}
 	intervention, err := store.ReadActiveExecution(ctx, "c")
 	if err != nil || intervention.Status != transition.NeedsIntervention || intervention.Compatibility == nil ||
@@ -166,5 +166,34 @@ func RunCompatibility(t *testing.T, newStore func(*testing.T) CompatibilityStore
 	if err != nil || restored.Status != transition.NeedsIntervention || restored.Compatibility != nil ||
 		!restored.Deadline.Equal(intervention.Deadline) {
 		t.Fatalf("restoration bypassed intervention or changed its deadline: %+v, %v", restored, err)
+	}
+	_, _, err = store.Accept(ctx, "d", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "d", Entity: "d", Key: "key",
+			Operation: transition.Initialize, MachineID: "machine", MachineVersion: "4", Target: "open",
+			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
+			Status: transition.Waiting, AcceptedAt: now, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reconcile(ctx); !errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("unavailable waiting behavior was not reported: %v", err)
+	}
+	waiting, err := store.ReadActiveExecution(ctx, "d")
+	if err != nil || waiting.Status != transition.Waiting || waiting.Compatibility == nil ||
+		waiting.Compatibility.Component != transition.CompatibilityMachine {
+		t.Fatalf("waiting work did not discover unavailable behavior: %+v, %v", waiting, err)
+	}
+	register("4")
+	if err := manager.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restored, err = store.ReadActiveExecution(ctx, "d")
+	if err != nil || restored.Status != transition.Waiting || restored.Compatibility != nil ||
+		!restored.Deadline.Equal(waiting.Deadline) {
+		t.Fatalf("waiting restoration changed phase or deadline: %+v, %v", restored, err)
 	}
 }

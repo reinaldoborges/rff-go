@@ -164,7 +164,7 @@ func (s *Store[EntityID, StateID]) BlockExecutionCompatibility(
 }
 
 // BlockQuiescedCompatibility records a discovered failure only if the
-// intervention snapshot has not changed since validation.
+// quiesced snapshot has not changed since validation.
 func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
 	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time,
 	expected transition.Execution[EntityID, StateID], diagnostic transition.CompatibilityDiagnostic,
@@ -172,12 +172,13 @@ func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
 	if clock == nil {
 		return transition.ErrInvalidLease
 	}
-	if expected.Status != transition.NeedsIntervention || expected.Compatibility != nil ||
+	if (expected.Status != transition.NeedsIntervention &&
+		(expected.Status != transition.Waiting || expected.CommitOperationID != "")) || expected.Compatibility != nil ||
 		expected.ID != lease.ExecutionID || expected.Entity != lease.Entity {
 		return transition.ErrInvalidHook
 	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		_, record, err := s.fencedExecution(ctx, tx, lease, clock)
+		now, record, err := s.fencedExecution(ctx, tx, lease, clock)
 		if err != nil {
 			return err
 		}
@@ -194,6 +195,23 @@ func (s *Store[EntityID, StateID]) BlockQuiescedCompatibility(
 		}
 		if !validDiagnostic(record, diagnostic) {
 			return transition.ErrInvalidHook
+		}
+		if record.Status == transition.Waiting {
+			work, err := loadHook(ctx, tx, lease.ExecutionID)
+			if err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
+				return err
+			}
+			if err == nil {
+				if work.Started {
+					return transition.ErrConflict
+				}
+				if work.Owner != "" {
+					fenceHook(&work, now)
+					if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		record.Compatibility = &diagnostic
 		return saveExecution(ctx, tx, lease.ExecutionID, record)
