@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,10 +63,15 @@ func (notificationControlFailure) Handoff(context.Context, transition.Transition
 }
 
 func TestOperatorNotificationRepairControls(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "taskmanager")
+	build := exec.Command("go", "build", "-o", binary, "../../cmd/taskmanager")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
 	for _, action := range []transition.ControlAction{transition.ControlNotificationRetry, transition.ControlNotificationWaive} {
 		t.Run(string(action), func(t *testing.T) {
 			ctx := context.Background()
-			now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			now := time.Now().UTC()
 			clock := func() time.Time { return now }
 			path := filepath.Join(t.TempDir(), "repair.db")
 			fixture, err := taskmanager.Open(path, clock)
@@ -158,15 +165,17 @@ func TestOperatorNotificationRepairControls(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := fixture.ControlExecution(ctx, "owner", id, "repair", action); !errors.Is(err, taskmanager.ErrDenied) {
-				t.Fatalf("owner was allowed notification control: %v", err)
+			deniedCommand := exec.Command(binary, "-db", path, "control", "owner", id, "repair", string(action))
+			if output, err := deniedCommand.CombinedOutput(); err == nil || !strings.Contains(string(output), taskmanager.ErrDenied.Error()) {
+				t.Fatalf("owner was allowed notification control: output=%q error=%v", output, err)
 			}
 			record, err = fixture.InspectExecution(ctx, "operator", id)
 			if err != nil || record.Status != transition.NotificationRepair || len(record.NotificationControls) != 0 {
 				t.Fatalf("denied control changed repair: %+v, %v", record, err)
 			}
-			if err := fixture.ControlExecution(ctx, "operator", id, "repair", action); err != nil {
-				t.Fatal(err)
+			allowedCommand := exec.Command(binary, "-db", path, "control", "operator", id, "repair", string(action))
+			if output, err := allowedCommand.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != `"ok"` {
+				t.Fatalf("operator notification control failed: output=%q error=%v", output, err)
 			}
 			var delivered []taskmanager.InvitationNotification
 			if err := fixture.SetNotificationSink(func(_ context.Context, notification taskmanager.InvitationNotification) error {
