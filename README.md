@@ -52,6 +52,9 @@ persists a safe compatibility diagnostic without consuming an attempt.
 the host must schedule that scan and use the same coordinator owner.
 SQLite's `ReadCompatibility` can inspect a diagnostic even when an identifier
 or state value cannot be decoded.
+`InspectionStore` lists retained executions and returns payload-free protocol
+summaries, including compatibility diagnostics and hook attempt history. The
+host must authorize access and protect application-provided failure details.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
