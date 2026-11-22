@@ -48,6 +48,48 @@ func activeMember(t *testing.T, fixture GovernanceFixture, now time.Time) {
 // RunGovernance checks assignment-aware removal and ownership transfer replay.
 func RunGovernance(t *testing.T, newFixture func(*testing.T, func() time.Time) GovernanceFixture) {
 	t.Helper()
+	t.Run("task permissions require active membership", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		activeMember(t, fixture, now)
+		if _, err := fixture.Invite(ctx, "owner", "group", "outsider", "invited-membership", "invite-outsider", now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for _, actor := range []string{"outsider", "operator"} {
+			if _, err := fixture.CreateTask(ctx, actor, "group", "denied-task", "Task", "denied-"+actor); !errors.Is(err, taskmanager.ErrDenied) {
+				t.Fatalf("%s created a task without active membership: %v", actor, err)
+			}
+		}
+		if _, err := fixture.CreateTask(ctx, "member", "group", "task", "Task", "create"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for _, actor := range []string{"outsider", "operator"} {
+			if _, err := fixture.TransitionTask(ctx, actor, "task", "denied-"+actor, taskmanager.StartTask); !errors.Is(err, taskmanager.ErrDenied) {
+				t.Fatalf("%s changed a task without active membership: %v", actor, err)
+			}
+		}
+		task, err := fixture.Task(ctx, "member", "task")
+		if err != nil || task.Status != taskmanager.TaskOpen {
+			t.Fatalf("denied transitions changed the task: %+v, %v", task, err)
+		}
+		if _, err := fixture.TransitionTask(ctx, "member", "task", "start", taskmanager.StartTask); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.Drive(ctx); err != nil {
+			t.Fatal(err)
+		}
+		task, err = fixture.Task(ctx, "member", "task")
+		if err != nil || task.Status != taskmanager.TaskInProgress {
+			t.Fatalf("active member could not progress the task: %+v, %v", task, err)
+		}
+	})
 	t.Run("assignment-aware removal", func(t *testing.T) {
 		ctx := context.Background()
 		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
