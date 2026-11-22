@@ -124,6 +124,28 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 		if err := coordinator.Reconcile(ctx); err == nil {
 			t.Fatal("lost rejection response was not reported")
 		}
+		rejected, err := store.ReadActiveExecution(ctx, "execution")
+		if err != nil || rejected.Status != transition.CommitRejected || rejected.CommitReceipt == nil {
+			t.Fatalf("durable rejection was not retained: %+v, %v", rejected, err)
+		}
+		if _, err := store.ApplyCheckedHookControl(ctx, fence, clock,
+			transition.HookControl{ID: "retry-rejected", Action: transition.RetryIntervention},
+			func(transition.Execution[string, string], transition.HookCall) error { return nil }); !errors.Is(err, transition.ErrInvalidHook) {
+			t.Fatalf("rejected commit accepted retry: %v", err)
+		}
+		conversions := 0
+		_, err = store.ApplyExecutionMigration(ctx, fence, clock,
+			transition.MigrationRequest{ID: "migrate-rejected", MachineID: "machine", MachineVersion: "2"},
+			func(context.Context, transition.MigrationSource[string]) (transition.MigrationSnapshot[string], error) {
+				conversions++
+				return transition.MigrationSnapshot[string]{}, nil
+			}, func(context.Context, transition.MigrationSource[string], transition.MigrationSnapshot[string], transition.Execution[string, string], transition.HookCall) error {
+				t.Fatal("rejected commit reached migration validation")
+				return nil
+			})
+		if !errors.Is(err, transition.ErrInvalidHook) || conversions != 0 {
+			t.Fatalf("rejected commit accepted migration: conversions=%d error=%v", conversions, err)
+		}
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
