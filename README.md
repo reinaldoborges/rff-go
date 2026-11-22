@@ -227,8 +227,11 @@ go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLo
 ./scripts/check.sh
 ```
 
-These are local checks, not a claim that the full acceptance matrix or CI gate
-has passed.
+Pull-request CI runs `./scripts/check.sh`, including these conformance and
+process-restart tests. Passing checks alone is not a claim of production
+readiness or exactly-once external delivery; the home repository's
+[acceptance matrix](https://github.com/reinaldoborges/rff-home/blob/main/docs/first-slice-acceptance.md)
+defines the complete single-node gate.
 
 ## License
 
