@@ -129,6 +129,8 @@ outcomes. The host must authorize every submission and persist enough approved
 context to reconcile it after restart. Its handler must atomically record and
 deduplicate outcomes with domain effects by input ID; transient errors leave
 inputs pending for host-scheduled reconciliation.
+For same-file hosts, `Store.AcceptInputAtomic` atomically records the input
+outcome with execution acceptance or a classified definitive rejection.
 The host provides domain commits; automatic rejection recovery is supported.
 `sqlite.NewNotificationOutbox` provides fenced local handoff and durable delivery
 claims, including recovery after claim expiry. Incompatible delivery records

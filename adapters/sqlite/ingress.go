@@ -21,6 +21,18 @@ func decodeInput(id string, data []byte) (transition.InputRecord, error) {
 	return record, nil
 }
 
+func saveInputOutcome(ctx context.Context, tx *sql.Tx, record *transition.InputRecord, outcome transition.InputOutcome) error {
+	record.Outcome = &outcome
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("encode input outcome: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE rff_inputs SET record = ? WHERE id = ?`, data, record.ID); err != nil {
+		return fmt.Errorf("persist input outcome: %w", err)
+	}
+	return nil
+}
+
 // AcceptInput atomically records or reconciles an input by its global ID.
 func (s *Store[EntityID, StateID]) AcceptInput(ctx context.Context, id string,
 	decide func(*transition.InputRecord) (*transition.InputRecord, error),

@@ -100,6 +100,40 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 
 func (f *Fixture) Close() error { return errors.Join(f.store.Close(), f.db.Close()) }
 
+type inputRejection struct{ failure fsm.Failure }
+
+func (e *inputRejection) Error() string { return "input rejected: " + e.failure.Code }
+
+func (f *Fixture) acceptInputAtomic(ctx context.Context, entity, key string, expiry bool,
+	decide func(context.Context, *sql.Tx, transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error),
+) (transition.Execution[string, string], bool, error) {
+	classify := func(err error) *fsm.Failure {
+		switch {
+		case ctx.Err() != nil:
+			return nil
+		case errors.Is(err, ErrDenied):
+			return &fsm.Failure{Code: "denied"}
+		case errors.Is(err, ErrNotFound):
+			return &fsm.Failure{Code: "not-found"}
+		case expiry && errors.Is(err, transition.ErrBusy):
+			return nil
+		case errors.Is(err, ErrConflict), errors.Is(err, transition.ErrBusy),
+			errors.Is(err, transition.ErrConflict), errors.Is(err, fsm.ErrTerminalState):
+			return &fsm.Failure{Code: "conflict"}
+		default:
+			return nil
+		}
+	}
+	execution, created, outcome, err := f.store.AcceptInputAtomic(ctx, entity, key, decide, classify)
+	if err != nil {
+		return execution, created, err
+	}
+	if outcome != nil && outcome.Failure != nil {
+		return execution, false, &inputRejection{failure: *outcome.Failure}
+	}
+	return execution, created, nil
+}
+
 func (f *Fixture) transaction(ctx context.Context, run func(*sql.Tx) error) (err error) {
 	tx, err := f.db.BeginTx(ctx, nil)
 	if err != nil {

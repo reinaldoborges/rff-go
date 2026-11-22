@@ -60,7 +60,7 @@ type taskAcceptanceStore struct {
 func (s taskAcceptanceStore) Accept(ctx context.Context, entity, key string,
 	decide transition.AcceptanceDecisionFunc[string, string],
 ) (transition.Execution[string, string], bool, error) {
-	return s.fixture.store.AcceptAtomic(ctx, entity, key,
+	return s.fixture.acceptInputAtomic(ctx, entity, key, false,
 		func(ctx context.Context, tx *sql.Tx, view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			if view.Existing != nil {
 				return decide(view)
@@ -115,10 +115,7 @@ func (f *Fixture) acceptTask(ctx context.Context, delivery transition.InputDeliv
 	var previous string
 	if input.Task.Event != "" {
 		err := f.db.QueryRowContext(ctx, `SELECT status FROM tm_tasks WHERE id = ?`, input.Task.ID).Scan(&previous)
-		if errors.Is(err, sql.ErrNoRows) {
-			return transition.InputOutcome{Failure: &fsm.Failure{Code: "conflict"}}, nil
-		}
-		if err != nil {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return transition.InputOutcome{}, fmt.Errorf("read task state for acceptance: %w", err)
 		}
 	}
@@ -141,7 +138,10 @@ func (f *Fixture) acceptTask(ctx context.Context, delivery transition.InputDeliv
 		request.HasEvent, request.Event, request.EventCodec = true, string(input.Task.Event), taskEventCodec
 	}
 	execution, _, err := acceptor.Accept(ctx, request)
+	var rejected *inputRejection
 	switch {
+	case errors.As(err, &rejected):
+		return transition.InputOutcome{Failure: &rejected.failure}, nil
 	case errors.Is(err, ErrDenied):
 		return transition.InputOutcome{Failure: &fsm.Failure{Code: "denied"}}, nil
 	case errors.Is(err, ErrConflict), errors.Is(err, transition.ErrBusy), errors.Is(err, transition.ErrConflict), errors.Is(err, fsm.ErrTerminalState):

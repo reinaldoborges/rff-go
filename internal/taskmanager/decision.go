@@ -29,7 +29,7 @@ type decisionAcceptanceStore struct {
 func (s decisionAcceptanceStore) Accept(ctx context.Context, entity, key string,
 	decide transition.AcceptanceDecisionFunc[string, string],
 ) (transition.Execution[string, string], bool, error) {
-	return s.fixture.store.AcceptAtomic(ctx, entity, key,
+	return s.fixture.acceptInputAtomic(ctx, entity, key, s.input.Event == expireInvitation,
 		func(ctx context.Context, tx *sql.Tx, view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			if view.Existing != nil {
 				return decide(view)
@@ -122,7 +122,10 @@ func (f *Fixture) acceptDecision(ctx context.Context, delivery transition.InputD
 		HasPrevious: true, Previous: previous, HasEvent: true, Event: string(input.Event), EventCodec: membershipEventCodec,
 		Input: input, InputCodec: membershipInputCodec, Notification: transition.NotifyInherit,
 	})
+	var rejected *inputRejection
 	switch {
+	case errors.As(err, &rejected):
+		return transition.InputOutcome{Failure: &rejected.failure}, nil
 	case errors.Is(err, transition.ErrBusy) && input.Event == expireInvitation:
 		return transition.InputOutcome{}, err
 	case errors.Is(err, ErrDenied):

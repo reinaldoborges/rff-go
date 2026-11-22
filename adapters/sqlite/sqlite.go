@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/reinaldoborges/rff-go/fsm"
 	"github.com/reinaldoborges/rff-go/internal/nilcheck"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
@@ -78,6 +79,38 @@ func (s *Store[EntityID, StateID]) AcceptAtomic(
 	ctx context.Context, entity EntityID, key string,
 	decide func(context.Context, *sql.Tx, transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error),
 ) (result transition.Execution[EntityID, StateID], created bool, err error) {
+	return s.acceptAtomic(ctx, entity, key, decide, nil)
+}
+
+type inputAcceptance struct {
+	classify func(error) *fsm.Failure
+	outcome  *transition.InputOutcome
+	record   transition.InputRecord
+}
+
+// AcceptInputAtomic records an input outcome at the same boundary as execution
+// acceptance or a classified definitive rejection. The input must already exist.
+// The classifier returns nil for transient or unknown failures. The callback
+// has the same transaction restrictions as AcceptAtomic; its writes are rolled
+// back on rejection. Callers must validate the input identity before invocation.
+func (s *Store[EntityID, StateID]) AcceptInputAtomic(
+	ctx context.Context, entity EntityID, inputID string,
+	decide func(context.Context, *sql.Tx, transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error),
+	classify func(error) *fsm.Failure,
+) (transition.Execution[EntityID, StateID], bool, *transition.InputOutcome, error) {
+	if classify == nil {
+		return transition.Execution[EntityID, StateID]{}, false, nil, transition.ErrInvalidRequest
+	}
+	input := &inputAcceptance{classify: classify}
+	result, created, err := s.acceptAtomic(ctx, entity, inputID, decide, input)
+	return result, created, input.outcome, err
+}
+
+func (s *Store[EntityID, StateID]) acceptAtomic(
+	ctx context.Context, entity EntityID, key string,
+	decide func(context.Context, *sql.Tx, transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error),
+	input *inputAcceptance,
+) (result transition.Execution[EntityID, StateID], created bool, err error) {
 	if key == "" || decide == nil {
 		return result, false, transition.ErrInvalidDecision
 	}
@@ -109,6 +142,32 @@ func (s *Store[EntityID, StateID]) AcceptAtomic(
 	} else if !errors.Is(rowErr, sql.ErrNoRows) {
 		return result, false, fmt.Errorf("read execution: %w", rowErr)
 	}
+	if input != nil {
+		var inputData []byte
+		if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_inputs WHERE id = ?`, key).Scan(&inputData); err != nil {
+			return result, false, fmt.Errorf("read accepted input: %w", err)
+		}
+		input.record, err = decodeInput(key, inputData)
+		if err != nil {
+			return result, false, err
+		}
+		if input.record.Outcome != nil {
+			input.outcome = input.record.Outcome
+			if input.outcome.Failure == nil {
+				if existing == nil || existing.ID != input.outcome.Receipt {
+					return result, false, transition.ErrInvalidDecision
+				}
+				result = *existing
+			}
+			if err := tx.Commit(); err != nil {
+				return result, false, fmt.Errorf("commit input replay: %w", err)
+			}
+			return result, false, nil
+		}
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT rff_input_decision`); err != nil {
+			return result, false, fmt.Errorf("start input decision: %w", err)
+		}
+	}
 	var active bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_active WHERE entity = ?)`, encodedEntity).Scan(&active); err != nil {
 		return result, false, fmt.Errorf("read reservation: %w", err)
@@ -123,11 +182,41 @@ func (s *Store[EntityID, StateID]) AcceptAtomic(
 	}
 	next, err := decide(ctx, tx, transition.AcceptanceView[EntityID, StateID]{Existing: viewExisting, Active: active})
 	if err != nil {
+		if input != nil {
+			failure := input.classify(err)
+			if failure != nil {
+				if _, rollbackErr := tx.ExecContext(ctx, `ROLLBACK TO rff_input_decision`); rollbackErr != nil {
+					return result, false, fmt.Errorf("rollback rejected input: %w", rollbackErr)
+				}
+				if _, releaseErr := tx.ExecContext(ctx, `RELEASE rff_input_decision`); releaseErr != nil {
+					return result, false, fmt.Errorf("release input decision: %w", releaseErr)
+				}
+				input.outcome = &transition.InputOutcome{Failure: failure}
+				if saveErr := saveInputOutcome(ctx, tx, &input.record, *input.outcome); saveErr != nil {
+					return result, false, saveErr
+				}
+				if commitErr := tx.Commit(); commitErr != nil {
+					return result, false, fmt.Errorf("commit input rejection: %w", commitErr)
+				}
+				return result, false, nil
+			}
+		}
 		return result, false, err
+	}
+	if input != nil {
+		if _, err := tx.ExecContext(ctx, `RELEASE rff_input_decision`); err != nil {
+			return result, false, fmt.Errorf("release input decision: %w", err)
+		}
 	}
 	if existing != nil {
 		if next != nil {
 			return result, false, transition.ErrInvalidDecision
+		}
+		if input != nil {
+			input.outcome = &transition.InputOutcome{Receipt: existing.ID}
+			if err := saveInputOutcome(ctx, tx, &input.record, *input.outcome); err != nil {
+				return result, false, err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return result, false, fmt.Errorf("commit replay: %w", err)
@@ -163,6 +252,12 @@ func (s *Store[EntityID, StateID]) AcceptAtomic(
 	result, err = s.decodeRecord(encoded)
 	if err != nil {
 		return result, false, err
+	}
+	if input != nil {
+		input.outcome = &transition.InputOutcome{Receipt: result.ID}
+		if err := saveInputOutcome(ctx, tx, &input.record, *input.outcome); err != nil {
+			return result, false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return transition.Execution[EntityID, StateID]{}, false, fmt.Errorf("commit acceptance: %w", err)
