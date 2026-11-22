@@ -427,6 +427,9 @@ func (s *Store[EntityID, StateID]) ReadHookProgress(ctx context.Context, executi
 			return err
 		}
 		progress = work.Progress
+		progress.Started = work.Started
+		progress.LeaseExpiresAt = work.ExpiresAt
+		progress.BudgetUsed = work.BudgetUsed
 		return nil
 	})
 	if err != nil {

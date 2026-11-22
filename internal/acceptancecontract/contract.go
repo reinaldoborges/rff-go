@@ -119,6 +119,14 @@ func Run(t *testing.T, newFixture func(*testing.T) Fixture) {
 		if !errors.Is(err, transition.ErrInvalidDecision) {
 			t.Fatalf("pre-marked work was accepted: %v", err)
 		}
+		_, _, err = f.Store.Accept(context.Background(), "other-entity", "other-key", func(view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			record := newRecord("new-id")
+			record.Entity, record.Key, record.Failure = "other-entity", "other-key", &fsm.Failure{Code: "fake"}
+			return record, nil
+		})
+		if !errors.Is(err, transition.ErrInvalidDecision) {
+			t.Fatalf("pre-failed work was accepted: %v", err)
+		}
 	})
 	t.Run("isolation", func(t *testing.T) {
 		f := newFixture(t)

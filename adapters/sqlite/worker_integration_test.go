@@ -89,15 +89,17 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("accept failed: created=%v error=%v", created, err)
 	}
-	fence, err := store.AcquireTransitionLease(ctx, execution.Entity, execution.ID, "coordinator", time.Now, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.DispatchHook(ctx, fence, time.Now, transition.HookDispatch{Kind: transition.HookEnter, DueAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
 	runner, err := transition.NewHookRunner[string, string, string, string](&registry, resolve, resolve)
 	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := transition.NewCoordinator[string, string](store, runner, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
 	worker, err := transition.NewHookWorker[string, string, string, string](store, runner, transition.WorkerConfig{
@@ -128,7 +130,20 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil || !progress.Completed || !progress.Result.Success || calls != 1 {
 		t.Fatalf("durable work success missing: progress=%+v calls=%d error=%v", progress, calls, err)
 	}
-	fence, err = store.AcquireTransitionLease(ctx, execution.Entity, execution.ID, "coordinator", time.Now, time.Hour)
+	coordinator, err = transition.NewCoordinator[string, string](store, runner, transition.CoordinatorConfig{
+		ID: "coordinator", LeaseTTL: time.Hour, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	marked, err := store.ReadActiveExecution(ctx, execution.ID)
+	if err != nil || marked.CommitOperationID == "" {
+		t.Fatalf("coordinator did not mark successful work: record=%+v error=%v", marked, err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, execution.Entity, execution.ID, "coordinator", time.Now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

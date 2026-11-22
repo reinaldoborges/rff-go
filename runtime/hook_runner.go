@@ -203,3 +203,21 @@ func (r *HookRunner[EntityID, StateID, Event, Input]) Run(
 	}
 	return prepared.run(ctx, call.Attempt)
 }
+
+// ClassifyHookFailure applies the machine version pinned by an execution.
+func (r *HookRunner[EntityID, StateID, Event, Input]) ClassifyHookFailure(
+	execution Execution[EntityID, StateID], failure error,
+) (HookResult, error) {
+	if failure == nil {
+		return HookResult{}, ErrInvalidHook
+	}
+	machine, err := r.machines.Lookup(execution.MachineID, execution.MachineVersion)
+	if err != nil {
+		return HookResult{}, fmt.Errorf("%w: machine: %w", ErrCompatibility, err)
+	}
+	safe, disposition, err := machine.ClassifyFailure(failure)
+	if err != nil {
+		return HookResult{}, fmt.Errorf("%w: classify hook failure: %w", ErrCompatibility, err)
+	}
+	return HookResult{Failure: safe, Disposition: disposition}, nil
+}

@@ -25,8 +25,9 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 		if err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work FROM rff_hook_work AS w
-			JOIN rff_active AS a ON a.execution_id = w.execution_id ORDER BY w.execution_id`)
+		rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.record FROM rff_hook_work AS w
+			JOIN rff_active AS a ON a.execution_id = w.execution_id
+			JOIN rff_executions AS e ON e.id = w.execution_id ORDER BY w.execution_id`)
 		if err != nil {
 			return fmt.Errorf("list hook work: %w", err)
 		}
@@ -34,8 +35,8 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 		var work hookWork
 		for rows.Next() {
 			var candidateID string
-			var data []byte
-			if err := rows.Scan(&candidateID, &data); err != nil {
+			var data, executionData []byte
+			if err := rows.Scan(&candidateID, &data, &executionData); err != nil {
 				return errors.Join(fmt.Errorf("read hook work: %w", err), rows.Close())
 			}
 			var candidate hookWork
@@ -44,6 +45,14 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 			}
 			if err := validateWork(candidateID, candidate); err != nil {
 				return errors.Join(err, rows.Close())
+			}
+			var execution diskRecord
+			if err := json.Unmarshal(executionData, &execution); err != nil || execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != candidateID {
+				return errors.Join(fmt.Errorf("%w: invalid hook execution", ErrUnsupportedSchema), err, rows.Close())
+			}
+			if (candidate.Progress.Dispatch.Kind == transition.HookRecover && execution.Status != transition.Aborting) ||
+				(candidate.Progress.Dispatch.Kind != transition.HookRecover && execution.Status != transition.Waiting && execution.Status != transition.Running) {
+				continue
 			}
 			if candidate.Progress.Completed || candidate.Started || now.Before(candidate.Progress.AvailableAt) ||
 				(candidate.Owner != "" && now.Before(candidate.ExpiresAt)) {

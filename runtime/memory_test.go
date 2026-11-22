@@ -54,7 +54,8 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 		return cloneExecution(record), false, nil
 	}
 	if next == nil || view.Active || next.Entity != entity || next.Key != key || next.ID == "" || s.ids[next.ID] ||
-		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting || next.CommitOperationID != "" {
+		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
+		next.CommitOperationID != "" || next.Failure != nil || next.FailureDisposition != "" {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
 	}
 	if s.fail {
@@ -72,6 +73,10 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.Failure != nil {
+		failure := *record.Failure
+		record.Failure = &failure
+	}
 	record.Input.Data = slices.Clone(record.Input.Data)
 	record.Event.Data = slices.Clone(record.Event.Data)
 	record.Policy.RetryDelays = slices.Clone(record.Policy.RetryDelays)

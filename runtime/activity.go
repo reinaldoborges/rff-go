@@ -37,14 +37,18 @@ type HookAttempt struct {
 	Unknown     bool
 }
 
-// HookProgress is persisted within an active transition execution.
+// HookProgress describes durable work and the current claim. Started,
+// LeaseExpiresAt, and BudgetUsed are derived from the durable activity record.
 type HookProgress struct {
-	ActivityID  string
-	Dispatch    HookDispatch
-	AvailableAt time.Time
-	Completed   bool
-	Result      HookResult
-	Attempts    []HookAttempt
+	ActivityID     string
+	Dispatch       HookDispatch
+	AvailableAt    time.Time
+	Completed      bool
+	Result         HookResult
+	Attempts       []HookAttempt
+	Started        bool      `json:"-"`
+	LeaseExpiresAt time.Time `json:"-"`
+	BudgetUsed     uint      `json:"-"`
 }
 
 // HookDispatcher is the coordinator side of durable hook activity dispatch.
@@ -59,4 +63,10 @@ type HookDispatcher[EntityID comparable] interface {
 // operation under the current transition fence, before the host commit.
 type WorkSuccessStore[EntityID comparable] interface {
 	MarkWorkSuccess(context.Context, TransitionLease[EntityID], func() time.Time) (string, error)
+}
+
+// InterventionStore persists an intervention after completed hook work.
+type InterventionStore[EntityID comparable] interface {
+	EnterHookIntervention(context.Context, TransitionLease[EntityID], func() time.Time) error
+	EnterDeadlineIntervention(context.Context, TransitionLease[EntityID], func() time.Time, HookResult) error
 }

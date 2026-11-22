@@ -30,6 +30,8 @@ persist hook outcomes.
 
 `HookWorker` claims hook activities through a host-injected activity store,
 renews their leases while working and reporting, and supports draining.
+`Coordinator.Reconcile` scans persisted active executions; the host must call it
+regularly, including without wakeups, and often enough to renew its leases.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -53,8 +55,9 @@ The adapter owns its `rff_` tables, scans existing records on open, and fails
 without writes for unsupported schemas. It migrates version 1 and 2 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
-It can reconcile an expired started attempt and redeliver the same hook identity.
-Coordinator progression, domain commits, and notifications are not yet
+The coordinator can reconcile expired attempts, retry hooks, enter intervention,
+and record a commit-pending work-success marker. Abort recovery, domain commits,
+operator controls, compatibility migration, and notifications are not yet
 implemented.
 
 ```sh

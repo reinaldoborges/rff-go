@@ -126,7 +126,8 @@ func TestExpiredStartedHookIsNotClaimedAgainWithoutReconciliation(t *testing.T) 
 		t.Fatal(err)
 	}
 	progress, err = store.ReadHookProgress(ctx, "execution")
-	if err != nil || len(progress.Attempts) != 3 || !progress.Attempts[0].Unknown || progress.ActivityID != claim.ActivityID {
+	if err != nil || len(progress.Attempts) != 3 || !progress.Attempts[0].Unknown || progress.ActivityID != claim.ActivityID ||
+		!progress.Started || progress.BudgetUsed != 3 || progress.LeaseExpiresAt.IsZero() {
 		t.Fatalf("reopened store lost recovery history: progress=%+v error=%v", progress, err)
 	}
 }

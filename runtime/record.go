@@ -105,6 +105,8 @@ type Execution[EntityID comparable, StateID comparable] struct {
 	Deadline             time.Time
 	Status               Status
 	CommitOperationID    string
+	Failure              *fsm.Failure
+	FailureDisposition   fsm.Disposition
 }
 
 // AcceptanceView is read atomically for one entity and idempotency key.
@@ -123,7 +125,7 @@ type AcceptanceDecisionFunc[EntityID comparable, StateID comparable] func(Accept
 // decision is valid only when Existing is present. A new execution is valid
 // only without an existing mapping or active reservation, with matching
 // entity and key, a unique nonempty execution ID, the current schema version,
-// Waiting status, and no commit operation. Invalid decisions return
+// Waiting status, no commit operation, and no failure. Invalid decisions return
 // ErrInvalidDecision. A callback error must leave no writes. A storage error
 // after commit may have an unknown outcome; a retry must reconcile against the
 // original key. Records and byte slices must not alias stored data.
