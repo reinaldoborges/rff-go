@@ -16,6 +16,23 @@ func TestNotificationFixtureContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		t.Cleanup(func() {
+			if err := fixture.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return fixture
+	})
+}
+
+func TestDenialIsolationFixtureContract(t *testing.T) {
+	fixturecontract.RunDenialIsolation(t, func(t *testing.T, clock func() time.Time) fixturecontract.DenialFixture {
+		t.Helper()
+		fixture, err := taskmanager.Open(filepath.Join(t.TempDir(), "contract.db"), clock)
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Cleanup(func() {
 			if err := fixture.Close(); err != nil {
 				t.Error(err)

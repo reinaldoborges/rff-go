@@ -15,6 +15,69 @@ type NotificationFixture interface {
 	SetNotificationSink(func(context.Context, taskmanager.InvitationNotification) error) error
 }
 
+// DenialFixture exposes domain behavior, notification delivery and execution inspection.
+type DenialFixture interface {
+	NotificationFixture
+	OperatorFixture
+}
+
+// RunDenialIsolation checks rejected requests create no execution or notification.
+func RunDenialIsolation(t *testing.T, newFixture func(*testing.T, func() time.Time) DenialFixture) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fixture := newFixture(t, func() time.Time { return now })
+	if err := fixture.SeedUsers(ctx, "owner", "invitee", "outsider"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.SeedOperator(ctx, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	var notifications []taskmanager.InvitationNotification
+	if err := fixture.SetNotificationSink(func(_ context.Context, notification taskmanager.InvitationNotification) error {
+		notifications = append(notifications, notification)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.CreateTask(ctx, "owner", "group", "task", "Task", "create"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "invitee", "invitation", "invite", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fixture.ListExecutions(ctx, "operator")
+	if err != nil || len(notifications) != 1 {
+		t.Fatalf("baseline execution or notification missing: executions=%v notifications=%+v error=%v", before, notifications, err)
+	}
+	if id, err := fixture.Invite(ctx, "outsider", "group", "outsider", "denied", "denied", now.Add(time.Hour)); !errors.Is(err, taskmanager.ErrDenied) || id != "" {
+		t.Fatalf("unauthorized invitation was accepted: id=%q error=%v", id, err)
+	}
+	if id, err := fixture.TransitionTask(ctx, "owner", "task", "invalid", taskmanager.CompleteTask); !errors.Is(err, taskmanager.ErrConflict) || id != "" {
+		t.Fatalf("invalid task transition was accepted: id=%q error=%v", id, err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fixture.ListExecutions(ctx, "operator")
+	if err != nil || len(after) != len(before) || len(notifications) != 1 {
+		t.Fatalf("rejected requests created work or notification: before=%v after=%v notifications=%+v error=%v", before, after, notifications, err)
+	}
+	task, err := fixture.Task(ctx, "owner", "task")
+	if err != nil || task.Status != taskmanager.TaskOpen {
+		t.Fatalf("invalid transition changed the task: %+v, %v", task, err)
+	}
+	if _, err := fixture.Membership(ctx, "owner", "denied"); !errors.Is(err, taskmanager.ErrNotFound) {
+		t.Fatalf("denied invitation created a membership: %v", err)
+	}
+}
+
 // RunNotification checks independent delivery retry and membership expiry.
 func RunNotification(t *testing.T, newFixture func(*testing.T, func() time.Time) NotificationFixture) {
 	t.Helper()
