@@ -170,4 +170,32 @@ func TestSchemaMigrationPreservesActiveExecutionAndAttemptHistory(t *testing.T) 
 	if err != nil || !progress.Completed || len(progress.Attempts) != 1 || progress.Attempts[0].Result == nil || !progress.Attempts[0].Result.Success {
 		t.Fatalf("migration lost attempt history: %+v, %v", progress, err)
 	}
+	config := transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Hour, Clock: clock}
+	coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	host := &lostCommitResponseHost{}
+	commits, err := transition.NewCommitCoordinator[string, string](store, host, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commits.Reconcile(ctx); err == nil {
+		t.Fatal("lost host response was not reported")
+	}
+	if err := commits.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectExecution(ctx, "execution")
+	if err != nil || inspection.Status != transition.Complete || host.writes != 1 || host.current != "open" {
+		t.Fatalf("migrated execution did not recover its commit: %+v writes=%d state=%q error=%v",
+			inspection, host.writes, host.current, err)
+	}
+	progress, err = store.ReadHookProgress(ctx, "execution")
+	if err != nil || len(progress.Attempts) != 1 {
+		t.Fatalf("recovery reran successful work: %+v, %v", progress, err)
+	}
 }
