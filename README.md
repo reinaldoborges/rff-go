@@ -22,7 +22,9 @@ See [AGENTS.md](AGENTS.md) for the verification commands.
 The `runtime` package defines an acceptor and a host-injected atomic acceptance
 store. Applications supply versioned codecs, an execution-ID generator, and a
 clock. Codecs must preserve semantic equality and report when it cannot be
-verified.
+verified. `CodecRegistry` provides concurrency-safe exact-version lookup and
+rejects duplicate codec registrations; applications may also supply their own
+resolver.
 
 The hook runner rehydrates pinned machine and codec versions and invokes state
 hooks without rerunning selection. It does not schedule work, fence attempts, or
