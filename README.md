@@ -199,7 +199,7 @@ original Membership identity after unassignment or removal.
 `internal/fixturecontract` provides reusable typed-API checks for invitation,
 membership history, expiry, closure, access, task progression, removal,
 ownership transfer, accepted-work invariants, and operator controls against a
-fixture implementation.
+fixture implementation, as well as notification failure and expiry behavior.
 
 Run the CLI and fixture checks, including a real subprocess recovery test, with:
 
