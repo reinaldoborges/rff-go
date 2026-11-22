@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 2
+	adapterSchemaVersion = 3
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
 	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
+	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -31,27 +32,29 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
 		"rff_active":            &activeExists,
 		"rff_transition_leases": &leasesExist,
+		"rff_hook_work":         &hookWorkExists,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (2)`,
+			`INSERT INTO rff_schema_version (version) VALUES (3)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
+			hookWorkDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -88,7 +91,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			}
 			count++
 			schemaVersion = version
-			if version != 1 && version != adapterSchemaVersion {
+			if version < 1 || version > adapterSchemaVersion {
 				return errors.Join(fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, version), rows.Close())
 			}
 		}
@@ -108,9 +111,6 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			if _, err := tx.ExecContext(ctx, leasesDDL); err != nil {
 				return fmt.Errorf("migrate transition leases: %w", err)
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 2`); err != nil {
-				return fmt.Errorf("update adapter version: %w", err)
-			}
 		} else {
 			var definition string
 			if !leasesExist {
@@ -123,6 +123,31 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 				return fmt.Errorf("%w: incompatible transition leases table", ErrUnsupportedSchema)
 			}
 			if err := validateLeases(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if schemaVersion < 3 {
+			if hookWorkExists {
+				return fmt.Errorf("%w: unexpected hook work table", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, hookWorkDDL); err != nil {
+				return fmt.Errorf("migrate hook work: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 3`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		} else {
+			var definition string
+			if !hookWorkExists {
+				return fmt.Errorf("%w: hook work table missing", ErrUnsupportedSchema)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_hook_work'`).Scan(&definition); err != nil {
+				return fmt.Errorf("%w: inspect hook work: %w", ErrUnsupportedSchema, err)
+			}
+			if definition != hookWorkDDL {
+				return fmt.Errorf("%w: incompatible hook work table", ErrUnsupportedSchema)
+			}
+			if err := validateHookWork(ctx, tx); err != nil {
 				return err
 			}
 		}

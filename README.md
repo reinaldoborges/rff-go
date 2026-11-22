@@ -29,8 +29,7 @@ hooks without rerunning selection. It does not schedule work, fence attempts, or
 persist hook outcomes.
 
 `HookWorker` claims hook activities through a host-injected activity store,
-renews their leases while working and reporting, and supports draining. The
-SQLite adapter does not implement that activity store yet.
+renews their leases while working and reporting, and supports draining.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -51,10 +50,12 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 acceptance stores
-to version 2 transactionally, preserving accepted records and reservations.
-It currently implements acceptance, active-execution discovery, and transition
-leases only, not worker execution, domain commits, or notifications.
+without writes for unsupported schemas. It migrates version 1 and 2 stores
+transactionally, preserving accepted records, reservations, and leases.
+It persists hook dispatch, worker claims, started attempts, and safe outcomes.
+It can reconcile an expired started attempt and redeliver the same hook identity.
+Coordinator progression, domain commits, and notifications are not yet
+implemented.
 
 ```sh
 go test ./adapters/sqlite

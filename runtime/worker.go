@@ -28,6 +28,12 @@ type HookLease struct {
 	ExpiresAt   time.Time
 }
 
+// StartedHook is the durable start time and identity of one hook attempt.
+type StartedHook struct {
+	Attempt   fsm.AttemptMetadata
+	StartedAt time.Time
+}
+
 // HookActivityStore is the durable worker side of the activity seam.
 // Implementations atomically fence claims, starts, renewals, and reports.
 // InspectHook returns the immutable snapshot bound to the claim; migration
@@ -38,7 +44,7 @@ type HookLease struct {
 type HookActivityStore[EntityID comparable, StateID comparable] interface {
 	ClaimHook(context.Context, string, func() time.Time, time.Duration) (HookLease, error)
 	InspectHook(context.Context, HookLease, func() time.Time) (Execution[EntityID, StateID], HookCall, error)
-	StartHook(context.Context, HookLease, func() time.Time) (fsm.AttemptMetadata, error)
+	StartHook(context.Context, HookLease, func() time.Time) (StartedHook, error)
 	RenewHook(context.Context, HookLease, func() time.Time, time.Duration) (HookLease, error)
 	ReportHook(context.Context, HookLease, HookResult, func() time.Time) error
 }
@@ -181,10 +187,11 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	if !w.config.Clock.Now().Before(execution.Deadline) {
 		return ErrTransitionDeadline
 	}
-	attempt, err := w.store.StartHook(claimCtx, lease, w.config.Clock.Now)
+	started, err := w.store.StartHook(claimCtx, lease, w.config.Clock.Now)
 	if err != nil {
 		return err
 	}
+	attempt := started.Attempt
 	if attempt.ExecutionID != lease.ExecutionID || attempt.ActivityID != lease.ActivityID || attempt.LeaseGeneration != lease.Generation {
 		return fmt.Errorf("%w: started attempt does not match claim", ErrInvalidHook)
 	}
@@ -199,8 +206,15 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	w.mu.Unlock()
 	defer workCancel()
 
-	timeout := execution.Policy.AttemptTimeout
-	remaining := execution.Deadline.Sub(w.config.Clock.Now())
+	now := w.config.Clock.Now()
+	if started.StartedAt.IsZero() || now.IsZero() || started.StartedAt.After(now) {
+		return fmt.Errorf("%w: invalid attempt start time", ErrInvalidHook)
+	}
+	if !now.Before(lease.ExpiresAt) {
+		return ErrStaleActivityLease
+	}
+	timeout := execution.Policy.AttemptTimeout - now.Sub(started.StartedAt)
+	remaining := execution.Deadline.Sub(now)
 	if remaining < timeout {
 		timeout = remaining
 	}

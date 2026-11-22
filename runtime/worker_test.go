@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reinaldoborges/rff-go/fsm"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -29,9 +28,9 @@ func (s *oneActivityStore) InspectHook(_ context.Context, _ transition.HookLease
 	return s.record, s.call, nil
 }
 
-func (s *oneActivityStore) StartHook(_ context.Context, _ transition.HookLease, _ func() time.Time) (fsm.AttemptMetadata, error) {
+func (s *oneActivityStore) StartHook(_ context.Context, _ transition.HookLease, clock func() time.Time) (transition.StartedHook, error) {
 	s.started = true
-	return s.call.Attempt, nil
+	return transition.StartedHook{Attempt: s.call.Attempt, StartedAt: clock()}, nil
 }
 
 func (s *oneActivityStore) RenewHook(_ context.Context, lease transition.HookLease, clock func() time.Time, ttl time.Duration) (transition.HookLease, error) {

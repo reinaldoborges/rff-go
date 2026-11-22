@@ -24,6 +24,7 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"dangling reservation", `INSERT INTO rff_active (entity, execution_id) VALUES (X'65', 'missing')`},
 		{"missing reservation", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":1,"ID":"id","Entity":"ZQ==","Key":"key","Status":"Waiting"}')`},
 		{"unreadable lease", `INSERT INTO rff_transition_leases (entity, execution_id, owner, generation, expires_at) VALUES (X'65', 'missing', 'owner', 0, 'not-a-time')`},
+		{"unreadable hook work", `INSERT INTO rff_hook_work (execution_id, work) VALUES ('missing', X'ff')`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
