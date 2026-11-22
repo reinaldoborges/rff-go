@@ -11,12 +11,16 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/reinaldoborges/rff-go/adapters/sqlite"
+	"github.com/reinaldoborges/rff-go/fsm"
+	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
 var (
 	ErrDenied         = errors.New("task-manager access denied")
 	ErrConflict       = errors.New("task-manager request conflicts with current state")
 	ErrInvalidRequest = errors.New("invalid task-manager request")
+	ErrNotFound       = errors.New("task-manager record not found")
 )
 
 type Group struct {
@@ -27,8 +31,11 @@ type Group struct {
 
 // Fixture is an application-owned SQLite domain store for local conformance.
 type Fixture struct {
-	db    *sql.DB
-	clock func() time.Time
+	db       *sql.DB
+	clock    func() time.Time
+	store    *sqlite.Store[string, string]
+	machines fsm.Registry[string, string, string, membershipInput]
+	runner   *transition.HookRunner[string, string, string, membershipInput]
 }
 
 func Open(path string, clock func() time.Time) (*Fixture, error) {
@@ -68,10 +75,17 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 	}); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
+	fixture.store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	if err := fixture.initializeMembershipRuntime(); err != nil {
+		return nil, errors.Join(err, fixture.store.Close(), db.Close())
+	}
 	return fixture, nil
 }
 
-func (f *Fixture) Close() error { return f.db.Close() }
+func (f *Fixture) Close() error { return errors.Join(f.store.Close(), f.db.Close()) }
 
 func (f *Fixture) transaction(ctx context.Context, run func(*sql.Tx) error) (err error) {
 	tx, err := f.db.BeginTx(ctx, nil)

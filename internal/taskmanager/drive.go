@@ -1,0 +1,102 @@
+package taskmanager
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/reinaldoborges/rff-go/fsm"
+	transition "github.com/reinaldoborges/rff-go/runtime"
+)
+
+type fixtureClock struct{ now func() time.Time }
+
+func (c fixtureClock) Now() time.Time { return c.now() }
+func (fixtureClock) NewTicker(d time.Duration) transition.WorkerTicker {
+	return (transition.SystemWorkerClock{}).NewTicker(d)
+}
+func (fixtureClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}
+
+type membershipCommitHost struct{ fixture *Fixture }
+
+func (h membershipCommitHost) Commit(ctx context.Context, lease transition.TransitionLease[string],
+	_ transition.Execution[string, string],
+) (transition.CommitReceipt, error) {
+	return h.fixture.store.CommitAtomic(ctx, lease, h.fixture.clock, func(ctx context.Context, tx *sql.Tx,
+		execution transition.Execution[string, string],
+	) (transition.CommitReceipt, error) {
+		receipt := transition.CommitReceipt{ExecutionID: execution.ID, OperationID: execution.CommitOperationID}
+		input, err := (jsonCodec[membershipInput]{}).Decode(ctx, execution.Input.Data)
+		if err != nil {
+			return transition.CommitReceipt{}, fmt.Errorf("decode membership commit input: %w", err)
+		}
+		if execution.Operation != transition.Initialize || execution.Entity != input.MembershipID || execution.Target != string(Invited) {
+			return transition.CommitReceipt{}, transition.ErrInvalidDecision
+		}
+		var valid bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tm_groups WHERE id = ? AND closed = 0)
+			AND NOT EXISTS(SELECT 1 FROM tm_memberships WHERE id = ? OR
+				(group_id = ? AND user_id = ? AND status IN ('Invited', 'Active')))`,
+			input.GroupID, input.MembershipID, input.GroupID, input.UserID).Scan(&valid); err != nil {
+			return transition.CommitReceipt{}, fmt.Errorf("check invitation invariants: %w", err)
+		}
+		if !valid {
+			receipt.Outcome = transition.CommitDenied
+			receipt.Failure = &fsm.Failure{Code: "membership-invariant"}
+			return receipt, nil
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tm_memberships (id, group_id, user_id, status, deadline, reason)
+			VALUES (?, ?, ?, ?, ?, '')`, input.MembershipID, input.GroupID, input.UserID, string(Invited),
+			input.Deadline.UTC().Format(time.RFC3339Nano)); err != nil {
+			return transition.CommitReceipt{}, fmt.Errorf("commit invitation: %w", err)
+		}
+		receipt.Outcome = transition.CommitSucceeded
+		return receipt, nil
+	})
+}
+
+// Drive reconciles pending inputs and one round of transition work.
+func (f *Fixture) Drive(ctx context.Context) error {
+	ingress, err := f.invitationIngress()
+	if err != nil {
+		return err
+	}
+	if err := ingress.Reconcile(ctx); err != nil {
+		return err
+	}
+	config := transition.CoordinatorConfig{ID: "taskmanager", Clock: f.clock, LeaseTTL: time.Minute}
+	coordinator, err := transition.NewCoordinator[string, string](f.store, f.runner, config)
+	if err != nil {
+		return err
+	}
+	worker, err := transition.NewHookWorker[string, string, string, membershipInput](f.store, f.runner, transition.WorkerConfig{
+		ID: "taskmanager-hook", Capacity: 1, LeaseTTL: time.Minute, RenewalInterval: 10 * time.Second, Clock: fixtureClock{now: f.clock},
+	})
+	if err != nil {
+		return err
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		return err
+	}
+	for {
+		err := worker.RunOne(ctx)
+		if errors.Is(err, transition.ErrNoHookActivity) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if err := coordinator.Reconcile(ctx); err != nil {
+		return err
+	}
+	commits, err := transition.NewCommitCoordinator[string, string](f.store, membershipCommitHost{fixture: f}, config)
+	if err != nil {
+		return err
+	}
+	return commits.Reconcile(ctx)
+}
