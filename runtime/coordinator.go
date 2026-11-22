@@ -33,12 +33,14 @@ type CoordinatorConfig struct {
 	ID       string
 	LeaseTTL time.Duration
 	Clock    func() time.Time
+	Workers  *WorkerMonitor
 }
 
 // CoordinatorStatus reports the last scan independently of worker capacity.
 type CoordinatorStatus struct {
 	Healthy  bool
 	LastScan time.Time
+	Capacity ExecutionCapacity
 }
 
 // Coordinator reconciles persisted executions; callers schedule regular scans.
@@ -64,7 +66,12 @@ func NewCoordinator[EntityID comparable, StateID comparable](
 func (c *Coordinator[EntityID, StateID]) Status() CoordinatorStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.status
+	status := c.status
+	status.Capacity.Degraded = true
+	if c.config.Workers != nil {
+		status.Capacity = c.config.Workers.Status()
+	}
+	return status
 }
 
 // Reconcile scans all active executions independently. Callers must invoke it

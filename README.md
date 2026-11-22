@@ -33,6 +33,10 @@ renews their leases while working and reporting, and supports draining.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
 `Coordinator.Status` reports the last scan separately from worker capacity.
+For capacity reporting, configure a `WorkerMonitor` with an explicit stale
+threshold and have the host periodically report each worker's `Status()`.
+Unready, draining, and stale workers contribute no available slots; no slots
+is degraded execution capacity, not failed persistence or acceptance.
 `CommitCoordinator` separately scans commit-pending work against a host-owned
 commit boundary. The host must enforce transition fences and atomically persist
 its final receipt with domain state or definitive rejection; errors leave the
