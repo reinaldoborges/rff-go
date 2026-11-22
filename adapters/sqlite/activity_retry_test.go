@@ -99,6 +99,9 @@ func TestFailedRetryHookIsRedeliveredDirectlyWithPinnedDelay(t *testing.T) {
 	if err := store.ReportHook(ctx, reclaimed, transition.HookResult{Success: true}, fixedClock(redeliveryAt)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.MarkWorkSuccess(ctx, fence, fixedClock(redeliveryAt)); !errors.Is(err, transition.ErrInvalidHook) {
+		t.Fatalf("successful Retry was mistaken for successful transition work: %v", err)
+	}
 	if _, err := store.DispatchHook(ctx, fence, fixedClock(redeliveryAt), transition.HookDispatch{
 		Kind: transition.HookEnter, RetryCycle: 2, DueAt: redeliveryAt,
 	}); err != nil {

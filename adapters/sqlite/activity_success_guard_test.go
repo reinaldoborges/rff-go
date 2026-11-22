@@ -38,9 +38,15 @@ func TestDurableWorkSuccessCannotBeDispatchedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.MarkWorkSuccess(ctx, fence, fixedClock(now)); !errors.Is(err, transition.ErrNoHookActivity) {
+		t.Fatalf("marked success without work: %v", err)
+	}
 	first, err := store.DispatchHook(ctx, fence, fixedClock(now), transition.HookDispatch{Kind: transition.HookEnter, DueAt: now})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := store.MarkWorkSuccess(ctx, fence, fixedClock(now)); !errors.Is(err, transition.ErrInvalidHook) {
+		t.Fatalf("marked success before hook completion: %v", err)
 	}
 	claim, err := store.ClaimHook(ctx, "worker", fixedClock(now), time.Minute)
 	if err != nil {
@@ -51,6 +57,11 @@ func TestDurableWorkSuccessCannotBeDispatchedAgain(t *testing.T) {
 	}
 	if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, fixedClock(now)); err != nil {
 		t.Fatal(err)
+	}
+	stale := fence
+	stale.Generation++
+	if _, err := store.MarkWorkSuccess(ctx, stale, fixedClock(now)); !errors.Is(err, transition.ErrStaleLease) {
+		t.Fatalf("stale coordinator marked success: %v", err)
 	}
 	if _, err := store.DispatchHook(ctx, fence, fixedClock(now), transition.HookDispatch{Kind: transition.HookEnter, RetryCycle: 1, DueAt: now}); !errors.Is(err, transition.ErrInvalidHook) {
 		t.Fatalf("durably successful work was dispatched again: %v", err)

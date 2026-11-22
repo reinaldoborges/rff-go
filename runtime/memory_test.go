@@ -54,7 +54,7 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 		return cloneExecution(record), false, nil
 	}
 	if next == nil || view.Active || next.Entity != entity || next.Key != key || next.ID == "" || s.ids[next.ID] ||
-		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting {
+		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting || next.CommitOperationID != "" {
 		return transition.Execution[string, state]{}, false, transition.ErrInvalidDecision
 	}
 	if s.fail {

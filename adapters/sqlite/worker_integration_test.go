@@ -128,6 +128,29 @@ func TestSQLiteWorkerRunsAcceptedExecution(t *testing.T) {
 	if err != nil || !progress.Completed || !progress.Result.Success || calls != 1 {
 		t.Fatalf("durable work success missing: progress=%+v calls=%d error=%v", progress, calls, err)
 	}
+	fence, err = store.AcquireTransitionLease(ctx, execution.Entity, execution.ID, "coordinator", time.Now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID, err := store.MarkWorkSuccess(ctx, fence, time.Now)
+	if err != nil || operationID == "" || operationID == progress.ActivityID {
+		t.Fatalf("commit operation was not recorded: id=%q error=%v", operationID, err)
+	}
+	replayedOperation, err := store.MarkWorkSuccess(ctx, fence, time.Now)
+	if err != nil || replayedOperation != operationID {
+		t.Fatalf("commit operation replay changed identity: id=%q error=%v", replayedOperation, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ReadActiveExecution(ctx, execution.ID)
+	if err != nil || pending.CommitOperationID != operationID {
+		t.Fatalf("commit-pending marker lost on restart: record=%+v error=%v", pending, err)
+	}
 	acceptor, err = transition.NewAcceptor[string, string, string, string](
 		store, &registry, resolve, resolve, func() (string, error) { return "other", nil }, time.Now,
 	)

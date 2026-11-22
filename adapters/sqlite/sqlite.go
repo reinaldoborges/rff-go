@@ -119,7 +119,7 @@ func (s *Store[EntityID, StateID]) Accept(
 		return *existing, false, nil
 	}
 	if next == nil || active || next.Entity != entity || next.Key != key || next.ID == "" ||
-		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting {
+		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting || next.CommitOperationID != "" {
 		return result, false, transition.ErrInvalidDecision
 	}
 	var idExists bool

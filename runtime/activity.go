@@ -54,3 +54,9 @@ type HookDispatcher[EntityID comparable] interface {
 	ResolveUnknownHook(context.Context, TransitionLease[EntityID], func() time.Time, string, uint64, HookResult) error
 	RedeliverHook(context.Context, TransitionLease[EntityID], func() time.Time, string, uint64, time.Time) error
 }
+
+// WorkSuccessStore records successful transition work and its stable commit
+// operation under the current transition fence, before the host commit.
+type WorkSuccessStore[EntityID comparable] interface {
+	MarkWorkSuccess(context.Context, TransitionLease[EntityID], func() time.Time) (string, error)
+}

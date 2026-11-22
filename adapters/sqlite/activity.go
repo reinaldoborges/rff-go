@@ -598,3 +598,58 @@ func validHookResult(result transition.HookResult) bool {
 	}
 	return result.Disposition == fsm.DispositionRetry || result.Disposition == fsm.DispositionIntervention
 }
+
+// MarkWorkSuccess persists the commit-pending marker after successful work.
+func (s *Store[EntityID, StateID]) MarkWorkSuccess(ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time) (string, error) {
+	if clock == nil {
+		return "", transition.ErrInvalidLease
+	}
+	var operationID string
+	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		now := clock()
+		if now.IsZero() {
+			return transition.ErrInvalidLease
+		}
+		if err := s.validTransitionFence(ctx, tx, lease, now); err != nil {
+			return err
+		}
+		var data []byte
+		if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, lease.ExecutionID).Scan(&data); err != nil {
+			return fmt.Errorf("read successful execution: %w", err)
+		}
+		var execution diskRecord
+		if err := json.Unmarshal(data, &execution); err != nil {
+			return fmt.Errorf("%w: decode successful execution: %w", ErrUnsupportedSchema, err)
+		}
+		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+			return fmt.Errorf("%w: invalid successful execution", ErrUnsupportedSchema)
+		}
+		if execution.CommitOperationID != "" {
+			operationID = execution.CommitOperationID
+			return nil
+		}
+		work, err := loadHook(ctx, tx, lease.ExecutionID)
+		if err != nil {
+			return err
+		}
+		if execution.Status != transition.Running || !work.Progress.Completed || !work.Progress.Result.Success ||
+			(work.Progress.Dispatch.Kind != transition.HookEnter && work.Progress.Dispatch.Kind != transition.HookTransition) {
+			return transition.ErrInvalidHook
+		}
+		sum := sha256.Sum256([]byte("rff-commit:" + lease.ExecutionID))
+		operationID = "rff-commit:" + hex.EncodeToString(sum[:])
+		execution.CommitOperationID = operationID
+		data, err = json.Marshal(execution)
+		if err != nil {
+			return fmt.Errorf("encode successful execution: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE rff_executions SET record = ? WHERE id = ?`, data, lease.ExecutionID); err != nil {
+			return fmt.Errorf("record successful work: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return operationID, nil
+}

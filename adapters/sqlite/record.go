@@ -29,6 +29,7 @@ type diskRecord struct {
 	AcceptedAt           time.Time
 	Deadline             time.Time
 	Status               transition.Status
+	CommitOperationID    string
 }
 
 func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[EntityID, StateID], entity []byte) ([]byte, error) {
@@ -49,7 +50,7 @@ func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[Enti
 		Previous: previous, HasPrevious: record.HasPrevious, Target: target,
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
-		Deadline: record.Deadline, Status: record.Status,
+		Deadline: record.Deadline, Status: record.Status, CommitOperationID: record.CommitOperationID,
 	})
 }
 
@@ -82,7 +83,7 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 		Previous: previous, HasPrevious: record.HasPrevious, Target: target,
 		Event: record.Event, Input: record.Input, NotificationOverride: record.NotificationOverride,
 		Notify: record.Notify, Policy: record.Policy, AcceptedAt: record.AcceptedAt,
-		Deadline: record.Deadline, Status: record.Status,
+		Deadline: record.Deadline, Status: record.Status, CommitOperationID: record.CommitOperationID,
 	}, nil
 }
 
