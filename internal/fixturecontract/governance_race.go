@@ -3,6 +3,7 @@ package fixturecontract
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,4 +66,66 @@ func RunGovernanceRace(t *testing.T, newFixture func(*testing.T, func() time.Tim
 			}
 		})
 	}
+	t.Run("transfer versus removal commit", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+		fixture := newFixture(t, func() time.Time { return now })
+		activeMember(t, fixture, now)
+		id, err := fixture.RemoveMember(ctx, "owner", "member-membership", "remove")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		transferred, driven := make(chan error, 1), make(chan error, 1)
+		var ready sync.WaitGroup
+		ready.Add(2)
+		go func() {
+			ready.Done()
+			<-start
+			_, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+			transferred <- err
+		}()
+		go func() {
+			ready.Done()
+			<-start
+			driven <- fixture.Drive(ctx)
+		}()
+		ready.Wait()
+		close(start)
+		transferErr, driveErr := <-transferred, <-driven
+		if driveErr != nil {
+			t.Fatalf("driving removal failed: %v", driveErr)
+		}
+		for range 3 {
+			if err := fixture.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		group, err := fixture.Group(ctx, "owner", "group")
+		if err != nil {
+			t.Fatal(err)
+		}
+		membership, err := fixture.InspectMembership(ctx, "operator", "member-membership")
+		if err != nil {
+			t.Fatal(err)
+		}
+		execution, err := fixture.InspectExecution(ctx, "operator", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case transferErr == nil:
+			if group.Owner != "member" || membership.Status != taskmanager.Active ||
+				execution.Status != transition.Aborted || execution.CommitReceipt == nil ||
+				execution.CommitReceipt.Outcome != transition.CommitDenied {
+				t.Fatalf("transfer winner allowed removal of owner: group=%+v membership=%+v execution=%+v", group, membership, execution)
+			}
+		case errors.Is(transferErr, taskmanager.ErrConflict):
+			if group.Owner != "owner" || membership.Status != taskmanager.Removed || execution.Status != transition.Complete {
+				t.Fatalf("removal winner allowed transfer to removed member: group=%+v membership=%+v execution=%+v", group, membership, execution)
+			}
+		default:
+			t.Fatalf("unexpected transfer outcome: %v", transferErr)
+		}
+	})
 }
