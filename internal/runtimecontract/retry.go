@@ -285,7 +285,7 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			return &transition.Execution[string, string]{
 				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
-				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				Operation: transition.Transition, Previous: "open", HasPrevious: true, Target: "done", Status: transition.Waiting,
 				AcceptedAt: now, Deadline: now.Add(time.Hour),
 				Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
 			}, nil
@@ -369,6 +369,16 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		record, err = store.InspectExecution(ctx, "execution")
 		if err != nil || record.Status != transition.Aborted || record.CommitReceipt != nil {
 			t.Fatalf("successful recovery did not settle without committing: %+v, %v", record, err)
+		}
+		domain := &host{current: "open"}
+		commits, err := transition.NewCommitCoordinator[string, string](store, domain, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := commits.Reconcile(ctx); err != nil || domain.writes != 0 || domain.current != "open" {
+			t.Fatalf("abort changed the current state: %+v, %v", domain, err)
 		}
 	})
 }
