@@ -2,6 +2,7 @@ package taskmanager_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -104,5 +105,69 @@ func TestOwnershipTransferIsAtomicAuditedAndReplayable(t *testing.T) {
 	replayed, err = fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
 	if err != nil || replayed != receipt {
 		t.Fatalf("original actor could not replay after closure: receipt=%+v error=%v", replayed, err)
+	}
+}
+
+func TestOwnershipTransferAuditFailureRollsBackOwnershipAndReplay(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "ownership-rollback.db")
+	fixture, err := taskmanager.Open(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fixture.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.SeedUsers(ctx, "owner", "member"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CreateGroup(ctx, "owner", "group", "owner-membership"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Invite(ctx, "owner", "group", "member", "membership", "invite", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Decide(ctx, "member", "membership", "accept", taskmanager.AcceptInvitation); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_transfer_audit BEFORE INSERT ON tm_ownership_transfers
+		BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer"); err == nil {
+		t.Fatal("transfer succeeded after an audit persistence failure")
+	}
+	group, err := fixture.Group(ctx, "owner", "group")
+	if err != nil || group.Owner != "owner" {
+		t.Fatalf("failed audit left ownership changed: %+v, %v", group, err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TRIGGER fail_transfer_audit`); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+	if err != nil || receipt.FormerOwner != "owner" || receipt.NewOwner != "member" {
+		t.Fatalf("rolled-back request could not be retried: %+v, %v", receipt, err)
+	}
+	replayed, err := fixture.TransferOwnership(ctx, "owner", "group", "member", "transfer")
+	if err != nil || replayed != receipt {
+		t.Fatalf("committed transfer did not replay its audit: %+v, %v", replayed, err)
 	}
 }
