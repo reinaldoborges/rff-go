@@ -136,4 +136,98 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 			t.Fatalf("new control cycle lost attempt history: %+v, %v", started, err)
 		}
 	})
+	t.Run("abort recovery exhaustion and retry", func(t *testing.T) {
+		ctx := context.Background()
+		store := newStore(t)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		clock := func() time.Time { return now }
+		_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+			return &transition.Execution[string, string]{
+				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+				Operation: transition.Initialize, Target: "open", Status: transition.Waiting,
+				AcceptedAt: now, Deadline: now.Add(time.Hour),
+				Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := transition.NewCoordinator[string, string](store, unknownClassifier{}, transition.CoordinatorConfig{
+			ID: "coordinator", LeaseTTL: time.Hour, Clock: clock,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.StartHook(ctx, claim, clock); err != nil {
+			t.Fatal(err)
+		}
+		failure := fsm.Failure{Code: "work-failed"}
+		if err := store.ReportHook(ctx, claim, transition.HookResult{Failure: failure, Disposition: fsm.DispositionIntervention}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := func(transition.Execution[string, string], transition.HookCall) error { return nil }
+		if _, err := store.ApplyCheckedHookControl(ctx, lease, clock,
+			transition.HookControl{ID: "abort", Action: transition.AbortIntervention}, check); err != nil {
+			t.Fatal(err)
+		}
+		recovery, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, call, err := store.InspectHook(ctx, recovery, clock)
+		if err != nil || call.Kind != transition.HookRecover || call.Failure == nil || *call.Failure != failure {
+			t.Fatalf("abort did not invoke recovery with the failure: %+v, %v", call, err)
+		}
+		if _, err := store.StartHook(ctx, recovery, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReportHook(ctx, recovery, transition.HookResult{
+			Failure: fsm.Failure{Code: "recover-failed"}, Disposition: fsm.DispositionRetry,
+		}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.InspectExecution(ctx, "execution")
+		if err != nil || record.Status != transition.NeedsIntervention {
+			t.Fatalf("failed recovery did not require intervention: %+v, %v", record, err)
+		}
+		if _, err := store.ApplyCheckedHookControl(ctx, lease, clock,
+			transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention}, check); err != nil {
+			t.Fatal(err)
+		}
+		resumed, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil || resumed.ActivityID != recovery.ActivityID {
+			t.Fatalf("recovery retry changed identity: %+v, %v", resumed, err)
+		}
+		attempt, err := store.StartHook(ctx, resumed, clock)
+		if err != nil || attempt.Attempt.Number != 3 {
+			t.Fatalf("recovery retry lost attempt history: %+v, %v", attempt, err)
+		}
+		if err := store.ReportHook(ctx, resumed, transition.HookResult{Success: true}, clock); err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		record, err = store.InspectExecution(ctx, "execution")
+		if err != nil || record.Status != transition.Aborted || record.CommitReceipt != nil {
+			t.Fatalf("successful recovery did not settle without committing: %+v, %v", record, err)
+		}
+	})
 }
