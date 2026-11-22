@@ -195,13 +195,14 @@ Additional commands are `group ACTOR GROUP`, `membership ACTOR MEMBERSHIP`,
 empty membership argument to unassign a task. Assignment history retains the
 original Membership identity after unassignment or removal.
 
-`internal/fixturecontract` provides reusable typed-API checks for basic
-invitation, access, and task progression against a fixture implementation.
+`internal/fixturecontract` provides reusable typed-API checks for invitation,
+membership history, expiry, closure, access, and task progression against a
+fixture implementation.
 
 Run the CLI and fixture checks, including a real subprocess recovery test, with:
 
 ```sh
-go test ./internal/taskmanager -run TestDomainFixtureContract
+go test ./internal/taskmanager -run 'Test(Domain|Membership)FixtureContract'
 go test ./cmd/taskmanager ./internal/taskmanager
 go test ./internal/taskmanager -run TestFixtureRecoversExpiryAndNotificationAcrossProcessRestart
 go test ./adapters/sqlite -run TestAcceptedAndStartedWorkSurvivesActualProcessLoss
