@@ -55,13 +55,40 @@ func (f *Fixture) driveExpiryTimers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	blocked, err := f.store.BlockedTimers(ctx)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(blocked))
+	for _, timer := range blocked {
+		seen[timer.ID] = true
+	}
+	var compatibilityErr error
 	for {
 		err := worker.RunOne(ctx)
 		if errors.Is(err, transition.ErrNoDueTimer) {
-			return nil
+			return compatibilityErr
 		}
 		if err != nil {
-			return err
+			compatibilityErr = errors.Join(compatibilityErr, err)
+			if !onlyCompatibility(err) || ctx.Err() != nil {
+				return compatibilityErr
+			}
+			blocked, listErr := f.store.BlockedTimers(ctx)
+			if listErr != nil {
+				return errors.Join(compatibilityErr, listErr)
+			}
+			// Retry only when a newly blocked timer can no longer starve other claims.
+			newBlock := false
+			for _, timer := range blocked {
+				if !seen[timer.ID] {
+					seen[timer.ID] = true
+					newBlock = true
+				}
+			}
+			if !newBlock {
+				return compatibilityErr
+			}
 		}
 	}
 }
