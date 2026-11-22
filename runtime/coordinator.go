@@ -95,7 +95,7 @@ func (c *Coordinator[EntityID, StateID]) Reconcile(ctx context.Context) (result 
 }
 
 func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id string) error {
-	execution, err := c.store.ReadActiveExecution(ctx, id)
+	execution, err := readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 	if err != nil {
 		return err
 	}
-	execution, err = c.store.ReadActiveExecution(ctx, id)
+	execution, err = readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
 	}

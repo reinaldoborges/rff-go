@@ -31,6 +31,38 @@ func (s *Store[EntityID, StateID]) ReadCompatibility(ctx context.Context, id str
 	return record.Compatibility, nil
 }
 
+// BlockUnreadableExecution records a decode failure without requiring decoded IDs.
+func (s *Store[EntityID, StateID]) BlockUnreadableExecution(ctx context.Context, id string) error {
+	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		var data []byte
+		err := tx.QueryRowContext(ctx, `SELECT e.record FROM rff_executions AS e
+			JOIN rff_active AS a ON a.execution_id = e.id WHERE e.id = ?`, id).Scan(&data)
+		if errors.Is(err, sql.ErrNoRows) {
+			return transition.ErrExecutionNotActive
+		}
+		if err != nil {
+			return fmt.Errorf("read unreadable execution: %w", err)
+		}
+		var record diskRecord
+		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || record.SchemaVersion != transition.CurrentSchemaVersion {
+			return fmt.Errorf("%w: invalid unreadable execution", ErrUnsupportedSchema)
+		}
+		if record.Compatibility != nil {
+			return nil
+		}
+		_, err = s.decodeRecord(data)
+		if err == nil {
+			return nil
+		}
+		var compatibility *transition.CompatibilityError
+		if !errors.As(err, &compatibility) || !validDiagnostic(record, compatibility.Diagnostic) {
+			return err
+		}
+		record.Compatibility = &compatibility.Diagnostic
+		return saveExecution(ctx, tx, id, record)
+	})
+}
+
 func validDiagnostic(record diskRecord, diagnostic transition.CompatibilityDiagnostic) bool {
 	if diagnostic.Name == "" || diagnostic.Version == "" {
 		return false

@@ -111,7 +111,7 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) Reconcile(ct
 }
 
 func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne(ctx context.Context, id string) error {
-	execution, err := c.store.ReadActiveExecution(ctx, id)
+	execution, err := readForReconciliation(ctx, c.store, id)
 	if err != nil || execution.Compatibility == nil {
 		return err
 	}
@@ -126,9 +126,12 @@ func (c *CompatibilityCoordinator[EntityID, StateID, Event, Input]) reconcileOne
 	if err != nil {
 		return err
 	}
-	execution, err = c.store.ReadActiveExecution(ctx, id)
+	execution, err = readForReconciliation(ctx, c.store, id)
 	if err != nil || execution.Compatibility == nil {
 		return err
+	}
+	if execution.CommitOperationID != "" || execution.Status == Notifying || execution.Status == NotificationRepair {
+		return c.store.RevalidateCompatibility(ctx, lease, c.config.Clock, *execution.Compatibility, nil)
 	}
 	progress, err := c.store.ReadHookProgress(ctx, id)
 	hasProgress := err == nil

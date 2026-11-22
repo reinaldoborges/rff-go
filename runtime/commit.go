@@ -80,9 +80,12 @@ func (c *CommitCoordinator[EntityID, StateID]) Reconcile(ctx context.Context) er
 }
 
 func (c *CommitCoordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id string) error {
-	execution, err := c.store.ReadActiveExecution(ctx, id)
+	execution, err := readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
+	}
+	if execution.Compatibility != nil {
+		return nil
 	}
 	if execution.Status == CommitRejected && (execution.CommitOperationID == "" || execution.CommitReceipt == nil ||
 		execution.CommitReceipt.Outcome != CommitDenied) {
@@ -99,9 +102,12 @@ func (c *CommitCoordinator[EntityID, StateID]) reconcileOne(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	execution, err = c.store.ReadActiveExecution(ctx, id)
+	execution, err = readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
+	}
+	if execution.Compatibility != nil {
+		return nil
 	}
 	if execution.Status == CommitRejected && (execution.CommitOperationID == "" || execution.CommitReceipt == nil ||
 		execution.CommitReceipt.Outcome != CommitDenied) {

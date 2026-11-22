@@ -83,9 +83,12 @@ func (c *NotificationCoordinator[EntityID, StateID]) Reconcile(ctx context.Conte
 }
 
 func (c *NotificationCoordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id string) error {
-	execution, err := c.store.ReadActiveExecution(ctx, id)
+	execution, err := readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
+	}
+	if execution.Compatibility != nil {
+		return nil
 	}
 	if execution.Status != Notifying {
 		return nil
@@ -98,9 +101,12 @@ func (c *NotificationCoordinator[EntityID, StateID]) reconcileOne(ctx context.Co
 	if err != nil {
 		return err
 	}
-	execution, err = c.store.ReadActiveExecution(ctx, id)
+	execution, err = readForReconciliation(ctx, c.store, id)
 	if err != nil {
 		return err
+	}
+	if execution.Compatibility != nil {
+		return nil
 	}
 	if execution.Status != Notifying {
 		return nil
