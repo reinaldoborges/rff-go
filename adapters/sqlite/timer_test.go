@@ -69,6 +69,87 @@ func TestTimerSchedulePersistsAndDeduplicatesAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestTimerReplayCancellationIsNotCodecIncompatibility(t *testing.T) {
+	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "timer-context.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	request := transition.TimerRequest[string]{
+		ID: "expiry", WorkflowID: "membership", Deadline: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
+		Event: "expired", EventCodec: transition.CodecVersion{Name: "event", Version: "1"},
+	}
+	scheduler, err := transition.NewTimerScheduler[string](store,
+		func(transition.CodecVersion) (transition.Codec[string], error) { return stringValueCodec{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := scheduler.Schedule(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scheduler, err = transition.NewTimerScheduler[string](store,
+		func(transition.CodecVersion) (transition.Codec[string], error) {
+			return cancelInputEqual{cancel: cancel}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = scheduler.Schedule(ctx, request)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, transition.ErrCompatibility) {
+		t.Fatalf("canceled equality was mistaken for unavailable behavior: %v", err)
+	}
+}
+
+func TestTimerCodecResolutionCancellationIsNotIncompatibility(t *testing.T) {
+	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "timer-resolution.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	request := transition.TimerRequest[string]{
+		ID: "expiry", WorkflowID: "membership", Deadline: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
+		Event: "expired", EventCodec: transition.CodecVersion{Name: "event", Version: "1"},
+	}
+	scheduler, err := transition.NewTimerScheduler[string](store,
+		func(transition.CodecVersion) (transition.Codec[string], error) { return stringValueCodec{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := scheduler.Schedule(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"expiry", "new-timer"} {
+		t.Run(id, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			scheduler, err := transition.NewTimerScheduler[string](store,
+				func(transition.CodecVersion) (transition.Codec[string], error) {
+					cancel()
+					return nil, context.Canceled
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := request
+			current.ID = id
+			_, _, err = scheduler.Schedule(ctx, current)
+			if !errors.Is(err, context.Canceled) || errors.Is(err, transition.ErrCompatibility) {
+				t.Fatalf("canceled resolution was mistaken for unavailable behavior: %v", err)
+			}
+		})
+	}
+}
+
 func TestTimerDeliveryUsesPersistedDeadlineAndRecoversUnknownOutcome(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "delivery.db")

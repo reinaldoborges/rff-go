@@ -73,10 +73,16 @@ func (s *TimerScheduler[Event]) Schedule(ctx context.Context, request TimerReque
 			}
 			codec, err := resolveCodec(s.resolve, existing.Event.Codec)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				return nil, err
 			}
 			equal, err := codec.Equal(ctx, slices.Clone(existing.Event.Data), request.Event)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				return nil, fmt.Errorf("%w: timer event equality: %w", ErrCompatibility, err)
 			}
 			if !equal {
@@ -86,6 +92,9 @@ func (s *TimerScheduler[Event]) Schedule(ctx context.Context, request TimerReque
 		}
 		codec, err := resolveCodec(s.resolve, request.EventCodec)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, err
 		}
 		data, err := codec.Encode(ctx, request.Event)
