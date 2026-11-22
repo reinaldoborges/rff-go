@@ -72,7 +72,7 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 through 4 stores
+without writes for unsupported schemas. It migrates version 1 through 5 stores
 transactionally, preserving accepted records, reservations, and leases.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
 The coordinator can reconcile expired attempts, retry hooks, enter intervention,
@@ -81,7 +81,9 @@ recovery. Low-level hook controls must be authorized and audited by the host;
 the typed ingress and authorization integration are not yet implemented.
 The host provides domain commits; automatic rejection recovery is supported.
 `sqlite.NewNotificationOutbox` provides fenced local handoff and durable delivery
-claims, including recovery after claim expiry. For domain data stored in the
+claims, including recovery after claim expiry. Incompatible delivery records
+are inspectable through `ReadNotificationCompatibility` and do not prevent
+other deliveries. For domain data stored in the
 same SQLite file, `Store.CommitAtomic` lets the host check and update its domain
 tables in the adapter transaction, atomically recording the receipt and enabled
 notification intent. Its callback must use only the provided transaction and

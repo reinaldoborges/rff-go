@@ -13,14 +13,15 @@ import (
 )
 
 type notificationWork struct {
-	Version    int
-	IntentID   string
-	DueAt      time.Time
-	Owner      string
-	Generation uint64
-	ExpiresAt  time.Time
-	Attempts   uint64
-	Completed  bool
+	Version       int
+	IntentID      string
+	DueAt         time.Time
+	Owner         string
+	Generation    uint64
+	ExpiresAt     time.Time
+	Attempts      uint64
+	Completed     bool
+	Compatibility *transition.CompatibilityDiagnostic
 }
 
 func validateNotification(execution diskRecord, work notificationWork) error {
@@ -29,6 +30,11 @@ func validateNotification(execution diskRecord, work notificationWork) error {
 		work.DueAt.IsZero() || (work.Owner == "") != work.ExpiresAt.IsZero() ||
 		(work.Owner != "" && (work.Generation == 0 || work.Completed)) || work.Generation != work.Attempts {
 		return fmt.Errorf("%w: invalid notification work", ErrUnsupportedSchema)
+	}
+	if work.Compatibility != nil &&
+		(!validDiagnostic(execution, *work.Compatibility) ||
+			work.Compatibility.Component != transition.CompatibilityEntity && work.Compatibility.Component != transition.CompatibilityState) {
+		return fmt.Errorf("%w: invalid notification compatibility", ErrUnsupportedSchema)
 	}
 	return nil
 }
@@ -153,11 +159,37 @@ func saveNotification(ctx context.Context, tx *sql.Tx, id string, work notificat
 	return nil
 }
 
+// ReadNotificationCompatibility returns a delivery diagnostic without decoding the intent.
+func (o *NotificationOutbox[EntityID, StateID]) ReadNotificationCompatibility(ctx context.Context, id string) (*transition.CompatibilityDiagnostic, error) {
+	var data, executionData []byte
+	err := o.store.db.QueryRowContext(ctx, `SELECT w.work, e.record FROM rff_notification_work AS w
+		JOIN rff_executions AS e ON e.id = w.execution_id WHERE w.execution_id = ?`, id).Scan(&data, &executionData)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, transition.ErrNoNotificationActivity
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read notification compatibility: %w", err)
+	}
+	var work notificationWork
+	var record diskRecord
+	if err := json.Unmarshal(data, &work); err != nil {
+		return nil, fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err)
+	}
+	if err := json.Unmarshal(executionData, &record); err != nil || record.ID != id {
+		return nil, fmt.Errorf("%w: invalid notification execution", ErrUnsupportedSchema)
+	}
+	if err := validateNotification(record, work); err != nil {
+		return nil, err
+	}
+	return work.Compatibility, nil
+}
+
 // ClaimNotification claims a due notification, counting this delivery attempt.
 func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 	ctx context.Context, owner string, clock func() time.Time, ttl time.Duration,
 ) (transition.NotificationDelivery[EntityID, StateID], error) {
 	var delivery transition.NotificationDelivery[EntityID, StateID]
+	var unavailable error
 	if owner == "" || clock == nil || ttl <= 0 {
 		return delivery, transition.ErrInvalidLease
 	}
@@ -174,7 +206,8 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 		}
 		var id string
 		var work notificationWork
-		var executionData []byte
+		var execution transition.Execution[EntityID, StateID]
+		blocked := make(map[string]notificationWork)
 		for rows.Next() {
 			var candidateID string
 			var data, candidateExecution []byte
@@ -195,25 +228,39 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 			if candidate.Completed || now.Before(candidate.DueAt) || candidate.Owner != "" && now.Before(candidate.ExpiresAt) {
 				continue
 			}
-			id, work, executionData = candidateID, candidate, candidateExecution
+			decoded, decodeErr := o.store.decodeRecord(candidateExecution)
+			if decodeErr != nil {
+				var compatibility *transition.CompatibilityError
+				if !errors.As(decodeErr, &compatibility) || !validDiagnostic(record, compatibility.Diagnostic) {
+					return errors.Join(decodeErr, rows.Close())
+				}
+				candidate.Compatibility = &compatibility.Diagnostic
+				blocked[candidateID] = candidate
+				unavailable = errors.Join(unavailable, decodeErr)
+				continue
+			}
+			id, work, execution = candidateID, candidate, decoded
 			break
 		}
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 			return fmt.Errorf("list notification work: %w", err)
 		}
+		for blockedID, blockedWork := range blocked {
+			if err := saveNotification(ctx, tx, blockedID, blockedWork); err != nil {
+				return err
+			}
+		}
 		if id == "" {
-			return transition.ErrNoNotificationActivity
+			unavailable = errors.Join(transition.ErrNoNotificationActivity, unavailable)
+			return nil
 		}
 		if work.Generation == math.MaxUint64 {
 			return errors.New("notification lease generation exhausted")
 		}
-		execution, err := o.store.decodeRecord(executionData)
-		if err != nil {
-			return err
-		}
 		work.Generation++
 		work.Attempts++
 		work.Owner, work.ExpiresAt = owner, expiry
+		work.Compatibility = nil
 		if err := saveNotification(ctx, tx, id, work); err != nil {
 			return err
 		}
@@ -225,6 +272,9 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 	})
 	if err != nil {
 		return transition.NotificationDelivery[EntityID, StateID]{}, err
+	}
+	if delivery.Intent.ID == "" {
+		return transition.NotificationDelivery[EntityID, StateID]{}, unavailable
 	}
 	return delivery, nil
 }
