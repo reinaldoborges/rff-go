@@ -22,6 +22,9 @@ type MigrationStore interface {
 // RunMigration checks domain verification, fencing, and original request replay.
 func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	t.Helper()
+	t.Run("rejected commit phase gates", func(t *testing.T) {
+		RunRejectedPhase(t, newStore)
+	})
 	t.Run("abort recovery rejects migration", func(t *testing.T) {
 		ctx := context.Background()
 		store := newStore(t)
