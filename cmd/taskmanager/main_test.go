@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/reinaldoborges/rff-go/internal/taskmanager"
+	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
 func TestLocalFixtureCLIStartsSignalsInspectsAndAuthorizes(t *testing.T) {
@@ -59,11 +60,13 @@ func TestLocalFixtureCLIStartsSignalsInspectsAndAuthorizes(t *testing.T) {
 	if err != nil || !strings.Contains(show, `"Status":"Complete"`) {
 		t.Fatalf("show did not inspect completed execution: %q, %v", show, err)
 	}
-	if _, err := invoke("control", "owner", execution, "retry", "retry"); err == nil {
-		t.Fatal("domain owner acquired operator controls")
-	}
-	if _, err := invoke("control", "operator", execution, "retry", "retry"); err == nil {
-		t.Fatal("invalid phase accepted retry")
+	for _, action := range []string{"retry", "abort", "notification-retry", "notification-waive"} {
+		if _, err := invoke("control", "owner", execution, action, action); !errors.Is(err, taskmanager.ErrDenied) {
+			t.Fatalf("domain owner acquired %s control: %v", action, err)
+		}
+		if _, err := invoke("control", "operator", execution, action, action); !errors.Is(err, transition.ErrExecutionNotActive) {
+			t.Fatalf("completed execution accepted %s control: %v", action, err)
+		}
 	}
 	if _, err := invoke("start-task", "invitee", "group", "task", "Task", "create-task"); err != nil {
 		t.Fatal(err)
