@@ -37,6 +37,11 @@ cancellation; such a hook may continue external side effects, which the host
 must make idempotent.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
+`RunReconciliation` can schedule these scans using a bounded `WakeupQueue` and
+a polling ticker. Notify the queue after durable work changes; notifications
+are coalesced hints and can be lost. The loop performs an initial scan, owns
+and stops the ticker, and returns on a scan error or cancellation. The host
+must observe errors and restart it with a new ticker when appropriate.
 `Coordinator.Status` reports the last scan separately from worker capacity.
 For capacity reporting, configure a `WorkerMonitor` with an explicit stale
 threshold and have the host periodically report each worker's `Status()`.
