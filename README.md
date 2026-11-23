@@ -135,6 +135,10 @@ new delivery; audited retry controls and Continuation evaluation are not yet
 implemented.
 Its source must retain unacknowledged markers across restarts and provide
 pagination cursors that remain valid when earlier markers are acknowledged.
+The separate-host cancellation restart contract can be run on both adapters
+with `go test ./adapters/sqlite ./adapters/mysql -run '^TestSuccessorCancellationProcessRestart$' -count=1`
+and a disposable MySQL DSN. Its SQLite host is a test fixture, not a
+production fencing implementation.
 `NotificationWorker` claims and delivers intents independently, renews claims
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by

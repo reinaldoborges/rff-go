@@ -96,6 +96,8 @@ func lookup(ctx context.Context, query func(context.Context, string, ...any) *sq
 		return Result{}, transition.ErrConflict
 	}
 	switch outcome {
+	case "pending":
+		return Result{Outcome: transition.SuccessorHostPending}, nil
 	case "accepted":
 		at, err := time.Parse(time.RFC3339Nano, acceptedAt)
 		if err != nil {
@@ -108,6 +110,10 @@ func lookup(ctx context.Context, query func(context.Context, string, ...any) *sq
 		return Result{Outcome: transition.SuccessorHostSuperseded, Cancellation: &transition.SuccessorCancellation[string, string]{
 			Binding: binding, Evidence: bytes.Clone(evidence), Superseded: true,
 		}}, nil
+	case "cancelled":
+		return Result{Outcome: transition.SuccessorHostCanceled, Cancellation: &transition.SuccessorCancellation[string, string]{
+			Binding: binding, Evidence: bytes.Clone(evidence),
+		}}, nil
 	default:
 		return Result{}, transition.ErrCompatibility
 	}
@@ -115,6 +121,88 @@ func lookup(ctx context.Context, query func(context.Context, string, ...any) *sq
 
 func (h *Host) LookupSuccessor(ctx context.Context, binding Binding) (Result, error) {
 	return lookup(ctx, h.db.QueryRowContext, binding)
+}
+
+// ClaimSuccessor models an in-flight host claim with a durable writer fence.
+func (h *Host) ClaimSuccessor(ctx context.Context, binding Binding) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	prior, err := lookup(ctx, tx.QueryRowContext, binding)
+	if err != nil {
+		return err
+	}
+	if prior.Outcome == transition.SuccessorHostPending {
+		return nil
+	}
+	if prior.Outcome != transition.SuccessorHostAbsent {
+		return transition.ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE domain SET fence = ? WHERE entity = ? AND revision = ? AND fence = ''`,
+		binding.Execution.ID, binding.Origin.Entity, binding.OriginRevision)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return transition.ErrConflict
+	}
+	data, err := bindingBytes(binding)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO successor_receipts(origin, binding, outcome, principal, accepted_at, evidence) VALUES (?, ?, 'pending', '', '', ?)`,
+		binding.Origin.ExecutionID, data, []byte{}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CancelPrepared atomically tombstones an unaccepted claim and releases its
+// fence. The hook runs inside the transaction to inject interruption.
+func (h *Host) CancelPrepared(ctx context.Context, binding Binding, beforeCommit func() error) (Result, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	defer tx.Rollback()
+	prior, err := lookup(ctx, tx.QueryRowContext, binding)
+	if err != nil {
+		return Result{}, err
+	}
+	if prior.Outcome == transition.SuccessorHostCanceled {
+		return prior, nil
+	}
+	if prior.Outcome != transition.SuccessorHostPending {
+		return Result{}, transition.ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE domain SET fence = '' WHERE entity = ? AND fence = ?`, binding.Origin.Entity, binding.Execution.ID)
+	if err != nil {
+		return Result{}, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return Result{}, transition.ErrConflict
+	}
+	evidence := []byte("cancelled:" + binding.Origin.ExecutionID)
+	if _, err := tx.ExecContext(ctx, `UPDATE successor_receipts SET outcome = 'cancelled', evidence = ? WHERE origin = ? AND outcome = 'pending'`, evidence, binding.Origin.ExecutionID); err != nil {
+		return Result{}, err
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			return Result{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Result{}, err
+	}
+	if h.LoseReply {
+		h.LoseReply = false
+		return Result{}, errors.New("lost host cancellation response")
+	}
+	return h.LookupSuccessor(ctx, binding)
 }
 
 func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, error) {
@@ -127,7 +215,8 @@ func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, er
 	if err != nil {
 		return Result{}, err
 	}
-	if prior.Outcome != transition.SuccessorHostAbsent {
+	pending := prior.Outcome == transition.SuccessorHostPending
+	if prior.Outcome != transition.SuccessorHostAbsent && !pending {
 		return prior, nil
 	}
 	if h.Authorize == "temporary" {
@@ -144,7 +233,10 @@ func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, er
 	if err := tx.QueryRowContext(ctx, `SELECT revision, fence FROM domain WHERE entity = ?`, binding.Origin.Entity).Scan(&revision, &fence); err != nil {
 		return Result{}, err
 	}
-	if fence != "" {
+	if pending && (fence != binding.Execution.ID || !bytes.Equal(revision, binding.OriginRevision)) {
+		return Result{}, transition.ErrConflict
+	}
+	if !pending && fence != "" {
 		return Result{}, transition.ErrBusy
 	}
 	data, err := bindingBytes(binding)
@@ -155,10 +247,17 @@ func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, er
 	outcome, principal, evidence := "accepted", "test-worker", []byte{}
 	if !bytes.Equal(revision, binding.OriginRevision) {
 		outcome, principal, evidence = "superseded", "", []byte("host-tombstone")
-	} else if _, err := tx.ExecContext(ctx, `UPDATE domain SET fence = ? WHERE entity = ?`, binding.Execution.ID, binding.Origin.Entity); err != nil {
-		return Result{}, err
+	} else if !pending {
+		if _, err := tx.ExecContext(ctx, `UPDATE domain SET fence = ? WHERE entity = ?`, binding.Execution.ID, binding.Origin.Entity); err != nil {
+			return Result{}, err
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO successor_receipts(origin, binding, outcome, principal, accepted_at, evidence) VALUES (?, ?, ?, ?, ?, ?)`,
+	if pending {
+		if _, err := tx.ExecContext(ctx, `UPDATE successor_receipts SET outcome = ?, principal = ?, accepted_at = ?, evidence = ? WHERE origin = ? AND outcome = 'pending'`,
+			outcome, principal, acceptedAt.Format(time.RFC3339Nano), evidence, binding.Origin.ExecutionID); err != nil {
+			return Result{}, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `INSERT INTO successor_receipts(origin, binding, outcome, principal, accepted_at, evidence) VALUES (?, ?, ?, ?, ?, ?)`,
 		binding.Origin.ExecutionID, data, outcome, principal, acceptedAt.Format(time.RFC3339Nano), evidence); err != nil {
 		return Result{}, err
 	}

@@ -140,9 +140,75 @@ func Prepare(t *testing.T, store Store, host *Host, entity string) Binding {
 func Run(t *testing.T, store Store, host *Host) {
 	t.Helper()
 	ctx := context.Background()
+	inflight := Prepare(t, store, host, "inflight")
+	if err := host.ClaimSuccessor(ctx, inflight); err != nil {
+		t.Fatal(err)
+	}
+	inflightResult, err := host.AcceptSuccessor(ctx, inflight)
+	if err != nil || inflightResult.Outcome != transition.SuccessorHostAccepted {
+		t.Fatalf("in-flight host claim could not become accepted: %+v error=%v", inflightResult, err)
+	}
+	if _, err := host.CancelPrepared(ctx, inflight, nil); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("accepted in-flight claim must not be cancelled: %v", err)
+	}
+	if err := host.Write(inflight.Origin.Entity, "outside", "revision-2"); err == nil {
+		t.Fatal("cancellation released an accepted successor fence")
+	}
+	race := Prepare(t, store, host, "cancel-race")
+	if err := host.ClaimSuccessor(ctx, race); err != nil {
+		t.Fatal(err)
+	}
+	type hostOutcome struct {
+		result Result
+		err    error
+	}
+	start := make(chan struct{})
+	acceptedRace, cancelledRace := make(chan hostOutcome, 1), make(chan hostOutcome, 1)
+	go func() {
+		<-start
+		result, err := host.AcceptSuccessor(ctx, race)
+		acceptedRace <- hostOutcome{result, err}
+	}()
+	go func() {
+		<-start
+		result, err := host.CancelPrepared(ctx, race, nil)
+		cancelledRace <- hostOutcome{result, err}
+	}()
+	close(start)
+	acceptedOutcome, cancelledOutcome := <-acceptedRace, <-cancelledRace
+	if acceptedOutcome.err != nil {
+		t.Fatalf("racing host acceptance: %v", acceptedOutcome.err)
+	}
+	switch acceptedOutcome.result.Outcome {
+	case transition.SuccessorHostAccepted:
+		if !errors.Is(cancelledOutcome.err, transition.ErrConflict) {
+			t.Fatalf("accepted race was cancelled: %+v", cancelledOutcome)
+		}
+		if err := host.Write(race.Origin.Entity, "outside", "revision-2"); err == nil {
+			t.Fatal("winning acceptance lost its host fence")
+		}
+	case transition.SuccessorHostCanceled:
+		if cancelledOutcome.err != nil || cancelledOutcome.result.Outcome != transition.SuccessorHostCanceled {
+			t.Fatalf("winning cancellation not retained: %+v", cancelledOutcome)
+		}
+		if err := host.Write(race.Origin.Entity, "outside", "revision-2"); err != nil {
+			t.Fatalf("winning cancellation did not release host fence: %v", err)
+		}
+	default:
+		t.Fatalf("unexpected race result: %+v", acceptedOutcome.result)
+	}
+	raceRecovery, err := transition.NewSuccessorRecovery[string, string](store, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = raceRecovery.Reconcile(ctx, race.Origin, false)
+	if acceptedOutcome.result.Outcome == transition.SuccessorHostAccepted && err != nil ||
+		acceptedOutcome.result.Outcome == transition.SuccessorHostCanceled && !errors.Is(err, transition.ErrSuccessorCancelled) {
+		t.Fatalf("reconcile racing host decision: %v", err)
+	}
 	concurrent := Setup(t, store, host, "concurrent")
 	aborted := errors.New("competitor aborted")
-	_, _, err := store.Accept(ctx, concurrent.Origin.Entity, "aborted", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+	_, _, err = store.Accept(ctx, concurrent.Origin.Entity, "aborted", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return nil, aborted
 	})
 	if !errors.Is(err, aborted) {
@@ -190,6 +256,9 @@ func Run(t *testing.T, store Store, host *Host) {
 	host.Authorize, host.LoseReply = "allow", true
 	if err := recovery.Reconcile(ctx, binding.Origin, true); err == nil {
 		t.Fatal("injected lost host response must be reported")
+	}
+	if _, err := host.CancelPrepared(ctx, binding, nil); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("accepted successor must not be cancelled as a provisional claim: %v", err)
 	}
 	if err := host.Write("accepted", "outside", "revision-2"); err == nil {
 		t.Fatal("direct state writer bypassed the durable host fence")
