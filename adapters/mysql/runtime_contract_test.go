@@ -26,6 +26,18 @@ func TestRuntimeOperationReconciliationContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeOperationDispatchClassificationContract(t *testing.T) {
+	runtimecontract.RunOperationDispatchClassification(t, func(t *testing.T) runtimecontract.OperationStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationPrerequisitesContract(t *testing.T) {
+	runtimecontract.RunOperationPrerequisites(t, func(t *testing.T) runtimecontract.OperationPrerequisiteStore {
+		return openMySQL(t)
+	})
+}
+
 func TestRuntimeOperationSafeRepeatContract(t *testing.T) {
 	runtimecontract.RunOperationSafeRepeat(t, func(t *testing.T) runtimecontract.OperationRepeatStore {
 		return openMySQL(t)
@@ -70,6 +82,18 @@ func TestOperationProcessRestart(t *testing.T) {
 		_, config := newMySQLDatabase(t)
 		runtimecontract.RunOperationLateCallRestart(t, config.FormatDSN(), open)
 	})
+}
+
+func TestOperationRecoveryProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.RecoveryOperationRestartStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.OperationRecoveryRestartAddress) != "" {
+		runtimecontract.OperationRecoveryRestartChild(t, open)
+		return
+	}
+	_, config := newMySQLDatabase(t)
+	runtimecontract.RunOperationRecoveryRestart(t, config.FormatDSN(), open)
 }
 
 func TestOperationRecordIsolation(t *testing.T) {

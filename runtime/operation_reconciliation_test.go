@@ -330,3 +330,31 @@ func TestTrackedUnknownOperationReconcilesConfirmedSuccess(t *testing.T) {
 		t.Fatalf("reconciliation evidence was not durably submitted: %+v", store.evidence)
 	}
 }
+
+func TestCompensationRequiresRecoverHook(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: func() time.Time { return now }, kind: HookRetry}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	request := reconciliationRequest()
+	request.Key = "refund"
+	request.Compensation = true
+	request.Prerequisites = []string{}
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		return OperationResult{Codec: request.ResultCodec, Data: []byte("receipt")}, nil
+	}
+	if _, err := TrackOperation(ctx, request, dispatch); !errors.Is(err, ErrInvalidRequest) || dispatches != 0 {
+		t.Fatalf("ordinary retry dispatched a compensation: calls=%d err=%v", dispatches, err)
+	}
+	scope.kind = HookRecover
+	if _, err := TrackOperation(ctx, request, dispatch); err != nil {
+		t.Fatalf("Recover could not dispatch tracked compensation: %v", err)
+	}
+	if dispatches != 1 || !store.binding.Compensation || store.binding.Prerequisites == nil ||
+		store.binding.Identity.Key != "refund" {
+		t.Fatalf("Recover did not durably bind distinct compensation metadata: calls=%d binding=%+v", dispatches, store.binding)
+	}
+}

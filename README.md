@@ -51,6 +51,16 @@ The host must not persist secrets or raw errors. Its adapter maps the supplied
 execution ID and key to a collision-free, provider-compatible idempotency
 identity and uses distinct keys for different record/purpose pairs and
 compensation. Business deduplication across executions remains host-owned.
+Recover remains host-defined work under the existing transition recovery
+budget; ordinary retry does not compensate automatically. Mark a tracked
+compensation with `Compensation: true` and durably declare its prerequisites
+with `Prerequisites: []string{"charge"}`. Use a non-nil empty slice only when
+the host has explicitly determined that the compensation is independent. A
+nil prerequisite list is an incomplete declaration and fails closed when
+tracked effects remain unresolved; missing, unsettled, conflicting, or cyclic
+prerequisites block dispatch and replay. The host remains responsible for
+declaring the complete dependency set and deciding whether settled outcomes
+make compensation appropriate, including equivalent gates for untracked calls.
 
 The adapters durably record possible dispatch before the call and its confirmed
 result before returning. Matching calls replay the recorded result; conflicts,
