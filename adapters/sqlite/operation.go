@@ -7,20 +7,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
 type operationRecord struct {
-	Version          int
-	Binding          transition.OperationBinding
-	ActivityID       string
-	Generation       uint64
-	DispatchPending  bool
-	Result           *transition.OperationResult
-	History          []transition.OperationHistoryEntry
-	EvidenceConflict bool
+	Version             int
+	Binding             transition.OperationBinding
+	ActivityID          string
+	Generation          uint64
+	DispatchPending     bool
+	DeclarationOnly     bool
+	PrerequisiteBlocked bool
+	Result              *transition.OperationResult
+	History             []transition.OperationHistoryEntry
+	EvidenceConflict    bool
 }
 
 func decodeOperation(id string, key []byte, data []byte) (operationRecord, error) {
@@ -29,7 +32,7 @@ func decodeOperation(id string, key []byte, data []byte) (operationRecord, error
 		return record, fmt.Errorf("%w: invalid operation record", ErrUnsupportedSchema)
 	}
 	b := record.Binding
-	if (record.Version != 1 && record.Version != 2) || b.Identity.ExecutionID != id || !bytes.Equal([]byte(b.Identity.Key), key) ||
+	if (record.Version != 1 && record.Version != 2 && record.Version != 3) || b.Identity.ExecutionID != id || !bytes.Equal([]byte(b.Identity.Key), key) ||
 		id == "" || b.Identity.Key == "" || b.Kind == "" || b.BehaviorVersion == "" ||
 		b.ComparatorVersion == "" || b.ResultCodec.Name == "" || b.ResultCodec.Version == "" ||
 		record.ActivityID == "" || record.Generation == 0 ||
@@ -40,9 +43,12 @@ func decodeOperation(id string, key []byte, data []byte) (operationRecord, error
 		record.Version = 2
 		record.DispatchPending = record.Result == nil
 	}
-	if record.DispatchPending && record.Result != nil || !validOperationHistory(b, record.History) {
+	b, bindingErr := transition.NormalizeOperationBinding(b)
+	if bindingErr != nil || record.DispatchPending && record.Result != nil ||
+		record.DeclarationOnly && (record.DispatchPending || record.Result != nil) || !validOperationHistory(b, record.History) {
 		return record, fmt.Errorf("%w: inconsistent operation history", ErrUnsupportedSchema)
 	}
+	record.Binding = b
 	return record, nil
 }
 
@@ -164,9 +170,11 @@ func (s *Store[EntityID, StateID]) InspectTrackedOperation(ctx context.Context, 
 
 func operationInspection(record operationRecord) transition.OperationInspection {
 	return transition.OperationInspection{
-		Binding: record.Binding, ActivityID: record.ActivityID, Generation: record.Generation,
-		MayHaveDispatched: true, Result: cloneOperationResult(record.Result),
-		History: cloneOperationHistory(record.History), EvidenceConflict: record.EvidenceConflict,
+		Binding: cloneOperationBinding(record.Binding), ActivityID: record.ActivityID, Generation: record.Generation,
+		MayHaveDispatched: !record.DeclarationOnly, DispatchPending: record.DispatchPending,
+		PrerequisiteBlocked: record.PrerequisiteBlocked,
+		Result:              cloneOperationResult(record.Result),
+		History:             cloneOperationHistory(record.History), EvidenceConflict: record.EvidenceConflict,
 	}
 }
 
@@ -177,6 +185,12 @@ func cloneOperationResult(result *transition.OperationResult) *transition.Operat
 	copy := *result
 	copy.Data = bytes.Clone(result.Data)
 	return &copy
+}
+
+func cloneOperationBinding(binding transition.OperationBinding) transition.OperationBinding {
+	binding.Input = bytes.Clone(binding.Input)
+	binding.Prerequisites = slices.Clone(binding.Prerequisites)
+	return binding
 }
 
 func sameOperationResult(a, b *transition.OperationResult) bool {
@@ -202,6 +216,11 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 	ctx context.Context, lease transition.HookLease, clock func() time.Time, binding transition.OperationBinding,
 	equal func(context.Context, []byte, []byte) (bool, error),
 ) (*transition.OperationResult, bool, error) {
+	var err error
+	binding, err = transition.NormalizeOperationBinding(binding)
+	if err != nil {
+		return nil, false, err
+	}
 	if clock == nil || equal == nil || binding.Identity.ExecutionID != lease.ExecutionID || binding.Identity.Key == "" ||
 		binding.Kind == "" || binding.BehaviorVersion == "" || binding.ComparatorVersion == "" ||
 		binding.ResultCodec.Name == "" || binding.ResultCodec.Version == "" {
@@ -209,7 +228,8 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 	}
 	var result *transition.OperationResult
 	var started bool
-	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	var deferredErr error
+	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
 		if err := operationClaim(ctx, tx, lease, clock()); err != nil {
 			return err
 		}
@@ -225,7 +245,8 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 			}
 			old := record.Binding
 			if old.Kind != binding.Kind || old.BehaviorVersion != binding.BehaviorVersion ||
-				old.ComparatorVersion != binding.ComparatorVersion || old.ResultCodec != binding.ResultCodec {
+				old.ComparatorVersion != binding.ComparatorVersion || old.ResultCodec != binding.ResultCodec ||
+				old.Compensation != binding.Compensation || !slices.Equal(old.Prerequisites, binding.Prerequisites) {
 				return transition.ErrConflict
 			}
 			matches, err := equal(ctx, bytes.Clone(old.Input), bytes.Clone(binding.Input))
@@ -238,6 +259,33 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 			if !matches {
 				return transition.ErrConflict
 			}
+			if err := ensureOperationPrerequisites(ctx, tx, binding); err != nil {
+				record.PrerequisiteBlocked = true
+				if saveErr := saveOperationRecord(ctx, tx, binding.Identity, record); saveErr != nil {
+					return saveErr
+				}
+				if isOperationPrerequisiteBlock(err) {
+					deferredErr = err
+					return operationClaim(ctx, tx, lease, clock())
+				}
+				return err
+			}
+			if record.PrerequisiteBlocked {
+				record.PrerequisiteBlocked = false
+				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+					return err
+				}
+			}
+			if record.DeclarationOnly {
+				record.DeclarationOnly = false
+				record.DispatchPending = true
+				record.PrerequisiteBlocked = false
+				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+					return err
+				}
+				started = true
+				return operationClaim(ctx, tx, lease, clock())
+			}
 			if record.Result == nil {
 				return transition.ErrOperationUnresolved
 			}
@@ -247,7 +295,7 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read operation: %w", err)
 		}
-		record := operationRecord{Version: 2, Binding: binding, ActivityID: lease.ActivityID, Generation: lease.Generation, DispatchPending: true}
+		record := operationRecord{Version: 3, Binding: binding, ActivityID: lease.ActivityID, Generation: lease.Generation, DeclarationOnly: true}
 		data, err = json.Marshal(record)
 		if err != nil {
 			return fmt.Errorf("encode operation: %w", err)
@@ -255,13 +303,36 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_operations (execution_id, operation_key, record) VALUES (?, ?, ?)`, lease.ExecutionID, []byte(binding.Identity.Key), data); err != nil {
 			return fmt.Errorf("record operation intent: %w", err)
 		}
+		if err := ensureOperationPrerequisites(ctx, tx, binding); err != nil {
+			if isOperationPrerequisiteBlock(err) {
+				record.PrerequisiteBlocked = true
+				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+					return err
+				}
+				deferredErr = err
+				return operationClaim(ctx, tx, lease, clock())
+			}
+			return err
+		}
+		record.DeclarationOnly = false
+		record.DispatchPending = true
+		record.PrerequisiteBlocked = false
+		if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+			return err
+		}
 		if err := operationClaim(ctx, tx, lease, clock()); err != nil {
 			return err
 		}
 		started = true
 		return nil
 	})
-	return result, started, err
+	if err != nil {
+		return nil, false, err
+	}
+	if deferredErr != nil {
+		return nil, false, deferredErr
+	}
+	return result, started, nil
 }
 
 // ReconcileTrackedOperation persists provider evidence and only opens a new
@@ -274,8 +345,13 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 	assessment transition.OperationAssessment,
 	equal func(context.Context, []byte, []byte) (bool, error),
 ) (transition.OperationReconciliation, error) {
+	var normalizeErr error
+	binding, normalizeErr = transition.NormalizeOperationBinding(binding)
 	if clock == nil || equal == nil || binding.Identity.ExecutionID != lease.ExecutionID {
 		return transition.OperationReconciliation{}, transition.ErrInvalidRequest
+	}
+	if normalizeErr != nil {
+		return transition.OperationReconciliation{}, normalizeErr
 	}
 	var result transition.OperationReconciliation
 	var deferredErr error
@@ -297,8 +373,13 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 		}
 		if record.Binding.Identity != binding.Identity || record.Binding.Kind != binding.Kind ||
 			record.Binding.BehaviorVersion != binding.BehaviorVersion ||
-			record.Binding.ComparatorVersion != binding.ComparatorVersion || record.Binding.ResultCodec != binding.ResultCodec {
+			record.Binding.ComparatorVersion != binding.ComparatorVersion || record.Binding.ResultCodec != binding.ResultCodec ||
+			record.Binding.Compensation != binding.Compensation ||
+			!slices.Equal(record.Binding.Prerequisites, binding.Prerequisites) {
 			return transition.ErrConflict
+		}
+		if err := ensureOperationPrerequisites(ctx, tx, binding); err != nil {
+			return err
 		}
 		matches, err := equal(ctx, bytes.Clone(record.Binding.Input), bytes.Clone(binding.Input))
 		if claimErr := operationClaim(ctx, tx, lease, clock()); claimErr != nil {
@@ -445,6 +526,10 @@ func (s *Store[EntityID, StateID]) CompleteTrackedOperation(
 		if err != nil {
 			return err
 		}
+		if err := ensureOperationPrerequisites(ctx, tx, record.Binding); err != nil {
+			return err
+		}
+		record.PrerequisiteBlocked = false
 		if record.EvidenceConflict {
 			return transition.ErrOperationEvidenceConflict
 		}
@@ -514,6 +599,9 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 			return err
 		}
 		if record.Binding.Identity != identity || !transition.OperationAssessmentValid(record.Binding, assessment, now) {
+			return transition.ErrOperationUnresolved
+		}
+		if record.DeclarationOnly && assessment.Outcome != transition.OperationOutcomeAbsent {
 			return transition.ErrOperationUnresolved
 		}
 		for _, entry := range record.History {
@@ -604,7 +692,7 @@ func sameOperationAssessment(a, b transition.OperationAssessment) bool {
 }
 
 func saveOperationRecord(ctx context.Context, tx *sql.Tx, identity transition.OperationIdentity, record operationRecord) error {
-	record.Version = 2
+	record.Version = 3
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("encode operation resolution: %w", err)
@@ -616,19 +704,134 @@ func saveOperationRecord(ctx context.Context, tx *sql.Tx, identity transition.Op
 }
 
 func ensureOperationsSettled(ctx context.Context, tx *sql.Tx, id string) error {
-	operations, err := loadOperationInspections(ctx, tx, id)
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key, record FROM rff_operations WHERE execution_id = ? ORDER BY operation_key`, id)
 	if err != nil {
 		return err
 	}
-	for _, operation := range operations {
-		if operation.EvidenceConflict {
+	defer rows.Close()
+	for rows.Next() {
+		var key, data []byte
+		if err := rows.Scan(&key, &data); err != nil {
+			return err
+		}
+		record, err := decodeOperation(id, key, data)
+		if err != nil {
+			return err
+		}
+		if record.EvidenceConflict {
 			return transition.ErrOperationEvidenceConflict
 		}
-		if operation.Result == nil {
+		if record.PrerequisiteBlocked {
+			return transition.ErrOperationPrerequisiteUnresolved
+		}
+		if record.DeclarationOnly {
+			continue
+		}
+		if !operationSettled(record) {
 			return transition.ErrOperationUnresolved
 		}
 	}
+	return rows.Err()
+}
+
+func ensureOperationPrerequisites(ctx context.Context, tx *sql.Tx, binding transition.OperationBinding) error {
+	type node struct {
+		record operationRecord
+	}
+	records := make(map[string]node)
+	graph := make(map[string][]string)
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key, record FROM rff_operations WHERE execution_id = ? ORDER BY operation_key`, binding.Identity.ExecutionID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var key, data []byte
+		if err := rows.Scan(&key, &data); err != nil {
+			rows.Close()
+			return err
+		}
+		record, err := decodeOperation(binding.Identity.ExecutionID, key, data)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		records[record.Binding.Identity.Key] = node{record: record}
+		graph[record.Binding.Identity.Key] = record.Binding.Prerequisites
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	graph[binding.Identity.Key] = binding.Prerequisites
+	if operationDependencyCycle(graph, binding.Identity.Key) {
+		return transition.ErrOperationPrerequisiteCycle
+	}
+	for _, key := range binding.Prerequisites {
+		dependency, ok := records[key]
+		if !ok {
+			return transition.ErrOperationPrerequisiteUnresolved
+		}
+		if dependency.record.EvidenceConflict {
+			return transition.ErrOperationEvidenceConflict
+		}
+		if !operationSettled(dependency.record) {
+			return transition.ErrOperationPrerequisiteUnresolved
+		}
+	}
+	if binding.Compensation && binding.Prerequisites == nil {
+		for key, operation := range records {
+			if key == binding.Identity.Key {
+				continue
+			}
+			if !operation.record.DeclarationOnly && !operationSettled(operation.record) {
+				return transition.ErrOperationPrerequisiteUnresolved
+			}
+		}
+	}
 	return nil
+}
+
+func operationDependencyCycle(graph map[string][]string, root string) bool {
+	state := make(map[string]uint8, len(graph))
+	var visit func(string) bool
+	visit = func(key string) bool {
+		switch state[key] {
+		case 1:
+			return true
+		case 2:
+			return false
+		}
+		state[key] = 1
+		for _, dependency := range graph[key] {
+			if _, exists := graph[dependency]; exists && visit(dependency) {
+				return true
+			}
+		}
+		state[key] = 2
+		return false
+	}
+	return visit(root)
+}
+
+func operationSettled(record operationRecord) bool {
+	if record.EvidenceConflict || record.DeclarationOnly || record.DispatchPending {
+		return false
+	}
+	if record.Result != nil {
+		return true
+	}
+	for i := len(record.History) - 1; i >= 0; i-- {
+		evidence := record.History[i].Assessment.Evidence
+		if evidence.Identity == record.Binding.Identity {
+			return evidence.Outcome == transition.OperationOutcomeAbsent && evidence.Quiesced
+		}
+	}
+	return false
+}
+
+func isOperationPrerequisiteBlock(err error) bool {
+	return errors.Is(err, transition.ErrOperationPrerequisiteUnresolved) ||
+		errors.Is(err, transition.ErrOperationPrerequisiteCycle) ||
+		errors.Is(err, transition.ErrOperationEvidenceConflict)
 }
 
 func loadOperationInspections(ctx context.Context, tx *sql.Tx, id string) ([]transition.OperationInspection, error) {
