@@ -144,19 +144,7 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 	}
 	if !progress.Completed {
 		if progress.Started && !c.config.Clock().Before(progress.LeaseExpiresAt) {
-			result, err := c.classifier.ClassifyHookFailure(execution, ErrAttemptUnknown)
-			if err != nil {
-				return c.recordCompatibilityError(ctx, lease, execution, CompatibilityUnknownAttempt, err)
-			}
-			if len(progress.Attempts) == 0 {
-				return ErrInvalidHook
-			}
-			attempt := progress.Attempts[len(progress.Attempts)-1]
-			err = c.store.ResolveUnknownHook(ctx, lease, c.config.Clock, progress.ActivityID, attempt.Metadata.LeaseGeneration, result)
-			if errors.Is(err, ErrActivityLeaseHeld) || errors.Is(err, ErrStaleActivityLease) {
-				return nil
-			}
-			return err
+			return c.reconcileExpiredStartedAttempt(ctx, lease, execution, progress)
 		}
 		if !progress.Started && !c.config.Clock().Before(execution.EffectiveDeadline()) {
 			return c.enterDeadlineIntervention(ctx, lease, execution)
@@ -164,84 +152,129 @@ func (c *Coordinator[EntityID, StateID]) reconcileOne(ctx context.Context, id st
 		return nil
 	}
 	if !progress.Result.Success {
-		if len(progress.Attempts) == 0 || progress.BudgetUsed == 0 || progress.BudgetUsed > uint(len(progress.Attempts)) {
-			return ErrInvalidHook
-		}
-		var failures uint
-		for _, attempt := range progress.Attempts[len(progress.Attempts)-int(progress.BudgetUsed):] {
-			if attempt.Result != nil && !attempt.Result.Success && attempt.Result.Disposition == fsm.DispositionRetry {
-				failures++
-			}
-		}
-		if failures == 0 {
-			return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
-		}
-		retry, delay, err := DecideRetry(execution.Policy, progress.BudgetUsed, failures-1, progress.Result.Disposition)
-		if err != nil {
-			return err
-		}
-		if !retry {
-			return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
-		}
-		last := progress.Attempts[len(progress.Attempts)-1]
-		due := last.CompletedAt.Add(delay)
-		if !c.config.Clock().Before(execution.EffectiveDeadline()) {
-			return c.enterDeadlineIntervention(ctx, lease, execution)
-		}
-		if !due.Before(execution.EffectiveDeadline()) {
-			return nil
-		}
-		switch progress.Dispatch.Kind {
-		case HookEnter, HookTransition:
-			var cycle uint
-			for _, attempt := range progress.Attempts {
-				if attempt.Kind == HookRetry && attempt.Metadata.RetryCycle > cycle {
-					cycle = attempt.Metadata.RetryCycle
-				}
-			}
-			failure := progress.Result.Failure
-			_, err = c.store.DispatchHook(ctx, lease, c.config.Clock, HookDispatch{
-				Kind: HookRetry, RetryCycle: cycle + 1, DueAt: due, Failure: &failure,
-			})
-			return err
-		case HookRetry, HookRecover:
-			return c.store.RedeliverHook(ctx, lease, c.config.Clock, progress.ActivityID, last.Metadata.LeaseGeneration, due)
-		default:
-			return ErrInvalidHook
-		}
+		return c.reconcileFailedHook(ctx, lease, execution, progress)
 	}
 	if progress.Dispatch.Kind == HookRetry {
-		if progress.BudgetUsed >= execution.Policy.MaxAttempts {
-			return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
-		}
-		if !c.config.Clock().Before(execution.EffectiveDeadline()) {
-			return c.enterDeadlineIntervention(ctx, lease, execution)
-		}
-		last := progress.Attempts[len(progress.Attempts)-1]
-		for i := len(progress.Attempts) - 1; i >= 0; i-- {
-			attempt := progress.Attempts[i]
-			if attempt.Kind != HookEnter && attempt.Kind != HookTransition {
-				continue
-			}
-			if attempt.Unknown {
-				return c.store.RedeliverHook(ctx, lease, c.config.Clock, attempt.Metadata.ActivityID, attempt.Metadata.LeaseGeneration, last.CompletedAt)
-			}
-			_, err := c.store.DispatchHook(ctx, lease, c.config.Clock, HookDispatch{
-				Kind: attempt.Kind, RetryCycle: progress.Dispatch.RetryCycle, DueAt: last.CompletedAt,
-			})
-			return err
-		}
-
-		return ErrInvalidHook
+		return c.resumeOriginalWorkAfterRetry(ctx, lease, execution, progress)
 	}
 	if progress.Dispatch.Kind == HookRecover && execution.Status == Aborting {
-		return c.store.FinishAbort(ctx, lease, c.config.Clock)
+		return c.finishAbortRecovery(ctx, lease)
 	}
 	if progress.Dispatch.Kind != HookEnter && progress.Dispatch.Kind != HookTransition {
 		return ErrInvalidHook
 	}
 	_, err = c.store.MarkWorkSuccess(ctx, lease, c.config.Clock)
 	return err
+}
+
+func (c *Coordinator[EntityID, StateID]) reconcileExpiredStartedAttempt(
+	ctx context.Context,
+	lease TransitionLease[EntityID],
+	execution Execution[EntityID, StateID],
+	progress HookProgress,
+) error {
+	result, err := c.classifier.ClassifyHookFailure(execution, ErrAttemptUnknown)
+	if err != nil {
+		return c.recordCompatibilityError(ctx, lease, execution, CompatibilityUnknownAttempt, err)
+	}
+	if len(progress.Attempts) == 0 {
+		return ErrInvalidHook
+	}
+	attempt := progress.Attempts[len(progress.Attempts)-1]
+	err = c.store.ResolveUnknownHook(ctx, lease, c.config.Clock, progress.ActivityID, attempt.Metadata.LeaseGeneration, result)
+	if errors.Is(err, ErrActivityLeaseHeld) || errors.Is(err, ErrStaleActivityLease) {
+		return nil
+	}
+	return err
+}
+
+func (c *Coordinator[EntityID, StateID]) reconcileFailedHook(
+	ctx context.Context,
+	lease TransitionLease[EntityID],
+	execution Execution[EntityID, StateID],
+	progress HookProgress,
+) error {
+	if len(progress.Attempts) == 0 || progress.BudgetUsed == 0 || progress.BudgetUsed > uint(len(progress.Attempts)) {
+		return ErrInvalidHook
+	}
+	var failures uint
+	for _, attempt := range progress.Attempts[len(progress.Attempts)-int(progress.BudgetUsed):] {
+		if attempt.Result != nil && !attempt.Result.Success && attempt.Result.Disposition == fsm.DispositionRetry {
+			failures++
+		}
+	}
+	if failures == 0 {
+		return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
+	}
+	retry, delay, err := DecideRetry(execution.Policy, progress.BudgetUsed, failures-1, progress.Result.Disposition)
+	if err != nil {
+		return err
+	}
+	if !retry {
+		return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
+	}
+	last := progress.Attempts[len(progress.Attempts)-1]
+	due := last.CompletedAt.Add(delay)
+	if !c.config.Clock().Before(execution.EffectiveDeadline()) {
+		return c.enterDeadlineIntervention(ctx, lease, execution)
+	}
+	if !due.Before(execution.EffectiveDeadline()) {
+		return nil
+	}
+	switch progress.Dispatch.Kind {
+	case HookEnter, HookTransition:
+		var cycle uint
+		for _, attempt := range progress.Attempts {
+			if attempt.Kind == HookRetry && attempt.Metadata.RetryCycle > cycle {
+				cycle = attempt.Metadata.RetryCycle
+			}
+		}
+		failure := progress.Result.Failure
+		_, err = c.store.DispatchHook(ctx, lease, c.config.Clock, HookDispatch{
+			Kind: HookRetry, RetryCycle: cycle + 1, DueAt: due, Failure: &failure,
+		})
+		return err
+	case HookRetry, HookRecover:
+		return c.store.RedeliverHook(ctx, lease, c.config.Clock, progress.ActivityID, last.Metadata.LeaseGeneration, due)
+	default:
+		return ErrInvalidHook
+	}
+}
+
+func (c *Coordinator[EntityID, StateID]) resumeOriginalWorkAfterRetry(
+	ctx context.Context,
+	lease TransitionLease[EntityID],
+	execution Execution[EntityID, StateID],
+	progress HookProgress,
+) error {
+	if progress.BudgetUsed >= execution.Policy.MaxAttempts {
+		return c.store.EnterHookIntervention(ctx, lease, c.config.Clock)
+	}
+	if !c.config.Clock().Before(execution.EffectiveDeadline()) {
+		return c.enterDeadlineIntervention(ctx, lease, execution)
+	}
+	last := progress.Attempts[len(progress.Attempts)-1]
+	for i := len(progress.Attempts) - 1; i >= 0; i-- {
+		attempt := progress.Attempts[i]
+		if attempt.Kind != HookEnter && attempt.Kind != HookTransition {
+			continue
+		}
+		if attempt.Unknown {
+			return c.store.RedeliverHook(ctx, lease, c.config.Clock, attempt.Metadata.ActivityID, attempt.Metadata.LeaseGeneration, last.CompletedAt)
+		}
+		_, err := c.store.DispatchHook(ctx, lease, c.config.Clock, HookDispatch{
+			Kind: attempt.Kind, RetryCycle: progress.Dispatch.RetryCycle, DueAt: last.CompletedAt,
+		})
+		return err
+	}
+
+	return ErrInvalidHook
+}
+
+func (c *Coordinator[EntityID, StateID]) finishAbortRecovery(
+	ctx context.Context, lease TransitionLease[EntityID],
+) error {
+	return c.store.FinishAbort(ctx, lease, c.config.Clock)
 }
 
 func reconcilable[EntityID comparable, StateID comparable](execution Execution[EntityID, StateID]) bool {
