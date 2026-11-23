@@ -1,7 +1,10 @@
 # RF-DSF Go implementation
 
 Experimental Go implementation of the RF-DSF first slice. The `fsm` package
-provides typed state-machine selection; the durable runtime is in progress.
+provides typed state-machine selection; the single-node durable runtime uses
+host-injected persistence, with SQLite as its first adapter. The
+[first-slice acceptance gate](https://github.com/reinaldoborges/rff-home/issues/22)
+has passed; this is not a production-readiness claim.
 
 Run the standalone, runtime-independent FSM example with:
 
