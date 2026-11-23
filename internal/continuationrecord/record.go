@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/reinaldoborges/rff-go/fsm"
 	transition "github.com/reinaldoborges/rff-go/runtime"
@@ -21,9 +22,91 @@ type record struct {
 	MachineID      []byte
 	MachineVersion []byte
 	Policy         fsm.Policy
+	Progress       *transition.ContinuationProgress `json:",omitempty"`
 }
 
 func Digest(executionID string) [32]byte { return sha256.Sum256([]byte(executionID)) }
+
+// Progress and SetProgress retain the marker and its driver state in the
+// same transactionally updated record.
+func Progress(data []byte) (*transition.ContinuationProgress, error) {
+	var stored record
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&stored); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("trailing continuation record data")
+	}
+	if stored.Progress != nil {
+		p := stored.Progress
+		switch p.Phase {
+		case transition.ContinuationWaiting, transition.ContinuationDriving, transition.ContinuationDecided,
+			transition.ContinuationStopped, transition.ContinuationIntervention, transition.ContinuationAccepting,
+			transition.ContinuationWaiverPending, transition.ContinuationWaived, transition.ContinuationAccepted,
+			transition.ContinuationSuperseded:
+		default:
+			return nil, errors.New("unsupported continuation phase")
+		}
+		if p.Version != 1 || p.Attempts > stored.Policy.MaxAttempts || p.AttemptPaused < 0 ||
+			p.CycleStarted.IsZero() != p.Deadline.IsZero() ||
+			(!p.CycleStarted.IsZero() && !p.Deadline.After(p.CycleStarted)) {
+			return nil, errors.New("invalid continuation progress")
+		}
+		if p.Phase == transition.ContinuationDriving || p.Phase == transition.ContinuationDecided || p.Phase == transition.ContinuationAccepting {
+			if p.Attempts == 0 || p.StartedAt.IsZero() || p.StartedGeneration == 0 || p.CycleStarted.IsZero() {
+				return nil, errors.New("invalid started continuation")
+			}
+		}
+		if p.Phase == transition.ContinuationDecided && (p.Decision == nil || !p.Decision.Continue) ||
+			p.Phase == transition.ContinuationStopped && (p.Decision == nil || p.Decision.Continue) ||
+			p.Phase == transition.ContinuationAccepting && (p.Decision == nil || !p.Decision.Continue || p.PermitExpires.IsZero() || len(p.SuccessorID) == 0) {
+			return nil, errors.New("invalid continuation decision")
+		}
+		if !p.PausedAt.IsZero() && (p.StartedAt.IsZero() || p.PausedAt.Before(p.StartedAt)) {
+			return nil, errors.New("invalid continuation pause")
+		}
+	}
+	return stored.Progress, nil
+}
+
+func SetProgress(data []byte, progress *transition.ContinuationProgress) ([]byte, error) {
+	if _, err := Progress(data); err != nil {
+		return nil, err
+	}
+	var stored record
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return nil, err
+	}
+	stored.Progress = progress
+	return json.Marshal(stored)
+}
+
+// StartCycle records the instant the origin reservation is released, so
+// queueing and downtime before the first worker claim consume the budget.
+func StartCycle(data []byte, now time.Time) ([]byte, error) {
+	progress, err := Progress(data)
+	if err != nil {
+		return nil, err
+	}
+	if now.IsZero() {
+		return nil, transition.ErrInvalidLease
+	}
+	if progress == nil {
+		progress = &transition.ContinuationProgress{Version: 1, Phase: transition.ContinuationWaiting}
+	}
+	if progress.Phase != transition.ContinuationWaiting || !progress.CycleStarted.IsZero() {
+		return data, nil
+	}
+	var stored record
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return nil, err
+	}
+	progress.CycleStarted = now
+	progress.Deadline = now.Add(stored.Policy.OverallTimeout)
+	return SetProgress(data, progress)
+}
 
 func Encode[E comparable, S comparable](marker transition.ContinuationMarker[E, S], entity, target []byte) ([]byte, error) {
 	if err := transition.ValidateContinuationMarker(marker); err != nil {

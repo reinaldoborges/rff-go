@@ -31,6 +31,6 @@ func (s *Store[EntityID, StateID]) CompleteNotificationHandoff(
 		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return err
 		}
-		return releaseReservation(ctx, tx, lease.ExecutionID)
+		return releaseReservation(ctx, tx, lease.ExecutionID, clock())
 	})
 }

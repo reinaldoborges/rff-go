@@ -79,7 +79,7 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			return err
 		}
 		if execution.Status == transition.Complete {
-			return releaseReservation(ctx, tx, lease.ExecutionID)
+			return releaseReservation(ctx, tx, lease.ExecutionID, clock())
 		}
 		return nil
 	})
