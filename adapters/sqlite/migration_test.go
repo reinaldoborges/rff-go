@@ -181,6 +181,10 @@ func TestMigrationPreservesOriginalReplayAndFencesUnstartedClaim(t *testing.T) {
 		t.Fatalf("changed migration replay did not conflict: %v", err)
 	}
 	migration.Parameters = []byte("conversion")
+	fence, err = store.AcquireTransitionLease(ctx, "entity", accepted.ID, "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	claim, err := store.ClaimHook(ctx, "new-worker", clock, time.Minute)
 	if err != nil {
 		t.Fatal(err)

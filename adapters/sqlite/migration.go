@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -181,6 +182,17 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 			if err := saveHook(ctx, tx, lease.ExecutionID, work); err != nil {
 				return err
 			}
+		}
+		encodedEntity, err := s.encodeEntity(lease.Entity)
+		if err != nil {
+			return err
+		}
+		if lease.Generation >= math.MaxInt64-1 {
+			return fmt.Errorf("transition lease generation exhausted")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE rff_transition_leases SET generation = generation + 1, expires_at = ? WHERE entity = ?`,
+			decisionTime.UTC().Format(time.RFC3339Nano), encodedEntity); err != nil {
+			return fmt.Errorf("fence migrated transition lease: %w", err)
 		}
 		stored.Compatibility = nil
 		receipt = transition.MigrationReceipt{Request: request, ParametersDigest: migrationDigest(request.Parameters), AcceptedAt: decisionTime.UTC()}

@@ -309,6 +309,7 @@ func validHookLease(ctx context.Context, tx *sql.Tx, lease transition.HookLease,
 	}
 	if lease.ExecutionID == "" || lease.ActivityID != work.Progress.ActivityID ||
 		lease.Owner == "" || lease.Owner != work.Owner || lease.Generation != uint64(work.Generation) ||
+		(work.Started && work.Progress.Attempts[len(work.Progress.Attempts)-1].Unknown) ||
 		!now.Before(work.ExpiresAt) {
 		return transition.ErrStaleActivityLease
 	}
