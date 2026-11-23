@@ -59,6 +59,11 @@ driving both scans in one process.
 outbox handoff. Unknown handoff outcomes are retried; definitive failures require
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
+`ContinuationDiscovery` is only a marker-reconciliation substrate: neither
+adapter currently persists Continuation intents, and acceptance, commit and
+evaluation are not wired to it. It is not a usable Continuation facility.
+Its source must retain unacknowledged markers across restarts and provide
+pagination cursors that remain valid when earlier markers are acknowledged.
 `NotificationWorker` claims and delivers intents independently, renews claims
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by
