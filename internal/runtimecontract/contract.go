@@ -69,6 +69,9 @@ func (h *host) Commit(_ context.Context, _ transition.TransitionLease[string],
 // Run checks a typed execution, durable commit and idempotent replay at runtime ports.
 func Run(t *testing.T, newStore func(*testing.T) Store) {
 	t.Helper()
+	t.Run("attempt timeout and deadline", func(t *testing.T) {
+		RunTiming(t, newStore)
+	})
 	t.Run("wakeup and polling", func(t *testing.T) {
 		RunWakeup(t, newStore)
 	})

@@ -42,6 +42,10 @@ type Fixture struct {
 }
 
 func Open(path string, clock func() time.Time) (*Fixture, error) {
+	return openWithDriver(path, clock, "sqlite3")
+}
+
+func openWithDriver(path string, clock func() time.Time, driver string) (*Fixture, error) {
 	if path == "" || path == ":memory:" || clock == nil {
 		return nil, ErrInvalidRequest
 	}
@@ -57,7 +61,7 @@ func Open(path string, clock func() time.Time) (*Fixture, error) {
 	query.Set("_foreign_keys", "on")
 	query.Set("_synchronous", "FULL")
 	uri.RawQuery = query.Encode()
-	db, err := sql.Open("sqlite3", uri.String())
+	db, err := sql.Open(driver, uri.String())
 	if err != nil {
 		return nil, fmt.Errorf("open fixture: %w", err)
 	}

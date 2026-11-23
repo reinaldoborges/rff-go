@@ -43,8 +43,13 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		if err := coordinator.Reconcile(ctx); err != nil {
 			t.Fatal(err)
 		}
-		for i, delay := range []time.Duration{time.Second, 3 * time.Second, 3 * time.Second} {
-			claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		var lostRetry transition.HookLease
+		for i, delay := range []time.Duration{time.Second, 3 * time.Second, 3 * time.Second, 3 * time.Second} {
+			ttl := time.Minute
+			if i == 2 {
+				ttl = time.Second
+			}
+			claim, err := store.ClaimHook(ctx, "worker", clock, ttl)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -52,13 +57,28 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 			if err != nil || (i == 0 && call.Kind != transition.HookEnter) || (i > 0 && call.Kind != transition.HookRetry) {
 				t.Fatalf("unexpected hook before retry %d: %+v, %v", i, call, err)
 			}
+			if i == 3 && (claim.ActivityID != lostRetry.ActivityID || claim.Generation <= lostRetry.Generation) {
+				t.Fatalf("unknown Retry was not directly redelivered: %+v", claim)
+			}
 			if _, err := store.StartHook(ctx, claim, clock); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.ReportHook(ctx, claim, transition.HookResult{
-				Failure: fsm.Failure{Code: "retryable"}, Disposition: fsm.DispositionRetry,
-			}, clock); err != nil {
-				t.Fatal(err)
+			if i == 2 {
+				lostRetry = claim
+				now = now.Add(ttl)
+				if err := coordinator.Reconcile(ctx); err != nil {
+					t.Fatal(err)
+				}
+				progress, err := store.ReadHookProgress(ctx, "execution")
+				if err != nil || len(progress.Attempts) != 3 || !progress.Attempts[2].Unknown {
+					t.Fatalf("lost Retry was not classified as unknown: %+v, %v", progress, err)
+				}
+			} else {
+				if err := store.ReportHook(ctx, claim, transition.HookResult{
+					Failure: fsm.Failure{Code: "retryable"}, Disposition: fsm.DispositionRetry,
+				}, clock); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := coordinator.Reconcile(ctx); err != nil {
 				t.Fatal(err)
@@ -352,7 +372,7 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 			transition.HookControl{ID: "retry-recovery", Action: transition.RetryIntervention}, check); err != nil {
 			t.Fatal(err)
 		}
-		resumed, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		resumed, err := store.ClaimHook(ctx, "worker", clock, time.Second)
 		if err != nil || resumed.ActivityID != recovery.ActivityID {
 			t.Fatalf("recovery retry changed identity: %+v, %v", resumed, err)
 		}
@@ -360,7 +380,33 @@ func RunRetryBudget(t *testing.T, newStore func(*testing.T) ControlStore) {
 		if err != nil || attempt.Attempt.Number != 3 {
 			t.Fatalf("recovery retry lost attempt history: %+v, %v", attempt, err)
 		}
-		if err := store.ReportHook(ctx, resumed, transition.HookResult{Success: true}, clock); err != nil {
+		now = now.Add(time.Second)
+		for range 2 {
+			if err := coordinator.Reconcile(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		record, err = store.InspectExecution(ctx, "execution")
+		if err != nil || record.Status != transition.NeedsIntervention {
+			t.Fatalf("unknown recovery did not require intervention: %+v, %v", record, err)
+		}
+		if _, err := store.ApplyCheckedHookControl(ctx, lease, clock,
+			transition.HookControl{ID: "retry-unknown-recovery", Action: transition.RetryIntervention}, check); err != nil {
+			t.Fatal(err)
+		}
+		redelivered, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+		if err != nil || redelivered.ActivityID != recovery.ActivityID || redelivered.Generation <= resumed.Generation {
+			t.Fatalf("unknown recovery was not directly redelivered: %+v, %v", redelivered, err)
+		}
+		_, call, err = store.InspectHook(ctx, redelivered, clock)
+		if err != nil || call.Kind != transition.HookRecover {
+			t.Fatalf("unknown recovery dispatched another hook: %+v, %v", call, err)
+		}
+		attempt, err = store.StartHook(ctx, redelivered, clock)
+		if err != nil || attempt.Attempt.Number != 4 {
+			t.Fatalf("unknown recovery lost attempt history: %+v, %v", attempt, err)
+		}
+		if err := store.ReportHook(ctx, redelivered, transition.HookResult{Success: true}, clock); err != nil {
 			t.Fatal(err)
 		}
 		if err := coordinator.Reconcile(ctx); err != nil {
