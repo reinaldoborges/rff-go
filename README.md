@@ -172,6 +172,30 @@ go test ./runtime
 go test ./internal/taskmanager
 ```
 
+## MySQL acceptance store
+
+`adapters/mysql` provides the same runtime persistence ports on MySQL 8.4 LTS
+or later, using InnoDB. `mysql.Open` takes a standard `database/sql` MySQL DSN
+that selects an application database and the same canonical identifier codecs
+as the SQLite adapter. The adapter opens and owns its connection pool; close
+the store when finished. Its versioned `rff_` schema is independent of
+SQLite's schema: it does not import, migrate, or read data from SQLite.
+The host owns application-domain tables.
+
+Adapter transactions acquire an InnoDB serialization row lock, including
+fenced leases and same-transaction host callbacks. The serialized transaction
+boundary deliberately mirrors SQLite's immediate transaction semantics and
+coordinates multiple adapter instances/processes. Identifier bytes are stored
+without prefix truncation; bounded prefix indexes only accelerate lookups, with
+exact-value checks and the serialization lock preserving full-key semantics.
+An incomplete, incompatible, or unsupported MySQL adapter schema is rejected;
+MySQL does not automatically migrate the separate SQLite schema.
+Run all eleven shared runtime persistence contract entry points and the
+MySQL-specific schema and concurrency tests locally with
+`./scripts/check-mysql.sh`, which requires `RFF_MYSQL_DSN` to point to a
+disposable MySQL 8.4 database with privileges to create and drop isolated test
+databases. The standard `./scripts/check.sh` and CI remain MySQL-independent.
+
 ## Local task-manager fixture
 
 The fixture CLI is for local development and conformance testing only. Seeded
