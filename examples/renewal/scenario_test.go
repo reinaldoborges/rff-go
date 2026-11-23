@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	driver "github.com/go-sql-driver/mysql"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -164,6 +168,64 @@ func TestAuthorizationAndSeparateStoreProtocols(t *testing.T) {
 	}
 }
 
+func TestWorkloadAuthorizationIsDecidedByHost(t *testing.T) {
+	host, err := OpenSQLite(sqlitePath(t, "workload-authorization"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	runWorkloadAuthorizationScenario(t, host)
+}
+
+func runWorkloadAuthorizationScenario(t *testing.T, host *Host) {
+	t.Helper()
+	ctx := context.Background()
+	allowedPlan := fmt.Sprintf("workload-allowed-%d", os.Getpid())
+	const period = "2026-11"
+	if _, err := host.Start(ctx, allowedPlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, allowedPlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("driving explicitly authorized workload on %s host", host.dialect)
+	if err := host.Drive(ctx); err != nil {
+		t.Fatalf("host-authorized workload did not complete renewal: %v", err)
+	}
+	allowed, err := host.Inspect(ctx, allowedPlan, period, "operator")
+	if err != nil || allowed.State != Renewed || allowed.Charges != 1 {
+		t.Fatalf("authorized workload did not complete renewal: status=%#v err=%v", allowed, err)
+	}
+
+	deniedPlan := fmt.Sprintf("workload-denied-%d", os.Getpid())
+	if _, err := host.Start(ctx, deniedPlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, deniedPlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetWorkloadAuthorization(ctx, deniedPlan, "renewal-worker", "untrusted", false); err == nil {
+		t.Fatal("unauthorized principal changed workload authorization")
+	}
+	if err := host.SetWorkloadAuthorization(ctx, deniedPlan, "renewal-worker", "operator", false); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("driving explicitly denied workload on %s host", host.dialect)
+	if err := host.Drive(ctx); !errors.Is(err, transition.ErrSuccessorDenied) {
+		t.Fatalf("host workload denial did not block successor acceptance: %v", err)
+	}
+	denied, err := host.Inspect(ctx, deniedPlan, period, "operator")
+	if err != nil || denied.State != Due || denied.Charges != 0 {
+		t.Fatalf("denied workload advanced or charged the plan: status=%#v err=%v", denied, err)
+	}
+}
+
 func TestStaleABAOriginIsSuperseded(t *testing.T) {
 	runtimePath := sqlitePath(t, "stale-runtime")
 	hostPath := sqlitePath(t, "stale-host")
@@ -172,6 +234,11 @@ func TestStaleABAOriginIsSuperseded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer host.Close()
+	runStaleABAOriginScenario(t, host)
+}
+
+func runStaleABAOriginScenario(t *testing.T, host *Host) {
+	t.Helper()
 	ctx := context.Background()
 	plan := "stale-" + strconv.Itoa(os.Getpid())
 	const period = "2026-11"
@@ -206,7 +273,7 @@ func TestStaleABAOriginIsSuperseded(t *testing.T) {
 		}
 		return tx.Commit()
 	}
-	err = host.Drive(ctx)
+	err := host.Drive(ctx)
 	if !errors.Is(err, transition.ErrSuccessorSuperseded) {
 		t.Fatalf("A-to-B-to-A origin race was not fenced: %v", err)
 	}
@@ -222,19 +289,102 @@ func TestMySQLHostScenarioAndProcessRestart(t *testing.T) {
 	if dsn == "" {
 		t.Skip("RFF_MYSQL_DSN is required for real MySQL host coverage")
 	}
-	plan := fmt.Sprintf("mysql-%d", os.Getpid())
+	databases := newRenewalMySQLDatabases(t, dsn, 3)
+	sharedDSN, separateRuntimeDSN, separateHostDSN := databases[0], databases[1], databases[2]
 	period := "2026-11"
-	start := runMySQLCLI(t, dsn, "-action", "start", "-plan", plan, "-period", period)
+	sharedPlan := fmt.Sprintf("mysql-shared-%d", os.Getpid())
+	start := runMySQLCLI(t, sharedDSN, "-action", "start", "-plan", sharedPlan, "-period", period)
 	if !strings.Contains(start, "state=AwaitingApproval") {
-		t.Fatalf("MySQL initialization did not commit: %s", start)
+		t.Fatalf("shared MySQL initialization did not commit: %s", start)
 	}
-	runMySQLCLI(t, dsn, "-action", "approve", "-plan", plan, "-period", period)
-	runMySQLCLI(t, dsn, "-action", "charge-once", "-provider-mode", "lost-response", "-plan", plan, "-period", period)
-	final := runMySQLCLI(t, dsn, "-action", "drive", "-plan", plan, "-period", period)
+	runMySQLCLI(t, sharedDSN, "-action", "approve", "-plan", sharedPlan, "-period", period)
+	runMySQLCLI(t, sharedDSN, "-action", "charge-once", "-provider-mode", "lost-response", "-plan", sharedPlan, "-period", period)
+	final := runMySQLCLI(t, sharedDSN, "-action", "drive", "-plan", sharedPlan, "-period", period)
 	if !strings.Contains(final, "states=[AwaitingApproval Due PaymentCaptured Renewed]") ||
 		!strings.Contains(final, "charges=1") {
-		t.Fatalf("MySQL host scenario did not reconcile after process restart: %s", final)
+		t.Fatalf("shared MySQL host scenario did not reconcile after process restart: %s", final)
 	}
+
+	separatePlan := fmt.Sprintf("mysql-separate-%d", os.Getpid())
+	separateStart := runMySQLCLI(t, separateRuntimeDSN,
+		"-host-dsn", separateHostDSN, "-action", "start", "-plan", separatePlan, "-period", period)
+	if !strings.Contains(separateStart, "state=AwaitingApproval") {
+		t.Fatalf("separate MySQL initialization did not commit: %s", separateStart)
+	}
+	runMySQLCLI(t, separateRuntimeDSN, "-host-dsn", separateHostDSN,
+		"-action", "approve", "-plan", separatePlan, "-period", period)
+	runMySQLCLI(t, separateRuntimeDSN, "-host-dsn", separateHostDSN,
+		"-action", "charge-once", "-provider-mode", "lost-response", "-plan", separatePlan, "-period", period)
+	separateFinal := runMySQLCLI(t, separateRuntimeDSN, "-host-dsn", separateHostDSN,
+		"-action", "drive", "-plan", separatePlan, "-period", period)
+	if !strings.Contains(separateFinal, "states=[AwaitingApproval Due PaymentCaptured Renewed]") ||
+		!strings.Contains(separateFinal, "charges=1") {
+		t.Fatalf("separate MySQL host scenario did not reconcile after process restart: %s", separateFinal)
+	}
+
+	sharedHost, err := OpenMySQL(sharedDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runWorkloadAuthorizationScenario(t, sharedHost)
+	if err := sharedHost.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	separateHost, err := OpenMySQLSeparate(separateRuntimeDSN, separateHostDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer separateHost.Close()
+	runStaleABAOriginScenario(t, separateHost)
+}
+
+func newRenewalMySQLDatabases(t *testing.T, dsn string, count int) []string {
+	t.Helper()
+	config, err := driver.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminDB, err := sql.Open("mysql", config.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version string
+	if err := adminDB.QueryRowContext(t.Context(), `SELECT VERSION()`).Scan(&version); err != nil {
+		_ = adminDB.Close()
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(version, "8.4.") {
+		_ = adminDB.Close()
+		t.Fatalf("host scenario requires MySQL 8.4, got %s", version)
+	}
+	t.Logf("running host scenario on MySQL %s", version)
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		t.Fatal(err)
+	}
+	var databases []string
+	t.Cleanup(func() {
+		for index := range databases {
+			name := fmt.Sprintf("rff_renewal_%s_%d", hex.EncodeToString(suffix[:]), index)
+			if _, err := adminDB.ExecContext(context.Background(), "DROP DATABASE `"+name+"`"); err != nil {
+				t.Error(err)
+			}
+		}
+		if err := adminDB.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	for index := 0; index < count; index++ {
+		name := fmt.Sprintf("rff_renewal_%s_%d", hex.EncodeToString(suffix[:]), index)
+		if _, err := adminDB.ExecContext(t.Context(), "CREATE DATABASE `"+name+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"); err != nil {
+			t.Fatal(err)
+		}
+		databaseConfig := *config
+		databaseConfig.DBName = name
+		databases = append(databases, databaseConfig.FormatDSN())
+	}
+	return databases
 }
 
 func sqlitePath(t *testing.T, name string) string {
@@ -264,7 +414,7 @@ func runMySQLCLI(t *testing.T, dsn string, args ...string) string {
 	command := exec.Command("go", commandArgs...)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("run MySQL renewal CLI %v: %v\n%s", args, err, output)
+		t.Fatalf("run MySQL renewal CLI: %v\n%s", err, output)
 	}
 	return string(output)
 }

@@ -323,6 +323,7 @@ func (h *Host) Close() error {
 func (h *Host) initialize() error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS renewal_plans (plan_id VARCHAR(255) PRIMARY KEY, period_id VARCHAR(255) NOT NULL, state VARCHAR(64) NOT NULL, revision BIGINT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS renewal_workload_grants (plan_id VARCHAR(255) NOT NULL, principal VARCHAR(255) NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (plan_id, principal))`,
 		`CREATE TABLE IF NOT EXISTS renewal_commit_receipts (execution_id VARCHAR(255) PRIMARY KEY, plan_id VARCHAR(255) NOT NULL, operation_id VARCHAR(255) NOT NULL, state VARCHAR(64) NOT NULL, revision BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_markers (execution_id VARCHAR(255) PRIMARY KEY, marker BLOB NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS renewal_fences (plan_id VARCHAR(255) PRIMARY KEY, execution_id VARCHAR(255) NOT NULL, origin_revision BIGINT NOT NULL)`,
@@ -457,6 +458,10 @@ func (h *Host) Start(ctx context.Context, plan, period string) (string, error) {
 		_ = tx.Rollback()
 		return "", err
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_workload_grants (plan_id, principal, allowed) VALUES (?, 'renewal-worker', 1)`, plan); err != nil && !isDuplicate(err) {
+		_ = tx.Rollback()
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
@@ -491,6 +496,41 @@ func (h *Host) Approve(ctx context.Context, plan, period, principal string) (str
 		return "", err
 	}
 	return execution.ID, nil
+}
+
+func (h *Host) SetWorkloadAuthorization(ctx context.Context, plan, workload, actor string, allowed bool) error {
+	if actor != "operator" {
+		return errors.New("workload authorization denied")
+	}
+	if plan == "" || workload != "renewal-worker" {
+		return transition.ErrInvalidRequest
+	}
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	var planID string
+	if err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT plan_id FROM renewal_plans WHERE plan_id = ?`), plan).Scan(&planID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	var current int
+	err = tx.QueryRowContext(ctx, h.lockQuery(`SELECT allowed FROM renewal_workload_grants WHERE plan_id = ? AND principal = ?`),
+		plan, workload).Scan(&current)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `INSERT INTO renewal_workload_grants (plan_id, principal, allowed) VALUES (?, ?, ?)`,
+			plan, workload, allowed)
+	case err != nil:
+	default:
+		_, err = tx.ExecContext(ctx, `UPDATE renewal_workload_grants SET allowed = ? WHERE plan_id = ? AND principal = ?`,
+			allowed, plan, workload)
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (h *Host) checkPlan(ctx context.Context, plan, period string, state State) error {
@@ -1027,18 +1067,25 @@ func (h *Host) acceptSuccessorTx(ctx context.Context, tx *sql.Tx, binding transi
 		return transition.SuccessorHostResult[string, State]{Outcome: transition.SuccessorHostSuperseded, Cancellation: &cancellation}, nil
 	}
 	var completed int
+	principal, allowed, err := h.authorizeRenewalWorkload(ctx, tx, binding, periodID)
+	if err != nil {
+		return transition.SuccessorHostResult[string, State]{}, err
+	}
+	if !allowed {
+		return h.persistSuccessorDenial(ctx, tx, binding, principal)
+	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM renewal_completed_periods WHERE plan_id = ? AND period_id = ?`, binding.Origin.Entity, periodID).Scan(&completed); err != nil {
 		return transition.SuccessorHostResult[string, State]{}, err
 	}
 	if completed != 0 {
-		return transition.SuccessorHostResult[string, State]{Outcome: transition.SuccessorHostDenied, Principal: "renewal-worker"}, nil
+		return h.persistSuccessorDenial(ctx, tx, binding, principal)
 	}
 	bindingData, err := json.Marshal(binding)
 	if err != nil {
 		return transition.SuccessorHostResult[string, State]{}, err
 	}
 	receipt := transition.SuccessorReceipt[string, State]{
-		Binding: binding, Principal: "renewal-worker", Decision: "allowed", AcceptedAt: h.clock(),
+		Binding: binding, Principal: principal, Decision: "allowed", AcceptedAt: h.clock(),
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_successors (origin_execution_id, binding, outcome, principal, decision, accepted_at, cancellation) VALUES (?, ?, 'accepted', ?, ?, ?, NULL)`,
 		binding.Origin.ExecutionID, bindingData, receipt.Principal, receipt.Decision, receipt.AcceptedAt); err != nil {
@@ -1049,6 +1096,46 @@ func (h *Host) acceptSuccessorTx(ctx context.Context, tx *sql.Tx, binding transi
 		return transition.SuccessorHostResult[string, State]{}, err
 	}
 	return transition.SuccessorHostResult[string, State]{Outcome: transition.SuccessorHostAccepted, Receipt: &receipt}, nil
+}
+
+func (h *Host) authorizeRenewalWorkload(ctx context.Context, tx *sql.Tx, binding transition.SuccessorBinding[string, State], period string) (string, bool, error) {
+	if binding.Execution.Input.Codec != (transition.CodecVersion{Name: "renewal-json", Version: "1"}) {
+		return "", false, transition.ErrCompatibility
+	}
+	var input Input
+	if err := json.Unmarshal(binding.Execution.Input.Data, &input); err != nil {
+		return "", false, transition.ErrCompatibility
+	}
+	if input.PlanID != binding.Origin.Entity || input.PeriodID != period || input.Principal == "" {
+		return "", false, transition.ErrConflict
+	}
+	var allowed int
+	err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT allowed FROM renewal_workload_grants WHERE plan_id = ? AND principal = ?`),
+		input.PlanID, input.Principal).Scan(&allowed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return input.Principal, false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return input.Principal, allowed == 1, nil
+}
+
+func (h *Host) persistSuccessorDenial(
+	ctx context.Context,
+	tx *sql.Tx,
+	binding transition.SuccessorBinding[string, State],
+	principal string,
+) (transition.SuccessorHostResult[string, State], error) {
+	bindingData, err := json.Marshal(binding)
+	if err != nil {
+		return transition.SuccessorHostResult[string, State]{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_successors (origin_execution_id, binding, outcome, principal, decision, accepted_at, cancellation) VALUES (?, ?, 'denied', ?, 'denied', ?, NULL)`,
+		binding.Origin.ExecutionID, bindingData, principal, h.clock()); err != nil {
+		return transition.SuccessorHostResult[string, State]{}, err
+	}
+	return transition.SuccessorHostResult[string, State]{Outcome: transition.SuccessorHostDenied, Principal: principal}, nil
 }
 
 func (h *Host) CancelContinuationSuccessor(ctx context.Context, binding transition.SuccessorBinding[string, State]) (transition.SuccessorHostResult[string, State], error) {

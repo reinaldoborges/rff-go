@@ -38,7 +38,10 @@ commit `Due`, and then lets durable Continuations request `PaymentCaptured` and
 `Renewed`. The charge is a tracked operation in the `PaymentCaptured` target
 hook, before that state commits. The host owns the plan-period guard, committed
 revision, workload/operator authorization, safe inspection, provider evidence,
-and refund recovery.
+and refund recovery. Starting a plan provisions an explicit grant for the
+`renewal-worker`; continuation acceptance checks that grant and the committed
+origin revision in the host transaction. `Host.SetWorkloadAuthorization`
+changes the grant only for an authorized operator.
 
 Each command opens and closes its database, so the following commands exercise
 recovery across actual process restarts. A lost response applies the provider
@@ -94,6 +97,11 @@ disposable MySQL 8.4 database:
 go run ./examples/renewal -backend mysql -dsn "$RFF_MYSQL_DSN"
 go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1
 ```
+
+The explicit MySQL host test creates isolated schemas and runs real-process
+restart scenarios against both shared and separate runtime/host stores. It
+checks workload allow/deny decisions on MySQL and uses a deterministic
+A-to-B-to-A barrier for stale-origin fencing.
 
 The fixture tests include shared-store SQLite, separate-store SQLite, actual
 process restarts, an inconclusive/late-call barrier, a stale A-to-B-to-A origin
