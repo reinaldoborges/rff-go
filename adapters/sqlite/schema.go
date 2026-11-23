@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 11
+	adapterSchemaVersion = 12
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -23,6 +23,7 @@ const (
 	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	continuationsDDL     = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	successorsDDL        = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE, phase TEXT NOT NULL, record BLOB NOT NULL)`
 	operationsDDL        = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
 )
 
@@ -37,7 +38,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, operationsExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, successorsExist, operationsExist bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
@@ -48,6 +49,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		"rff_timers":            &timersExist,
 		"rff_inputs":            &inputsExist,
 		"rff_continuations":     &continuationsExist,
+		"rff_successors":        &successorsExist,
 		"rff_operations":        &operationsExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
@@ -55,12 +57,12 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || operationsExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || successorsExist || operationsExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (11)`,
+			`INSERT INTO rff_schema_version (version) VALUES (12)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -69,6 +71,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			timersDDL,
 			inputsDDL,
 			continuationsDDL,
+			successorsDDL,
 			operationsDDL,
 		}
 		for _, statement := range statements {
@@ -284,6 +287,21 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		if schemaVersion < 11 {
 			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 11`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
+		if !successorsExist {
+			return fmt.Errorf("%w: successor table missing", ErrUnsupportedSchema)
+		}
+		var definition string
+		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_successors'`).Scan(&definition); err != nil || definition != successorsDDL {
+			return fmt.Errorf("%w: incompatible successor table", ErrUnsupportedSchema)
+		}
+		if err := s.validateSuccessors(ctx, tx); err != nil {
+			return err
+		}
+		if schemaVersion < adapterSchemaVersion {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 12`); err != nil {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}

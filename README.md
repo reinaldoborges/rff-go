@@ -124,8 +124,31 @@ receipt and original reservation release. Missing origins return
 `ErrContinuationOriginMissing`; discovery leaves those host markers
 unacknowledged for retry, and readiness diagnoses previously stored orphans.
 Evaluation is not implemented.
+The successor-acceptance substrate reserves a stable binding before a
+separate-store host records its authorization, origin revision, receipt and
+durable writer fence. Schedule `SuccessorRecovery.Reconcile` to resolve
+uncertain outcomes; lack of a response is not evidence that acceptance failed.
+For a shared database, `AcceptSuccessorAtomicDecision` runs the host's origin
+check, authorization, audit and fence in the adapter transaction and retains
+definitive denial or supersession. Host integration
+must enforce the fence for every state writer and release it only with a
+fenced cancellation or safe completion. A host unable to do so must reject
+acceptance. The receipt timestamp starts the execution deadline; host and
+runtime clocks must be compatible.
+
+Preparation, inspection, finalization and atomic adapter callbacks are
+trusted internal primitives, not externally authorized endpoints. Use
+`Acceptor.ReplaySuccessor` and `Acceptor.InspectSuccessor` with host disclosure
+authorization, and authorize any other disclosure separately. Internal recovery must remain
+available without replay permission. Definitive authorization denial blocks
+new delivery; audited retry controls and Continuation evaluation are not yet
+implemented.
 Its source must retain unacknowledged markers across restarts and provide
 pagination cursors that remain valid when earlier markers are acknowledged.
+The separate-host cancellation restart contract can be run on both adapters
+with `go test ./adapters/sqlite ./adapters/mysql -run '^TestSuccessorCancellationProcessRestart$' -count=1`
+and a disposable MySQL DSN. Its SQLite host is a test fixture, not a
+production fencing implementation.
 `NotificationWorker` claims and delivers intents independently, renews claims
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by
@@ -189,6 +212,7 @@ rewriting them. Fresh stores include the operation tables; pre-operation
 stores without them are incompatible and are not migrated or backfilled.
 Operation-only version 10 stores are upgraded transactionally with the
 Continuation table; continuation-only version 10 stores are incompatible.
+Stores without the successor table are incompatible and are not backfilled.
 Unreadable operation records are isolated to the affected identity or scan.
 Older adapter versions cannot open the new schema.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
