@@ -47,7 +47,7 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 				return errors.Join(err, rows.Close())
 			}
 			var execution diskRecord
-			if err := json.Unmarshal(executionData, &execution); err != nil || execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != candidateID {
+			if err := json.Unmarshal(executionData, &execution); err != nil || !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != candidateID {
 				return errors.Join(fmt.Errorf("%w: invalid hook execution", ErrUnsupportedSchema), err, rows.Close())
 			}
 			if (candidate.Progress.Dispatch.Kind == transition.HookRecover && execution.Status != transition.Aborting) ||
@@ -168,7 +168,7 @@ func (s *Store[EntityID, StateID]) StartHook(ctx context.Context, lease transiti
 		if err := json.Unmarshal(data, &execution); err != nil {
 			return fmt.Errorf("%w: decode hook execution: %w", ErrUnsupportedSchema, err)
 		}
-		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+		if !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != lease.ExecutionID {
 			return fmt.Errorf("%w: invalid hook execution", ErrUnsupportedSchema)
 		}
 		if (work.Progress.Dispatch.Kind == transition.HookRecover && execution.Status != transition.Aborting) ||

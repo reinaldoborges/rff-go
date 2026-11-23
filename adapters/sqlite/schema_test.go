@@ -19,6 +19,8 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"future adapter version", `UPDATE rff_schema_version SET version = 99`},
 		{"incomplete tables", `DROP TABLE rff_active`},
 		{"pre-operation store", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 9`},
+		{"continuation-only version ten", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 10`},
+		{"missing continuation table", `DROP TABLE rff_continuations`},
 		{"missing unique constraint", `DROP TABLE rff_executions; CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL)`},
 		{"unreadable record", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', X'ff')`},
 		{"future record version", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":99,"ID":"id","Key":"key"}')`},

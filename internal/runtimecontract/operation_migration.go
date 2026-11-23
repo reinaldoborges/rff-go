@@ -30,6 +30,10 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
 			Status: transition.Waiting, Deadline: now.Add(time.Hour),
 			Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			Continuation: &transition.ContinuationSnapshot{
+				MachineID: "machine", MachineVersion: "1",
+				Policy: fsm.Policy{MaxAttempts: 3, AttemptTimeout: time.Minute, OverallTimeout: time.Hour, RetryDelays: []time.Duration{time.Second}},
+			},
 		}, nil
 	})
 	if err != nil {
@@ -99,13 +103,23 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 	validated := false
 	verifiedMigrator, err := transition.NewExecutionMigrator[string, string, string, string](store, runner,
 		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationRequest) (transition.MigrationSnapshot[string], error) {
+			if source.Continuation == nil || source.Continuation.MachineVersion != "1" || len(source.Operations) != 2 {
+				t.Fatal("converter did not receive both pinned continuation and operations")
+			}
+			source.Continuation.MachineVersion = "tampered"
+			source.Continuation.Policy.RetryDelays[0] = 2 * time.Second
+			source.Operations[0].Binding.Input[0] = 'X'
 			return transition.MigrationSnapshot[string]{MachineID: "machine", MachineVersion: "2", Target: "open", Input: source.Input, Policy: source.Policy}, nil
 		},
-		func(context.Context, transition.MigrationSource[string], transition.MigrationSnapshot[string]) error {
+		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationSnapshot[string]) error {
+			if source.Continuation == nil || source.Continuation.MachineVersion != "1" || source.Continuation.Policy.RetryDelays[0] != time.Second {
+				return errors.New("continuation binding changed before domain verification")
+			}
 			return nil
 		},
 		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationSnapshot[string]) error {
-			if len(source.Operations) != 2 {
+			if len(source.Operations) != 2 || string(source.Operations[0].Binding.Input) != "amount=100" ||
+				source.Continuation == nil || source.Continuation.MachineVersion != "1" {
 				return errors.New("operation bindings missing from compatibility verification")
 			}
 			validated = true
@@ -117,6 +131,11 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 	_, err = verifiedMigrator.Migrate(ctx, fence, clock, transition.MigrationRequest{ID: "migration", MachineID: "machine", MachineVersion: "2"})
 	if err != nil || !validated {
 		t.Fatalf("compatible operation migration failed: validated=%v err=%v", validated, err)
+	}
+	execution, err := store.ReadActiveExecution(ctx, "execution")
+	if err != nil || execution.Continuation == nil || execution.Continuation.MachineVersion != "1" ||
+		execution.Continuation.Policy.RetryDelays[0] != time.Second {
+		t.Fatalf("migration changed pinned continuation: %+v %v", execution.Continuation, err)
 	}
 	inspection, err := store.InspectTrackedOperation(ctx, binding.Identity)
 	if err != nil || inspection.Result == nil || string(inspection.Result.Data) != "receipt" {

@@ -103,6 +103,19 @@ driving both scans in one process.
 outbox handoff. Unknown handoff outcomes are retried; definitive failures require
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
+`ContinuationDiscovery` and the adapters' durable marker stores are an
+incomplete reconciliation substrate, not a usable Continuation facility.
+Acceptance pins an opted-in target's policy; the shared-store commit writes a
+marker atomically. Separate-store hosts must attest to atomically retaining a
+replayable marker before commit, and schedule discovery. Receipt reconciliation
+waits for the matching runtime marker. Listing a marker does not establish that
+its origin is ready for evaluation; `ContinuationReady` checks the successful
+receipt and original reservation release. Missing origins return
+`ErrContinuationOriginMissing`; discovery leaves those host markers
+unacknowledged for retry, and readiness diagnoses previously stored orphans.
+Evaluation is not implemented.
+Its source must retain unacknowledged markers across restarts and provide
+pagination cursors that remain valid when earlier markers are acknowledged.
 `NotificationWorker` claims and delivers intents independently, renews claims
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by
@@ -164,6 +177,8 @@ requirements. In-memory databases are not supported by this adapter.
 The adapter owns its `rff_` tables and rejects unsupported schemas without
 rewriting them. Fresh stores include the operation tables; pre-operation
 stores without them are incompatible and are not migrated or backfilled.
+Operation-only version 10 stores are upgraded transactionally with the
+Continuation table; continuation-only version 10 stores are incompatible.
 Unreadable operation records are isolated to the affected identity or scan.
 Older adapter versions cannot open the new schema.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
@@ -235,7 +250,8 @@ coordinates multiple adapter instances/processes. Identifier bytes are stored
 without prefix truncation; bounded prefix indexes only accelerate lookups, with
 exact-value checks and the serialization lock preserving full-key semantics.
 An incomplete, incompatible, or unsupported MySQL adapter schema is rejected;
-MySQL does not automatically migrate the separate SQLite schema.
+MySQL does not automatically migrate older adapter schemas, including
+version 2 stores from either feature branch.
 Run the shared runtime persistence contract entry points and the
 MySQL-specific schema and concurrency tests locally with
 `./scripts/check-mysql.sh`, which requires `RFF_MYSQL_DSN` to point to a

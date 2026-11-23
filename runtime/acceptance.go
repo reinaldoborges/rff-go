@@ -182,6 +182,10 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 	if err := validatePolicy(selected.Policy); err != nil {
 		return nil, err
 	}
+	var continuation *ContinuationSnapshot
+	if policy, enabled := machine.ContinuationPolicy(selected.Target); enabled {
+		continuation = &ContinuationSnapshot{MachineID: request.MachineID, MachineVersion: request.MachineVersion, Policy: policy}
+	}
 	id, err := a.newID()
 	if err != nil {
 		return nil, fmt.Errorf("allocate execution ID: %w", err)
@@ -205,7 +209,7 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 		MachineID: request.MachineID, MachineVersion: request.MachineVersion,
 		Previous: previous, HasPrevious: request.HasPrevious, Target: selected.Target,
 		Event: event, Input: EncodedValue{Codec: request.InputCodec, Data: slices.Clone(inputData)},
-		NotificationOverride: request.Notification, Notify: notify, Policy: selected.Policy,
+		NotificationOverride: request.Notification, Notify: notify, Policy: selected.Policy, Continuation: continuation,
 		AcceptedAt: now, Deadline: now.Add(selected.Policy.OverallTimeout), Status: Waiting,
 	}, nil
 }

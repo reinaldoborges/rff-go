@@ -93,13 +93,14 @@ func (NoopHandler[EntityID, StateID, Event, Input]) Recover(context.Context, Exe
 // return only failure data safe to persist. An absent classifier is reported
 // when classification is requested.
 type Config[EntityID comparable, StateID comparable, Event, Input any] struct {
-	ID               string
-	Version          string
-	InitialStates    []StateID
-	TerminalStates   []StateID
-	Handlers         map[StateID]Handler[EntityID, StateID, Event, Input]
-	SelectInitial    func(Input) (Selection[StateID], error)
-	SelectTransition func(StateID, Event, Input) (Selection[StateID], error)
+	ID                   string
+	Version              string
+	InitialStates        []StateID
+	TerminalStates       []StateID
+	Handlers             map[StateID]Handler[EntityID, StateID, Event, Input]
+	ContinuationPolicies map[StateID]Policy
+	SelectInitial        func(Input) (Selection[StateID], error)
+	SelectTransition     func(StateID, Event, Input) (Selection[StateID], error)
 	// Reopens explicitly identifies allowed transitions from terminal states.
 	Reopens         func(StateID, Event, Input) bool
 	ClassifyFailure func(error) (Failure, Disposition)
@@ -136,10 +137,30 @@ func NewMachine[EntityID comparable, StateID comparable, Event, Input any](confi
 			return nil, fmt.Errorf("%w: terminal state is not registered", ErrInvalidMachine)
 		}
 	}
+	config.ContinuationPolicies = maps.Clone(config.ContinuationPolicies)
+	for state, policy := range config.ContinuationPolicies {
+		if _, ok := config.Handlers[state]; !ok || policy.MaxAttempts == 0 || policy.AttemptTimeout <= 0 || policy.OverallTimeout <= 0 {
+			return nil, fmt.Errorf("%w: invalid continuation state or policy", ErrInvalidMachine)
+		}
+		for _, delay := range policy.RetryDelays {
+			if delay < 0 {
+				return nil, fmt.Errorf("%w: invalid continuation retry delay", ErrInvalidMachine)
+			}
+		}
+		policy.RetryDelays = slices.Clone(policy.RetryDelays)
+		config.ContinuationPolicies[state] = policy
+	}
 	config.InitialStates = slices.Clone(config.InitialStates)
 	config.TerminalStates = slices.Clone(config.TerminalStates)
 	config.Handlers = maps.Clone(config.Handlers)
 	return &Machine[EntityID, StateID, Event, Input]{config: config}, nil
+}
+
+// ContinuationPolicy returns the explicit target-state policy, when enabled.
+func (m *Machine[EntityID, StateID, Event, Input]) ContinuationPolicy(target StateID) (Policy, bool) {
+	policy, enabled := m.config.ContinuationPolicies[target]
+	policy.RetryDelays = slices.Clone(policy.RetryDelays)
+	return policy, enabled
 }
 
 // ID returns the stable application-owned machine identifier.

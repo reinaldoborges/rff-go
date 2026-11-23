@@ -23,6 +23,15 @@ type localCommitHost struct {
 	loseReply  bool
 }
 
+func (*localCommitHost) ContinuationCommitSupported() bool { return true }
+
+type unpreparedContinuationHost struct{ calls int }
+
+func (h *unpreparedContinuationHost) Commit(context.Context, transition.TransitionLease[string], transition.Execution[string, string]) (transition.CommitReceipt, error) {
+	h.calls++
+	return transition.CommitReceipt{}, errors.New("host should not be called")
+}
+
 func (h *localCommitHost) Commit(ctx context.Context, lease transition.TransitionLease[string], _ transition.Execution[string, string]) (transition.CommitReceipt, error) {
 	receipt, err := h.store.CommitAtomic(ctx, lease, h.clock, func(ctx context.Context, tx *sql.Tx, execution transition.Execution[string, string]) (transition.CommitReceipt, error) {
 		h.calls++
@@ -85,8 +94,9 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 		_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 			return &transition.Execution[string, string]{
 				SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
-				Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting,
-				Notify: true, AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
+				Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting, MachineID: "task", MachineVersion: "1",
+				Continuation: &transition.ContinuationSnapshot{MachineID: "task", MachineVersion: "1", Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Second, OverallTimeout: time.Minute}},
+				Notify:       true, AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
 					MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 				},
 			}, nil
@@ -123,6 +133,9 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 		}
 		if err := coordinator.Reconcile(ctx); err == nil {
 			t.Fatal("lost rejection response was not reported")
+		}
+		if markers, err := store.ContinuationMarkers(ctx); err != nil || len(markers) != 0 {
+			t.Fatalf("rejected commit created continuation: %+v, %v", markers, err)
 		}
 		rejected, err := store.ReadActiveExecution(ctx, "execution")
 		if err != nil || rejected.Status != transition.CommitRejected || rejected.CommitReceipt == nil {
@@ -211,8 +224,9 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution",
-			Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting,
-			Notify: true, AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
+			Entity: "entity", Key: "key", Operation: transition.Initialize, Target: "target", Status: transition.Waiting, MachineID: "task", MachineVersion: "1",
+			Continuation: &transition.ContinuationSnapshot{MachineID: "task", MachineVersion: "1", Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Second, OverallTimeout: time.Minute}},
+			Notify:       true, AcceptedAt: now, Deadline: now.Add(time.Hour), Policy: fsm.Policy{
 				MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour,
 			},
 		}, nil
@@ -237,8 +251,24 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 	if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, clock); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkWorkSuccess(ctx, fence, clock); err != nil {
+	operationID, err := store.MarkWorkSuccess(ctx, fence, clock)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if err := store.RecordCommitReceipt(ctx, fence, clock, transition.CommitReceipt{
+		ExecutionID: "execution", OperationID: operationID, Outcome: transition.CommitSucceeded,
+	}); !errors.Is(err, transition.ErrContinuationPending) {
+		t.Fatalf("receipt without durable continuation marker should remain pending: %v", err)
+	}
+	unprepared := &unpreparedContinuationHost{}
+	unpreparedCoordinator, err := transition.NewCommitCoordinator[string, string](store, unprepared, transition.CoordinatorConfig{
+		ID: "coordinator", Clock: clock, LeaseTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unpreparedCoordinator.Reconcile(ctx); !errors.Is(err, transition.ErrContinuationUnavailable) || unprepared.calls != 0 {
+		t.Fatalf("unsupported host was allowed to commit: calls=%d err=%v", unprepared.calls, err)
 	}
 	host := &localCommitHost{store: store, clock: clock, fail: true}
 	coordinator, err := transition.NewCommitCoordinator[string, string](store, host, transition.CoordinatorConfig{
@@ -249,6 +279,9 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 	}
 	if err := coordinator.Reconcile(ctx); err == nil {
 		t.Fatal("injected failure was not reported")
+	}
+	if markers, err := store.ContinuationMarkers(ctx); err != nil || len(markers) != 0 {
+		t.Fatalf("rolled-back commit created continuation: %+v, %v", markers, err)
 	}
 	db, err = sql.Open("sqlite3", path)
 	if err != nil {
@@ -303,6 +336,10 @@ func TestAtomicCommitRollsBackAndEnqueuesNotification(t *testing.T) {
 	}
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if markers, err := store.ContinuationMarkers(ctx); err != nil || len(markers) != 1 ||
+		markers[0].ExecutionID != "execution" || markers[0].MachineVersion != "1" {
+		t.Fatalf("successful commit did not retain continuation: %+v, %v", markers, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
