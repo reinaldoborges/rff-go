@@ -64,6 +64,10 @@ func TestRuntimeOperationMigration(t *testing.T) {
 	runtimecontract.RunOperationMigration(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
 }
 
+func TestRuntimeMigrationWithoutProvider(t *testing.T) {
+	runtimecontract.RunMigrationWithoutProvider(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
+}
+
 func TestOperationProcessRestart(t *testing.T) {
 	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
 		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})

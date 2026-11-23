@@ -91,12 +91,16 @@ guarantee.
 An execution migration with tracked operations requires the optional operation
 compatibility verifier passed to `NewExecutionMigrator`. It receives the
 recorded bindings and outcomes and must prove that the destination can honor
-them, including any immutable references. Without that proof migration blocks.
+them, including provider identity, result codecs, immutable references,
+prerequisites and evidence. Set `OperationRequest.Provider` to a stable,
+non-secret provider identity before dispatch; migration blocks if any recorded
+operation lacks it or if compatibility cannot be proved. Evidence for a
+pinned provider must identify the same provider.
 Successful migration fences the prior coordinator and hook claims; the
 coordinator must acquire a fresh transition lease before resuming.
 The shared migration and process-restart contracts run against both adapters
 with a disposable MySQL DSN:
-`go test ./adapters/sqlite ./adapters/mysql -run '^(TestRuntimeMigrationContract|TestRuntimeOperationMigration|TestContinuationMigrationContract|TestMigrationOperationProcessRestart)$' -count=1`.
+`go test ./adapters/sqlite ./adapters/mysql -run '^(TestRuntimeMigrationContract|TestRuntimeOperationMigration|TestRuntimeMigrationWithoutProvider|TestContinuationMigrationContract|TestMigrationOperationProcessRestart|TestMigrationWriteProcessCrash)$' -count=1`.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
 `RunReconciliation` can schedule these scans using a bounded `WakeupQueue` and

@@ -105,7 +105,7 @@ func TestTrackedOperationReplaysWithinHook(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	codec := transition.CodecVersion{Name: "result", Version: "1"}
 	req := transition.OperationRequest{
-		Key: "charge", Kind: "charge", BehaviorVersion: "1",
+		Key: "charge", Kind: "charge", Provider: "provider-a", BehaviorVersion: "1",
 		ComparatorVersion: "bytes-v1", Input: []byte("amount=100"),
 		ResultCodec:   codec,
 		Preflight:     func(context.Context) error { return nil },
@@ -169,6 +169,11 @@ func TestTrackedOperationReplaysWithinHook(t *testing.T) {
 		changed.Input = []byte("amount=200")
 		if _, err := transition.TrackOperation(ctx, changed, dispatch); !errors.Is(err, transition.ErrConflict) {
 			return errors.New("changed input did not conflict")
+		}
+		changed = req
+		changed.Provider = "provider-b"
+		if _, err := transition.TrackOperation(ctx, changed, dispatch); !errors.Is(err, transition.ErrConflict) {
+			return errors.New("changed provider did not conflict")
 		}
 		decline := req
 		decline.Key = "decline"
@@ -284,5 +289,9 @@ func TestTrackedOperationReplaysWithinHook(t *testing.T) {
 	progress, err := store.ReadHookProgress(ctx, "execution")
 	if err != nil || !progress.Completed || !progress.Result.Success || dispatches != 1 {
 		t.Fatalf("tracked replay failed: progress=%+v dispatches=%d err=%v", progress, dispatches, err)
+	}
+	inspection, err := store.InspectTrackedOperation(ctx, transition.OperationIdentity{ExecutionID: "execution", Key: "charge"})
+	if err != nil || inspection.Binding.Provider != req.Provider {
+		t.Fatalf("provider identity was not persisted: %+v %v", inspection.Binding, err)
 	}
 }

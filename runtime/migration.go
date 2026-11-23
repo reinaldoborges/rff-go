@@ -83,8 +83,9 @@ type MigrationStore[EntityID comparable, StateID comparable] interface {
 // verifies the converted source against authoritative state and proves the
 // destination can honor any pinned Continuation behavior and policy.
 // The optional operation verifier is mandatory when any tracked operation
-// exists; it must prove the destination can honor every original binding and
-// outcome.
+// exists; it must prove the destination can honor every original binding,
+// provider, result, immutable reference, prerequisite and evidence record.
+// Operations lacking a pinned provider cannot be migrated.
 type ExecutionMigrator[EntityID comparable, StateID comparable, Event, Input any] struct {
 	store            MigrationStore[EntityID, StateID]
 	runner           *HookRunner[EntityID, StateID, Event, Input]
@@ -182,6 +183,11 @@ func (m *ExecutionMigrator[EntityID, StateID, Event, Input]) Migrate(
 				return err
 			}
 			if len(source.Operations) != 0 {
+				for _, operation := range source.Operations {
+					if operation.Binding.Provider == "" {
+						return fmt.Errorf("%w: operation provider identity is unavailable", ErrCompatibility)
+					}
+				}
 				if m.verifyOperations == nil {
 					return fmt.Errorf("%w: operation migration verifier is unavailable", ErrCompatibility)
 				}

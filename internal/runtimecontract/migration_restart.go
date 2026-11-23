@@ -15,6 +15,7 @@ import (
 
 const MigrationRestartAddress = "RFF_MIGRATION_RESTART_ADDRESS"
 const migrationRestartPhase = "RFF_MIGRATION_RESTART_PHASE"
+const MigrationWriteCrashAddress = "RFF_MIGRATION_WRITE_CRASH_ADDRESS"
 
 type MigrationRestartStore interface {
 	OperationMigrationStore
@@ -55,7 +56,9 @@ func migrationRestartMigrator(t *testing.T, store MigrationRestartStore, crash b
 			return nil
 		},
 		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationSnapshot[string]) error {
-			if source.Operations[0].Binding.Identity != restartBinding().Identity || !source.Operations[0].MayHaveDispatched {
+			if source.Operations[0].Binding.Identity != restartBinding().Identity ||
+				source.Operations[0].Binding.Provider != restartBinding().Provider ||
+				source.Operations[0].Binding.BehaviorVersion != restartBinding().BehaviorVersion || !source.Operations[0].MayHaveDispatched {
 				return errors.New("original unknown operation missing")
 			}
 			if crash {
@@ -88,6 +91,115 @@ func MigrationRestartChild(t *testing.T, open func(string) (MigrationRestartStor
 		t.Fatal(err)
 	}
 	os.Exit(73)
+}
+
+// RunMigrationWriteCrash injects process loss at a database write boundary.
+// The adapter-specific trigger must stop the child only after reaching the
+// requested statement; it is removed before the store is reopened.
+func RunMigrationWriteCrash(t *testing.T, address string, open func(string) (MigrationRestartStore, error), install func() error, crash func(*exec.Cmd) error, remove func() error) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store, err := open(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour}
+	_, _, err = store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "key",
+			MachineID: "machine", MachineVersion: "1", Operation: transition.Initialize, Target: "open",
+			Input:  transition.EncodedValue{Codec: transition.CodecVersion{Name: "input", Version: "1"}, Data: []byte("payload")},
+			Status: transition.Waiting, Deadline: now.Add(time.Hour), Policy: policy,
+			Continuation: &transition.ContinuationSnapshot{MachineID: "machine", MachineVersion: "1", Policy: policy},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, claim, clock); err != nil {
+		t.Fatal(err)
+	}
+	binding := restartBinding()
+	if _, started, err := store.BeginTrackedOperation(ctx, claim, clock, binding, operationInputEqual); err != nil || !started {
+		t.Fatalf("start unknown call: started=%v err=%v", started, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := install(); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestMigrationWriteProcessCrash$")
+	command.Env = append(os.Environ(), MigrationWriteCrashAddress+"="+address, MigrationRestartAddress+"="+address, migrationRestartPhase+"=commit")
+	var output bytes.Buffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := crash(command); err != nil {
+		t.Fatalf("crash at write boundary: %v\n%s", err, output.String())
+	}
+	if err := remove(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = open(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	record, err := store.ReadActiveExecution(ctx, "execution")
+	if err != nil || record.MachineVersion != "1" || len(record.Migrations) != 0 || record.Continuation == nil || record.Continuation.MachineVersion != "1" {
+		t.Fatalf("crash left partial execution: %+v %v", record, err)
+	}
+	inspection, err := store.InspectTrackedOperation(ctx, binding.Identity)
+	if err != nil || inspection.Binding.Provider != binding.Provider || inspection.Result != nil || !inspection.MayHaveDispatched {
+		t.Fatalf("crash lost operation binding: %+v %v", inspection, err)
+	}
+	if _, err := store.RenewHook(ctx, claim, clock, time.Minute); err != nil {
+		t.Fatalf("crash left partial hook fence: %v", err)
+	}
+	currentFence, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", clock, time.Hour)
+	if err != nil || currentFence.Generation != fence.Generation {
+		t.Fatalf("crash left partial transition fence: %+v %v", currentFence, err)
+	}
+	migrator := migrationRestartMigrator(t, store, false)
+	if _, err := migrator.Migrate(ctx, fence, clock, transition.MigrationRequest{ID: "migration", MachineID: "machine", MachineVersion: "2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = open(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.ReadActiveExecution(ctx, "execution")
+	if err != nil || record.MachineVersion != "2" || len(record.Migrations) != 1 || record.Continuation.MachineVersion != "1" {
+		t.Fatalf("retried migration was not complete: %+v %v", record, err)
+	}
+	if _, err := store.RenewHook(ctx, claim, clock, time.Minute); !errors.Is(err, transition.ErrStaleActivityLease) {
+		t.Fatalf("committed migration did not fence hook: %v", err)
+	}
+	if _, err := store.RenewTransitionLease(ctx, fence, clock, time.Hour); !errors.Is(err, transition.ErrStaleLease) {
+		t.Fatalf("committed migration did not fence coordinator: %v", err)
+	}
 }
 
 // RunMigrationRestart checks atomic crash recovery and retained unknown calls.
@@ -164,7 +276,8 @@ func RunMigrationRestart(t *testing.T, address string, open func(string) (Migrat
 			t.Fatalf("%s migration snapshot: %+v %v", step.phase, record, err)
 		}
 		inspection, err := store.InspectTrackedOperation(ctx, binding.Identity)
-		if err != nil || inspection.Result != nil || !inspection.MayHaveDispatched || inspection.Binding.BehaviorVersion != binding.BehaviorVersion {
+		if err != nil || inspection.Result != nil || !inspection.MayHaveDispatched ||
+			inspection.Binding.Provider != binding.Provider || inspection.Binding.BehaviorVersion != binding.BehaviorVersion {
 			t.Fatalf("%s lost unknown operation: %+v %v", step.phase, inspection, err)
 		}
 		if step.phase == "commit" {
