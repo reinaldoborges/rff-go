@@ -13,6 +13,7 @@ import (
 
 type OperationMigrationStore interface {
 	OperationStore
+	transition.OperationReconciliationStore
 	transition.MigrationStore[string, string]
 }
 
@@ -61,6 +62,27 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 	if err := store.CompleteTrackedOperation(ctx, lease, clock, binding.Identity, transition.OperationResult{Codec: binding.ResultCodec, Data: []byte("receipt")}); err != nil {
 		t.Fatal(err)
 	}
+	assessment := transition.OperationAssessment{
+		Outcome: transition.OperationOutcomeSucceeded,
+		Evidence: transition.OperationEvidence{
+			Identity: binding.Identity, Outcome: transition.OperationOutcomeSucceeded,
+			Provider: "provider", Scope: "merchant", Reference: "charge-reference",
+			InputFingerprint: "input", Version: "1", Provenance: "lookup",
+			BehaviorVersion: binding.BehaviorVersion, ComparatorVersion: binding.ComparatorVersion,
+			ObservedAt: now, ValidUntil: now.Add(time.Minute),
+		},
+		Result: &transition.OperationResult{Codec: binding.ResultCodec, Data: []byte("receipt")},
+	}
+	if _, err := store.ReconcileTrackedOperation(ctx, lease, clock, binding, assessment, equal); err != nil {
+		t.Fatal(err)
+	}
+	compensation := binding
+	compensation.Identity.Key = "refund"
+	compensation.Compensation = true
+	compensation.Prerequisites = []string{binding.Identity.Key}
+	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, compensation, equal); err != nil || !started {
+		t.Fatalf("compensation start: started=%v err=%v", started, err)
+	}
 	unknown := binding
 	unknown.Identity.Key = "unknown"
 	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, unknown, equal); err != nil || !started {
@@ -103,7 +125,7 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 	validated := false
 	verifiedMigrator, err := transition.NewExecutionMigrator[string, string, string, string](store, runner,
 		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationRequest) (transition.MigrationSnapshot[string], error) {
-			if source.Continuation == nil || source.Continuation.MachineVersion != "1" || len(source.Operations) != 2 {
+			if source.Continuation == nil || source.Continuation.MachineVersion != "1" || len(source.Operations) != 3 {
 				t.Fatal("converter did not receive both pinned continuation and operations")
 			}
 			source.Continuation.MachineVersion = "tampered"
@@ -115,12 +137,39 @@ func RunOperationMigration(t *testing.T, newStore func(*testing.T) OperationMigr
 			if source.Continuation == nil || source.Continuation.MachineVersion != "1" || source.Continuation.Policy.RetryDelays[0] != time.Second {
 				return errors.New("continuation binding changed before domain verification")
 			}
+			for i := range source.Operations {
+				if source.Operations[i].Binding.Identity.Key == "refund" {
+					source.Operations[i].Binding.Prerequisites[0] = "tampered"
+				}
+				if source.Operations[i].Binding.Identity == binding.Identity {
+					history := source.Operations[i].History
+					if len(history) == 0 || history[len(history)-1].Assessment.Result == nil {
+						return errors.New("operation evidence missing")
+					}
+					history[len(history)-1].Assessment.Evidence.Reference = "tampered"
+					history[len(history)-1].Assessment.Result.Data[0] = 'X'
+				}
+			}
 			return nil
 		},
 		func(_ context.Context, source transition.MigrationSource[string], _ transition.MigrationSnapshot[string]) error {
-			if len(source.Operations) != 2 || string(source.Operations[0].Binding.Input) != "amount=100" ||
+			if len(source.Operations) != 3 || string(source.Operations[0].Binding.Input) != "amount=100" ||
 				source.Continuation == nil || source.Continuation.MachineVersion != "1" {
 				return errors.New("operation bindings missing from compatibility verification")
+			}
+			for _, operation := range source.Operations {
+				if operation.Binding.Identity.Key == "refund" && (len(operation.Binding.Prerequisites) != 1 || operation.Binding.Prerequisites[0] != binding.Identity.Key) {
+					return errors.New("operation prerequisites changed before operation verification")
+				}
+				if operation.Binding.Identity == binding.Identity {
+					if len(operation.History) == 0 || operation.History[len(operation.History)-1].Assessment.Result == nil {
+						return errors.New("operation evidence missing")
+					}
+					last := operation.History[len(operation.History)-1].Assessment
+					if last.Evidence.Reference != "charge-reference" || string(last.Result.Data) != "receipt" {
+						return errors.New("operation evidence changed before operation verification")
+					}
+				}
 			}
 			validated = true
 			return nil

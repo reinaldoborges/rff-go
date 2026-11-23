@@ -36,6 +36,17 @@ func TestOperationProcessRestart(t *testing.T) {
 	})
 }
 
+func TestMigrationOperationProcessRestart(t *testing.T) {
+	open := func(path string) (runtimecontract.MigrationRestartStore, error) {
+		return sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.MigrationRestartAddress) != "" {
+		runtimecontract.MigrationRestartChild(t, open)
+		return
+	}
+	runtimecontract.RunMigrationRestart(t, filepath.Join(t.TempDir(), "migration-restart.db"), open)
+}
+
 func TestOperationRecoveryProcessRestart(t *testing.T) {
 	open := func(path string) (runtimecontract.RecoveryOperationRestartStore, error) {
 		return sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})

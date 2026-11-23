@@ -84,6 +84,18 @@ func TestOperationProcessRestart(t *testing.T) {
 	})
 }
 
+func TestMigrationOperationProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.MigrationRestartStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.MigrationRestartAddress) != "" {
+		runtimecontract.MigrationRestartChild(t, open)
+		return
+	}
+	_, config := newMySQLDatabase(t)
+	runtimecontract.RunMigrationRestart(t, config.FormatDSN(), open)
+}
+
 func TestOperationRecoveryProcessRestart(t *testing.T) {
 	open := func(dsn string) (runtimecontract.RecoveryOperationRestartStore, error) {
 		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})

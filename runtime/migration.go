@@ -124,10 +124,24 @@ func cloneMigrationSource[EntityID comparable](source MigrationSource[EntityID])
 	for i := range source.Operations {
 		operation := &source.Operations[i]
 		operation.Binding.Input = slices.Clone(operation.Binding.Input)
+		operation.Binding.Prerequisites = slices.Clone(operation.Binding.Prerequisites)
 		if operation.Result != nil {
 			result := *operation.Result
 			result.Data = slices.Clone(result.Data)
 			operation.Result = &result
+		}
+		operation.History = slices.Clone(operation.History)
+		for j := range operation.History {
+			assessment := &operation.History[j].Assessment
+			if assessment.Result != nil {
+				result := *assessment.Result
+				result.Data = slices.Clone(result.Data)
+				assessment.Result = &result
+			}
+			if assessment.Repeat != nil {
+				repeat := *assessment.Repeat
+				assessment.Repeat = &repeat
+			}
 		}
 	}
 	return source
