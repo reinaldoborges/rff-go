@@ -31,6 +31,17 @@ func TestRuntimeOperationReconciliationContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeOperationDispatchClassificationContract(t *testing.T) {
+	runtimecontract.RunOperationDispatchClassification(t, func(t *testing.T) runtimecontract.OperationStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "classification.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
 func TestRuntimeOperationPrerequisitesContract(t *testing.T) {
 	runtimecontract.RunOperationPrerequisites(t, func(t *testing.T) runtimecontract.OperationPrerequisiteStore {
 		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "prerequisites.db"), sqlite.StringCodec{}, sqlite.StringCodec{})

@@ -464,6 +464,7 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 		switch assessment.Outcome {
 		case transition.OperationOutcomeSucceeded:
 			record.Result = cloneOperationResult(assessment.Result)
+			record.DispatchPending = false
 			result = transition.OperationReconciliation{Result: cloneOperationResult(record.Result), Resolved: true}
 		case transition.OperationOutcomeFailed:
 			if assessment.Repeat != nil && transition.OperationMayRepeat(binding, assessment, now) {
@@ -478,6 +479,7 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 				}
 			} else {
 				record.Result = cloneOperationResult(assessment.Result)
+				record.DispatchPending = false
 				result = transition.OperationReconciliation{Result: cloneOperationResult(record.Result), Resolved: true}
 			}
 		case transition.OperationOutcomeAbsent, transition.OperationOutcomeUnknown:

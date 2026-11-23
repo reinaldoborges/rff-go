@@ -26,6 +26,12 @@ func TestRuntimeOperationReconciliationContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeOperationDispatchClassificationContract(t *testing.T) {
+	runtimecontract.RunOperationDispatchClassification(t, func(t *testing.T) runtimecontract.OperationStore {
+		return openMySQL(t)
+	})
+}
+
 func TestRuntimeOperationPrerequisitesContract(t *testing.T) {
 	runtimecontract.RunOperationPrerequisites(t, func(t *testing.T) runtimecontract.OperationPrerequisiteStore {
 		return openMySQL(t)
