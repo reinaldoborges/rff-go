@@ -30,28 +30,19 @@ type Group struct {
 	Closed bool
 }
 
-// Fixture is an application-owned SQLite domain store for local conformance.
-type Fixture struct {
-	db       *sql.DB
-	clock    func() time.Time
-	store    *sqlite.Store[string, string]
-	machines fsm.Registry[string, string, string, fixtureInput]
-	runner   *transition.HookRunner[string, string, string, fixtureInput]
-	sinkMu   sync.RWMutex
-	sink     func(context.Context, InvitationNotification) error
+type fixtureResources struct {
+	path  string
+	db    *sql.DB
+	store *sqlite.Store[string, string]
 }
 
-func Open(path string, clock func() time.Time) (*Fixture, error) {
-	return openWithDriver(path, clock, "sqlite3")
-}
-
-func openWithDriver(path string, clock func() time.Time, driver string) (*Fixture, error) {
-	if path == "" || path == ":memory:" || clock == nil {
-		return nil, ErrInvalidRequest
+func openFixtureResources(path, driver string) (fixtureResources, error) {
+	if path == "" || path == ":memory:" {
+		return fixtureResources{}, ErrInvalidRequest
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve fixture path: %w", err)
+		return fixtureResources{}, fmt.Errorf("resolve fixture path: %w", err)
 	}
 	uri := url.URL{Scheme: "file", Path: absolute}
 	query := uri.Query()
@@ -63,11 +54,14 @@ func openWithDriver(path string, clock func() time.Time, driver string) (*Fixtur
 	uri.RawQuery = query.Encode()
 	db, err := sql.Open(driver, uri.String())
 	if err != nil {
-		return nil, fmt.Errorf("open fixture: %w", err)
+		return fixtureResources{}, fmt.Errorf("open fixture: %w", err)
 	}
+	resources := fixtureResources{path: absolute, db: db}
 	db.SetMaxOpenConns(1)
-	fixture := &Fixture{db: db, clock: clock}
-	if err := fixture.transaction(context.Background(), func(tx *sql.Tx) error {
+	fail := func(err error) (fixtureResources, error) {
+		return fixtureResources{}, errors.Join(err, resources.Close())
+	}
+	if err := fixtureTransaction(context.Background(), db, func(tx *sql.Tx) error {
 		for _, statement := range []string{
 			`CREATE TABLE IF NOT EXISTS tm_users (id TEXT PRIMARY KEY NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS tm_operators (id TEXT PRIMARY KEY NOT NULL)`,
@@ -87,22 +81,61 @@ func openWithDriver(path string, clock func() time.Time, driver string) (*Fixtur
 		}
 		return nil
 	}); err != nil {
-		return nil, errors.Join(err, db.Close())
+		return fail(err)
 	}
-	fixture.store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	// The application DB and transition store use separate pools against this
+	// canonical file so the fixture can commit domain and runtime records atomically.
+	resources.store, err = sqlite.Open[string, string](resources.path, sqlite.StringCodec{}, sqlite.StringCodec{})
 	if err != nil {
-		return nil, errors.Join(err, db.Close())
+		return fail(err)
 	}
+	return resources, nil
+}
+
+func (r fixtureResources) Close() error {
+	var storeErr, dbErr error
+	if r.store != nil {
+		storeErr = r.store.Close()
+	}
+	if r.db != nil {
+		dbErr = r.db.Close()
+	}
+	return errors.Join(storeErr, dbErr)
+}
+
+// Fixture is an application-owned SQLite domain store for local conformance.
+type Fixture struct {
+	fixtureResources
+	clock    func() time.Time
+	machines fsm.Registry[string, string, string, fixtureInput]
+	runner   *transition.HookRunner[string, string, string, fixtureInput]
+	sinkMu   sync.RWMutex
+	sink     func(context.Context, InvitationNotification) error
+}
+
+func Open(path string, clock func() time.Time) (*Fixture, error) {
+	return openWithDriver(path, clock, "sqlite3")
+}
+
+func openWithDriver(path string, clock func() time.Time, driver string) (*Fixture, error) {
+	if clock == nil {
+		return nil, ErrInvalidRequest
+	}
+	resources, err := openFixtureResources(path, driver)
+	if err != nil {
+		return nil, err
+	}
+	fixture := &Fixture{fixtureResources: resources, clock: clock}
 	if err := fixture.initializeMembershipRuntime(); err != nil {
-		return nil, errors.Join(err, fixture.store.Close(), db.Close())
+		return nil, errors.Join(err, fixture.Close())
 	}
 	if err := fixture.reconcileRuntimeEntities(context.Background()); err != nil {
-		return nil, errors.Join(err, fixture.store.Close(), db.Close())
+		return nil, errors.Join(err, fixture.Close())
 	}
 	return fixture, nil
 }
 
-func (f *Fixture) Close() error { return errors.Join(f.store.Close(), f.db.Close()) }
+func (f *Fixture) Close() error { return f.fixtureResources.Close() }
 
 type inputRejection struct{ failure fsm.Failure }
 
@@ -139,7 +172,11 @@ func (f *Fixture) acceptInputAtomic(ctx context.Context, entity, key string, exp
 }
 
 func (f *Fixture) transaction(ctx context.Context, run func(*sql.Tx) error) (err error) {
-	tx, err := f.db.BeginTx(ctx, nil)
+	return fixtureTransaction(ctx, f.db, run)
+}
+
+func fixtureTransaction(ctx context.Context, db *sql.DB, run func(*sql.Tx) error) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin fixture transaction: %w", err)
 	}

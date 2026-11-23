@@ -65,3 +65,11 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The MySQL adapter uses [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql)
+v1.9.3, which is distributed under the Mozilla Public License 2.0. The complete
+license text is included in [`adapters/mysql/LICENSE`](adapters/mysql/LICENSE).
+Its source files contain the following copyright notice:
+
+Copyright 2012, 2013, 2014, 2016, 2017, 2018, 2019, 2024
+The Go-MySQL-Driver Authors. All rights reserved.
