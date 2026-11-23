@@ -27,6 +27,7 @@ func TestContinuationMarkerProcessRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		marker = continuationcontract.PrepareOrigin(t, store, marker)
 		if err := store.RecordContinuationMarker(context.Background(), marker); err != nil {
 			t.Fatal(err)
 		}
@@ -46,6 +47,11 @@ func TestContinuationMarkerProcessRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	execution, err := store.ReadActiveExecution(context.Background(), marker.ExecutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.OperationID = execution.CommitOperationID
 	if err := store.RecordContinuationMarker(context.Background(), marker); err != nil {
 		t.Fatalf("replay after process loss: %v", err)
 	}
@@ -59,19 +65,27 @@ func TestContinuationMarkerProcessRestart(t *testing.T) {
 }
 
 func TestContinuationAtomicProcessRestart(t *testing.T) {
-	db, config := newMySQLDatabase(t)
-	dsn := config.FormatDSN()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestContinuationAtomicContract/initial_notification$")
-	cmd.Env = append(os.Environ(), "RFF_MYSQL_ATOMIC_RESTART="+dsn, "RFF_CONTINUATION_ATOMIC_CRASH=1")
-	if err := cmd.Run(); err == nil {
-		t.Fatal("expected process loss")
-	} else if exit := new(exec.ExitError); !errors.As(err, &exit) || exit.ExitCode() != 87 {
-		t.Fatalf("unexpected child failure: %v", err)
+	for _, boundary := range []string{"before-commit", "after-commit"} {
+		t.Run(boundary, func(t *testing.T) {
+			db, config := newMySQLDatabase(t)
+			dsn := config.FormatDSN()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestContinuationAtomicContract/initial_notification$")
+			cmd.Env = append(os.Environ(), "RFF_MYSQL_ATOMIC_RESTART="+dsn, "RFF_CONTINUATION_ATOMIC_CRASH="+boundary)
+			if err := cmd.Run(); err == nil {
+				t.Fatal("expected process loss")
+			} else if exit := new(exec.ExitError); !errors.As(err, &exit) || exit.ExitCode() != 87 {
+				t.Fatalf("unexpected child failure: %v", err)
+			}
+			store, err := mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			if boundary == "before-commit" {
+				continuationcontract.CheckAtomicRollbackAfterRestart(t, store, db)
+			} else {
+				continuationcontract.CheckAtomicAfterRestart(t, store, db)
+			}
+		})
 	}
-	store, err := mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	continuationcontract.CheckAtomicAfterRestart(t, store, db)
 }

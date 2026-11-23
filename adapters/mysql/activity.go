@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/reinaldoborges/rff-go/fsm"
+	"github.com/reinaldoborges/rff-go/internal/executionidentity"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -28,6 +29,44 @@ type hookWork struct {
 	Started           bool
 	FencedUnknown     bool
 	BudgetUsed        uint
+}
+
+type hookWorkAlias hookWork
+
+func (work hookWork) MarshalJSON() ([]byte, error) {
+	ids := make([][]byte, len(work.Progress.Attempts))
+	for i, attempt := range work.Progress.Attempts {
+		ids[i] = []byte(attempt.Metadata.ExecutionID)
+	}
+	return json.Marshal(struct {
+		hookWorkAlias
+		AttemptExecutionIDs [][]byte
+	}{hookWorkAlias: hookWorkAlias(work), AttemptExecutionIDs: ids})
+}
+
+func (work *hookWork) UnmarshalJSON(data []byte) error {
+	var envelope struct {
+		hookWorkAlias
+		AttemptExecutionIDs [][]byte
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	*work = hookWork(envelope.hookWorkAlias)
+	if envelope.AttemptExecutionIDs == nil {
+		return nil
+	}
+	if len(envelope.AttemptExecutionIDs) != len(work.Progress.Attempts) {
+		return errors.New("inconsistent hook attempt identities")
+	}
+	for i, raw := range envelope.AttemptExecutionIDs {
+		attempt := &work.Progress.Attempts[i]
+		if !executionidentity.Matches(attempt.Metadata.ExecutionID, raw) {
+			return errors.New("inconsistent hook attempt identity")
+		}
+		attempt.Metadata.ExecutionID = string(raw)
+	}
+	return nil
 }
 
 type hookDispatchHistory struct {

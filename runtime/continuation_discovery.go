@@ -14,6 +14,10 @@ import (
 // durably reconciled into the runtime store.
 var ErrContinuationPending = errors.New("continuation marker pending")
 
+// ErrContinuationOriginMissing means the marker's originating execution is
+// unavailable. Discovery must retain the host marker for retry.
+var ErrContinuationOriginMissing = errors.New("continuation origin execution missing")
+
 // ContinuationMarker is the host's durable evidence of an opted-in commit.
 // The host must create it atomically with the successful commit and receipt.
 type ContinuationMarker[EntityID comparable, StateID comparable] struct {
@@ -74,6 +78,7 @@ type ContinuationMarkerSource[EntityID comparable, StateID comparable] interface
 
 // ContinuationMarkerStore durably records markers and detects conflicting
 // replays. A nil error certifies durable persistence, including on replay.
+// A missing origin is reported without acknowledging the host marker.
 type ContinuationMarkerStore[EntityID comparable, StateID comparable] interface {
 	RecordContinuationMarker(context.Context, ContinuationMarker[EntityID, StateID]) error
 }

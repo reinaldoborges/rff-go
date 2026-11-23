@@ -97,7 +97,10 @@ marker atomically. Separate-store hosts must attest to atomically retaining a
 replayable marker before commit, and schedule discovery. Receipt reconciliation
 waits for the matching runtime marker. Listing a marker does not establish that
 its origin is ready for evaluation; `ContinuationReady` checks the successful
-receipt and original reservation release. Evaluation is not implemented.
+receipt and original reservation release. Missing origins return
+`ErrContinuationOriginMissing`; discovery leaves those host markers
+unacknowledged for retry, and readiness diagnoses previously stored orphans.
+Evaluation is not implemented.
 Its source must retain unacknowledged markers across restarts and provide
 pagination cursors that remain valid when earlier markers are acknowledged.
 `NotificationWorker` claims and delivers intents independently, renews claims

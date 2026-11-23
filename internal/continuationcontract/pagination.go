@@ -43,7 +43,7 @@ func (h *pagedHost) AcknowledgeContinuationMarker(_ context.Context, marker tran
 }
 
 func RunPagination(t *testing.T, store interface {
-	transition.ContinuationMarkerStore[string, string]
+	Store
 	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
 }) {
 	t.Helper()
@@ -52,6 +52,8 @@ func RunPagination(t *testing.T, store interface {
 	first := transition.ContinuationMarker[string, string]{SchemaVersion: 1, ExecutionID: "first", OperationID: "commit-1", Entity: "one", Target: "due", MachineID: "plan", MachineVersion: "1", Policy: policy}
 	second := first
 	second.ExecutionID, second.OperationID, second.Entity = "second", "commit-2", "two"
+	first = PrepareOrigin(t, store, first)
+	second = PrepareOrigin(t, store, second)
 	host := &pagedHost{markers: []transition.ContinuationMarker[string, string]{first, second}, acknowledged: make(map[string]bool), failPage: true, failFirstAck: true}
 	discovery, err := transition.NewContinuationDiscovery[string, string](store, host)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/reinaldoborges/rff-go/adapters/sqlite"
 	"github.com/reinaldoborges/rff-go/fsm"
+	"github.com/reinaldoborges/rff-go/internal/continuationcontract"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -23,6 +24,7 @@ func TestContinuationMarkersSurviveReopenAndRejectConflicts(t *testing.T) {
 		Target: "due", MachineID: "plan", MachineVersion: "1",
 		Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Second, OverallTimeout: time.Minute},
 	}
+	marker = continuationcontract.PrepareOrigin(t, store, marker)
 	if err := store.RecordContinuationMarker(context.Background(), marker); err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +65,7 @@ func TestContinuationMarkersPreserveBinaryIdentities(t *testing.T) {
 		Entity: "entity", Target: "state", MachineID: string([]byte{0xfd}), MachineVersion: string([]byte{0xfc}),
 		Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Second, OverallTimeout: time.Minute},
 	}
+	marker = continuationcontract.PrepareOrigin(t, store, marker)
 	if err := store.RecordContinuationMarker(context.Background(), marker); err != nil {
 		t.Fatal(err)
 	}

@@ -111,6 +111,9 @@ func RunAtomic(t *testing.T, fixture func(*testing.T) (AtomicStore, *sql.DB)) {
 				if _, err := tx.ExecContext(ctx, `INSERT INTO continuation_test_domain (id) VALUES (?)`, "origin"); err != nil {
 					return transition.CommitReceipt{}, err
 				}
+				if os.Getenv("RFF_CONTINUATION_ATOMIC_CRASH") == "before-commit" {
+					os.Exit(87)
+				}
 				if tt.fail {
 					return transition.CommitReceipt{}, errors.New("injected rollback")
 				}
@@ -124,7 +127,7 @@ func RunAtomic(t *testing.T, fixture func(*testing.T) (AtomicStore, *sql.DB)) {
 			if (err != nil) != tt.fail {
 				t.Fatalf("commit error: %v", err)
 			}
-			if os.Getenv("RFF_CONTINUATION_ATOMIC_CRASH") == "1" {
+			if os.Getenv("RFF_CONTINUATION_ATOMIC_CRASH") == "after-commit" {
 				os.Exit(87)
 			}
 			var count int
@@ -145,6 +148,47 @@ func RunAtomic(t *testing.T, fixture func(*testing.T) (AtomicStore, *sql.DB)) {
 			}
 		})
 	}
+}
+
+func CheckAtomicRollbackAfterRestart(t *testing.T, store AtomicStore, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM continuation_test_domain`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("uncommitted domain mutation survived process loss: count=%d err=%v", count, err)
+	}
+	markers, err := store.ContinuationMarkers(ctx)
+	if err != nil || len(markers) != 0 {
+		t.Fatalf("uncommitted continuation survived process loss: %+v err=%v", markers, err)
+	}
+	execution, err := store.ReadActiveExecution(ctx, "origin")
+	if err != nil || execution.CommitReceipt != nil || execution.CommitOperationID == "" {
+		t.Fatalf("pre-commit execution state was not preserved: %+v err=%v", execution, err)
+	}
+	if ready, err := store.ContinuationReady(ctx, "origin"); ready || !errors.Is(err, transition.ErrContinuationPending) {
+		t.Fatalf("uncommitted continuation became ready: ready=%v err=%v", ready, err)
+	}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	lease, err := store.AcquireTransitionLease(ctx, "entity", "origin", "owner", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	callback := func(ctx context.Context, tx *sql.Tx, execution transition.Execution[string, string]) (transition.CommitReceipt, error) {
+		calls++
+		if _, err := tx.ExecContext(ctx, `INSERT INTO continuation_test_domain (id) VALUES (?)`, "origin"); err != nil {
+			return transition.CommitReceipt{}, err
+		}
+		return transition.CommitReceipt{ExecutionID: execution.ID, OperationID: execution.CommitOperationID, Outcome: transition.CommitSucceeded}, nil
+	}
+	if _, err := store.CommitAtomic(ctx, lease, clock, callback); err != nil {
+		t.Fatalf("retry after uncommitted process loss: %v", err)
+	}
+	if _, err := store.CommitAtomic(ctx, lease, clock, callback); err != nil || calls != 1 {
+		t.Fatalf("retry replay duplicated commit: calls=%d err=%v", calls, err)
+	}
+	CheckAtomicAfterRestart(t, store, db)
 }
 
 func CheckAtomicAfterRestart(t *testing.T, store AtomicStore, db *sql.DB) {

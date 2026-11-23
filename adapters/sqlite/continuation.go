@@ -69,7 +69,7 @@ func (s *Store[EntityID, StateID]) validateContinuationOrigin(ctx context.Contex
 	var data []byte
 	err := tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, marker.ExecutionID).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return transition.ErrContinuationOriginMissing
 	}
 	if err != nil {
 		return err
@@ -173,7 +173,7 @@ func (s *Store[EntityID, StateID]) ContinuationReady(ctx context.Context, execut
 		}
 		err = tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, executionID).Scan(&data)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return transition.ErrContinuationOriginMissing
 		}
 		if err != nil {
 			return err

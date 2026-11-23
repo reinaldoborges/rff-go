@@ -16,6 +16,7 @@ func TestContinuationAtomicContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			store, err := mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
 			if err != nil {
 				t.Fatal(err)
@@ -31,4 +32,24 @@ func TestContinuationAtomicContract(t *testing.T) {
 		t.Cleanup(func() { _ = store.Close() })
 		return store, db
 	})
+}
+
+func TestContinuationMissingOrigin(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	continuationcontract.RunMissingOrigin(t, store, db)
+}
+
+func TestContinuationHookIdentityCompatibility(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	continuationcontract.RunHookIdentityCompatibility(t, store, db)
 }
