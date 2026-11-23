@@ -30,7 +30,7 @@ func (s *Store[EntityID, StateID]) readControlExecution(
 	if err := json.Unmarshal(data, &stored); err != nil {
 		return stored, fmt.Errorf("%w: decode control execution: %w", ErrUnsupportedSchema, err)
 	}
-	if stored.SchemaVersion != transition.CurrentSchemaVersion || stored.ID != lease.ExecutionID || !bytes.Equal(stored.Entity, entity) {
+	if !transition.SupportedExecutionSchema(stored.SchemaVersion) || stored.ID != lease.ExecutionID || !bytes.Equal(stored.Entity, entity) {
 		return stored, fmt.Errorf("%w: invalid control execution", ErrUnsupportedSchema)
 	}
 	return stored, nil

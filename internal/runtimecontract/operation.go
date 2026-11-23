@@ -17,6 +17,7 @@ type OperationStore interface {
 	Store
 	transition.OperationStore
 	transition.OperationInspector
+	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
 }
 
 // RunOperation checks durable matching, replay, and terminal fencing.
@@ -30,7 +31,12 @@ func RunOperation(t *testing.T, newStore func(*testing.T) OperationStore) {
 		return &transition.Execution[string, string]{
 			SchemaVersion: transition.CurrentSchemaVersion, ID: "execution", Entity: "entity", Key: "request",
 			Operation: transition.Initialize, Status: transition.Waiting, Deadline: now.Add(time.Hour),
+			MachineID: "machine", MachineVersion: "1",
 			Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			Continuation: &transition.ContinuationSnapshot{
+				MachineID: "machine", MachineVersion: "1",
+				Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+			},
 		}, nil
 	})
 	if err != nil {
@@ -173,6 +179,10 @@ func RunOperation(t *testing.T, newStore func(*testing.T) OperationStore) {
 	}
 	if _, err := store.MarkWorkSuccess(ctx, fence, clock); !errors.Is(err, transition.ErrOperationUnresolved) {
 		t.Fatalf("unresolved dispatch allowed work success: %v", err)
+	}
+	markers, err := store.ContinuationMarkers(ctx)
+	if err != nil || len(markers) != 0 {
+		t.Fatalf("unresolved operation created a continuation: %+v, %v", markers, err)
 	}
 	if err := store.CompleteTrackedOperation(ctx, lease, clock, unknown.Identity, transition.OperationResult{Codec: codec}); !errors.Is(err, transition.ErrStaleActivityLease) {
 		t.Fatalf("completed scope accepted late result: %v", err)

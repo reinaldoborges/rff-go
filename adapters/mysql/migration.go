@@ -112,6 +112,11 @@ func (s *Store[EntityID, StateID]) ApplyExecutionMigration(
 		source.Input.Data = slices.Clone(source.Input.Data)
 		source.Event.Data = slices.Clone(source.Event.Data)
 		source.Policy.RetryDelays = slices.Clone(source.Policy.RetryDelays)
+		if stored.Continuation != nil {
+			pinned := *stored.Continuation
+			pinned.Policy.RetryDelays = slices.Clone(pinned.Policy.RetryDelays)
+			source.Continuation = &pinned
+		}
 		snapshot, err := convert(ctx, source)
 		if err != nil {
 			return block(err)

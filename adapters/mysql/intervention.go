@@ -84,7 +84,7 @@ func (s *Store[EntityID, StateID]) fencedExecution(
 	if err := json.Unmarshal(data, &execution); err != nil {
 		return now, execution, fmt.Errorf("%w: decode fenced execution: %w", ErrUnsupportedSchema, err)
 	}
-	if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+	if !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != lease.ExecutionID {
 		return now, execution, fmt.Errorf("%w: invalid fenced execution", ErrUnsupportedSchema)
 	}
 	return now, execution, nil

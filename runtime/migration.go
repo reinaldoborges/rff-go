@@ -52,6 +52,7 @@ type MigrationSource[EntityID comparable] struct {
 	Event          EncodedValue
 	Input          EncodedValue
 	Policy         fsm.Policy
+	Continuation   *ContinuationSnapshot
 	Operations     []OperationInspection
 }
 
@@ -79,9 +80,11 @@ type MigrationStore[EntityID comparable, StateID comparable] interface {
 
 // ExecutionMigrator coordinates authorized conversion and destination validation.
 // The host authorizes and audits requests, coordinates domain changes, and
-// verifies the converted source against authoritative state. The optional
-// operation verifier is mandatory when any tracked operation exists; it must
-// prove the destination can honor every original binding and outcome.
+// verifies the converted source against authoritative state and proves the
+// destination can honor any pinned Continuation behavior and policy.
+// The optional operation verifier is mandatory when any tracked operation
+// exists; it must prove the destination can honor every original binding and
+// outcome.
 type ExecutionMigrator[EntityID comparable, StateID comparable, Event, Input any] struct {
 	store            MigrationStore[EntityID, StateID]
 	runner           *HookRunner[EntityID, StateID, Event, Input]
@@ -112,6 +115,11 @@ func cloneMigrationSource[EntityID comparable](source MigrationSource[EntityID])
 	source.Input.Data = slices.Clone(source.Input.Data)
 	source.Event.Data = slices.Clone(source.Event.Data)
 	source.Policy.RetryDelays = slices.Clone(source.Policy.RetryDelays)
+	if source.Continuation != nil {
+		pinned := *source.Continuation
+		pinned.Policy.RetryDelays = slices.Clone(pinned.Policy.RetryDelays)
+		source.Continuation = &pinned
+	}
 	source.Operations = slices.Clone(source.Operations)
 	for i := range source.Operations {
 		operation := &source.Operations[i]

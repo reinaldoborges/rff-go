@@ -25,7 +25,7 @@ func (s *Store[EntityID, StateID]) ReadCompatibility(ctx context.Context, id str
 		return nil, fmt.Errorf("read compatibility diagnostic: %w", err)
 	}
 	var record diskRecord
-	if err := json.Unmarshal(data, &record); err != nil || record.SchemaVersion != transition.CurrentSchemaVersion || record.ID != id {
+	if err := json.Unmarshal(data, &record); err != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.ID != id {
 		return nil, fmt.Errorf("%w: invalid compatibility execution", ErrUnsupportedSchema)
 	}
 	if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
@@ -47,7 +47,7 @@ func (s *Store[EntityID, StateID]) BlockUnreadableExecution(ctx context.Context,
 			return fmt.Errorf("read unreadable execution: %w", err)
 		}
 		var record diskRecord
-		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || record.SchemaVersion != transition.CurrentSchemaVersion {
+		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || !transition.SupportedExecutionSchema(record.SchemaVersion) {
 			return fmt.Errorf("%w: invalid unreadable execution", ErrUnsupportedSchema)
 		}
 		if record.Compatibility != nil {
@@ -126,7 +126,7 @@ func (s *Store[EntityID, StateID]) BlockHookCompatibility(
 			return fmt.Errorf("read incompatible execution: %w", err)
 		}
 		var record diskRecord
-		if err := json.Unmarshal(data, &record); err != nil || record.ID != lease.ExecutionID || record.SchemaVersion != transition.CurrentSchemaVersion {
+		if err := json.Unmarshal(data, &record); err != nil || record.ID != lease.ExecutionID || !transition.SupportedExecutionSchema(record.SchemaVersion) {
 			return fmt.Errorf("%w: invalid incompatible execution", ErrUnsupportedSchema)
 		}
 		if !validDiagnostic(record, diagnostic) {
