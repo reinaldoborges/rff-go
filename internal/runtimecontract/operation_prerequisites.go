@@ -109,6 +109,55 @@ func RunOperationPrerequisites(t *testing.T, newStore func(*testing.T) Operation
 		}
 	})
 
+	t.Run("nil prerequisite declaration cannot be retried as independent", func(t *testing.T) {
+		store, lease, clock := startOperationAttempt(t, newStore)
+		ctx := context.Background()
+		equal := operationInputEqual
+		charge := prerequisiteBinding("charge", false, nil)
+		if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, charge, equal); err != nil || !started {
+			t.Fatalf("start unresolved charge: started=%v err=%v", started, err)
+		}
+
+		incomplete := prerequisiteBinding("refund", true, nil)
+		if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, incomplete, equal); !errors.Is(err, transition.ErrOperationPrerequisiteUnresolved) || started {
+			t.Fatalf("incomplete declaration did not fail closed: started=%v err=%v", started, err)
+		}
+		independent := incomplete
+		independent.Prerequisites = []string{}
+		if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, independent, equal); !errors.Is(err, transition.ErrConflict) || started {
+			t.Fatalf("nil declaration was retried as independent: started=%v err=%v", started, err)
+		}
+	})
+
+	t.Run("independent prerequisite declaration cannot be retried as incomplete", func(t *testing.T) {
+		store, lease, clock := startOperationAttempt(t, newStore)
+		ctx := context.Background()
+		equal := operationInputEqual
+		independent := prerequisiteBinding("refund", true, []string{})
+		if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, independent, equal); err != nil || !started {
+			t.Fatalf("start independent compensation: started=%v err=%v", started, err)
+		}
+		incomplete := independent
+		incomplete.Prerequisites = nil
+		if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, incomplete, equal); !errors.Is(err, transition.ErrConflict) || started {
+			t.Fatalf("independent declaration was retried as incomplete: started=%v err=%v", started, err)
+		}
+		now := clock()
+		assessment := transition.OperationAssessment{
+			Outcome: transition.OperationOutcomeUnknown,
+			Evidence: transition.OperationEvidence{
+				Identity: independent.Identity, Outcome: transition.OperationOutcomeUnknown,
+				Provider: "payment-sandbox", Scope: "merchant-7", Reference: "refund-1",
+				InputFingerprint: "refund-input-v1", Version: "lookup-v1", Provenance: "authoritative-query",
+				BehaviorVersion: independent.BehaviorVersion, ComparatorVersion: independent.ComparatorVersion,
+				ObservedAt: now, ValidUntil: now.Add(time.Minute),
+			},
+		}
+		if _, err := store.ReconcileTrackedOperation(ctx, lease, clock, incomplete, assessment, equal); !errors.Is(err, transition.ErrConflict) {
+			t.Fatalf("reconciliation accepted changed prerequisite nilness: %v", err)
+		}
+	})
+
 	t.Run("cycles are retained and rejected", func(t *testing.T) {
 		store, lease, clock := startOperationAttempt(t, newStore)
 		ctx := context.Background()

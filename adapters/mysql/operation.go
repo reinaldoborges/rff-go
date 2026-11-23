@@ -248,7 +248,7 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 			old := record.Binding
 			if old.Kind != binding.Kind || old.BehaviorVersion != binding.BehaviorVersion ||
 				old.ComparatorVersion != binding.ComparatorVersion || old.ResultCodec != binding.ResultCodec ||
-				old.Compensation != binding.Compensation || !slices.Equal(old.Prerequisites, binding.Prerequisites) {
+				old.Compensation != binding.Compensation || !operationPrerequisitesEqual(old.Prerequisites, binding.Prerequisites) {
 				return transition.ErrConflict
 			}
 			matches, err := equal(ctx, bytes.Clone(old.Input), bytes.Clone(binding.Input))
@@ -376,7 +376,7 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 			record.Binding.BehaviorVersion != binding.BehaviorVersion ||
 			record.Binding.ComparatorVersion != binding.ComparatorVersion || record.Binding.ResultCodec != binding.ResultCodec ||
 			record.Binding.Compensation != binding.Compensation ||
-			!slices.Equal(record.Binding.Prerequisites, binding.Prerequisites) {
+			!operationPrerequisitesEqual(record.Binding.Prerequisites, binding.Prerequisites) {
 			return transition.ErrConflict
 		}
 		if err := ensureOperationPrerequisites(ctx, tx, binding); err != nil {
@@ -832,6 +832,13 @@ func isOperationPrerequisiteBlock(err error) bool {
 	return errors.Is(err, transition.ErrOperationPrerequisiteUnresolved) ||
 		errors.Is(err, transition.ErrOperationPrerequisiteCycle) ||
 		errors.Is(err, transition.ErrOperationEvidenceConflict)
+}
+
+func operationPrerequisitesEqual(left, right []string) bool {
+	if (left == nil) != (right == nil) {
+		return false
+	}
+	return slices.Equal(left, right)
 }
 
 func loadOperationInspections(ctx context.Context, tx *sql.Tx, id string) ([]transition.OperationInspection, error) {
