@@ -20,6 +20,28 @@ func TestRuntimeOperationContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeOperationReconciliationContract(t *testing.T) {
+	runtimecontract.RunOperationReconciliation(t, func(t *testing.T) runtimecontract.OperationReconciliationStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "reconciliation.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
+func TestRuntimeOperationSafeRepeatContract(t *testing.T) {
+	runtimecontract.RunOperationSafeRepeat(t, func(t *testing.T) runtimecontract.OperationRepeatStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "repeat.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
 func TestRuntimeOperationSuccessRace(t *testing.T) {
 	runtimecontract.RunOperationSuccessRace(t, func(t *testing.T) runtimecontract.OperationStore {
 		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "operations.db"), sqlite.StringCodec{}, sqlite.StringCodec{})

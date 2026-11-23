@@ -30,6 +30,10 @@ func TestOperationProcessRestart(t *testing.T) {
 			runtimecontract.RunOperationRestart(t, filepath.Join(t.TempDir(), "restart.db"), phase, open)
 		})
 	}
+	t.Run("late-provider-call", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "late-restart.db")
+		runtimecontract.RunOperationLateCallRestart(t, path, open)
+	})
 }
 
 func TestOperationRecordIsolation(t *testing.T) {
