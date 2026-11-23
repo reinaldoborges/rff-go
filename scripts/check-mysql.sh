@@ -8,3 +8,4 @@ fi
 
 go test ./adapters/mysql -count=1
 go test -race ./adapters/mysql -count=1
+go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1
