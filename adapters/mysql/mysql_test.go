@@ -92,6 +92,36 @@ func TestOpenRejectsMissingVersionedTableWithoutRecreatingIt(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsPreOperationSchemaWithoutWriting(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `DROP TABLE rff_operations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE rff_schema_version SET version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{}); !errors.Is(err, mysql.ErrUnsupportedSchema) {
+		t.Fatalf("pre-operation schema was not rejected: %v", err)
+	}
+	var version, count int
+	if err := db.QueryRowContext(t.Context(), `SELECT version FROM rff_schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'rff_operations'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 || count != 0 {
+		t.Fatalf("unsupported store was rewritten: version=%d operation tables=%d", version, count)
+	}
+}
+
 func TestOpenRejectsNonInnoDBTable(t *testing.T) {
 	adminDB, config := newMySQLDatabase(t)
 	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})

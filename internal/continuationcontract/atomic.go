@@ -1,6 +1,7 @@
 package continuationcontract
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 type AtomicStore interface {
 	Store
+	transition.OperationStore
 	CommitAtomic(context.Context, transition.TransitionLease[string], func() time.Time,
 		func(context.Context, *sql.Tx, transition.Execution[string, string]) (transition.CommitReceipt, error)) (transition.CommitReceipt, error)
 	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
@@ -78,6 +80,23 @@ func RunAtomic(t *testing.T, fixture func(*testing.T) (AtomicStore, *sql.DB)) {
 			}
 			if _, err := store.StartHook(ctx, claim, clock); err != nil {
 				t.Fatal(err)
+			}
+			if tt.opted && !tt.deny && !tt.fail {
+				codec := transition.CodecVersion{Name: "result", Version: "1"}
+				binding := transition.OperationBinding{
+					Identity: transition.OperationIdentity{ExecutionID: "origin", Key: string([]byte{'k', 0xff})},
+					Kind:     "read", BehaviorVersion: "1", ComparatorVersion: "1", ResultCodec: codec,
+				}
+				equal := func(_ context.Context, a, b []byte) (bool, error) { return bytes.Equal(a, b), nil }
+				if _, started, err := store.BeginTrackedOperation(ctx, claim, clock, binding, equal); err != nil || !started {
+					t.Fatalf("start tracked operation: started=%v err=%v", started, err)
+				}
+				if err := store.CompleteTrackedOperation(ctx, claim, clock, binding.Identity, transition.OperationResult{Codec: codec, NoResult: true}); err != nil {
+					t.Fatal(err)
+				}
+				if result, started, err := store.BeginTrackedOperation(ctx, claim, clock, binding, equal); err != nil || started || result == nil || !result.NoResult {
+					t.Fatalf("tracked operation replay: result=%+v started=%v err=%v", result, started, err)
+				}
 			}
 			if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, clock); err != nil {
 				t.Fatal(err)

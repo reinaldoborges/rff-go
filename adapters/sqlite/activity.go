@@ -709,6 +709,9 @@ func (s *Store[EntityID, StateID]) MarkWorkSuccess(ctx context.Context, lease tr
 		if execution.Compatibility != nil {
 			return transition.ErrCompatibility
 		}
+		if err := ensureOperationsSettled(ctx, tx, lease.ExecutionID); err != nil {
+			return err
+		}
 		work, err := loadHook(ctx, tx, lease.ExecutionID)
 		if err != nil {
 			return err

@@ -38,6 +38,37 @@ renews their leases while working and reporting, and supports draining.
 An attempt timeout is reported without waiting for a hook that ignores context
 cancellation; such a hook may continue external side effects, which the host
 must make idempotent.
+
+Hooks may explicitly call `runtime.TrackOperation` with the hook's context.
+The worker supplies the capability only when its store implements
+`OperationStore`; invoking it without an active capability fails rather than
+calling the downstream adapter. Supply a stable operation key, kind, behavior
+and semantic comparator versions, safe input, a result codec version, and
+preflight and validation callbacks. The comparator must be side-effect-free
+and must not re-enter the store. A result is either typed data, an explicit
+`NoResult`, or a host-classified definitive failure with a safe `FailureCode`.
+The host must not persist secrets or raw errors. Its adapter maps the supplied
+execution ID and key to a collision-free, provider-compatible idempotency
+identity and uses distinct keys for different record/purpose pairs and
+compensation. Business deduplication across executions remains host-owned.
+
+The adapters durably record possible dispatch before the call and its confirmed
+result before returning. Matching calls replay the recorded result; conflicts,
+missing behavior, codecs, unverifiable equality, stale attempts and uncertain
+results fail explicitly. A dispatch error is treated as unknown, not as proof
+that nothing happened. An unresolved operation blocks work success and final
+abort, even after a process restart. `OperationInspector` exposes retained
+safe data; the host must authorize access. No automatic unknown-outcome
+reconciliation, operator resolution, or compensation-prerequisite enforcement
+is provided here. Until those facilities are implemented, the host must not
+repeat unknown effects or assume dependent compensation is safe. Fencing
+cannot stop an external call already in flight and is not an exactly-once
+guarantee.
+
+An execution migration with tracked operations requires the optional operation
+compatibility verifier passed to `NewExecutionMigrator`. It receives the
+recorded bindings and outcomes and must prove that the destination can honor
+them, including any immutable references. Without that proof migration blocks.
 `Coordinator.Reconcile` scans persisted active executions; the host must call it
 regularly, including without wakeups, and often enough to renew its leases.
 `RunReconciliation` can schedule these scans using a bounded `WakeupQueue` and
@@ -127,10 +158,13 @@ five-second busy timeout, foreign keys, and `synchronous=FULL`. Durability
 depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
-The adapter owns its `rff_` tables, scans existing records on open, and fails
-without writes for unsupported schemas. It migrates version 1 through 8 stores
-transactionally, preserving accepted records, reservations, and leases.
-Older adapter versions cannot open a migrated store.
+The adapter owns its `rff_` tables and rejects unsupported schemas without
+rewriting them. Fresh stores include the operation tables; pre-operation
+stores without them are incompatible and are not migrated or backfilled.
+Operation-only version 10 stores are upgraded transactionally with the
+Continuation table; continuation-only version 10 stores are incompatible.
+Unreadable operation records are isolated to the affected identity or scan.
+Older adapter versions cannot open the new schema.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
 the acceptance transaction; its callback must leave replays read-only.
 It persists hook dispatch, worker claims, started attempts, and safe outcomes.
@@ -175,6 +209,7 @@ go test ./adapters/sqlite -run TestNotificationDelivery
 go test ./adapters/sqlite -run TestAtomicCommit
 go test ./adapters/sqlite -run TestIncompatibleExecution
 go test ./adapters/sqlite -run TestMigration
+go test ./runtime ./adapters/sqlite -run 'TestTrackedOperation|TestRuntimeOperation|TestRuntimeConcurrentOperations|TestOperationProcessRestart|TestOperationRecordIsolation' -count=1
 go test ./adapters/sqlite -run TestTimer
 go test ./adapters/sqlite -run 'TestTypedInput|TestTypedCommand'
 go test ./runtime -run TestNotificationWorker
@@ -199,12 +234,18 @@ coordinates multiple adapter instances/processes. Identifier bytes are stored
 without prefix truncation; bounded prefix indexes only accelerate lookups, with
 exact-value checks and the serialization lock preserving full-key semantics.
 An incomplete, incompatible, or unsupported MySQL adapter schema is rejected;
-MySQL does not automatically migrate the separate SQLite schema.
-Run all eleven shared runtime persistence contract entry points and the
+MySQL does not automatically migrate older adapter schemas, including
+version 2 stores from either feature branch.
+Run the shared runtime persistence contract entry points and the
 MySQL-specific schema and concurrency tests locally with
 `./scripts/check-mysql.sh`, which requires `RFF_MYSQL_DSN` to point to a
 disposable MySQL 8.4 database with privileges to create and drop isolated test
 databases. The standard `./scripts/check.sh` and CI remain MySQL-independent.
+With that DSN set, run the focused dual-adapter operation checks using:
+
+```sh
+go test ./adapters/sqlite ./adapters/mysql -run 'TestRuntimeOperation|TestRuntimeConcurrentOperations|TestOperationProcessRestart|TestOperationRecordIsolation' -count=1
+```
 
 ## Local task-manager fixture
 
