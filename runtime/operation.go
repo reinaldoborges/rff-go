@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"time"
 )
 
@@ -20,6 +21,10 @@ var (
 	ErrOperationNotFound = errors.New("tracked operation not found")
 	// ErrOperationEvidenceConflict means provider evidence conflicts with a prior resolution.
 	ErrOperationEvidenceConflict = errors.New("tracked operation evidence conflicts with prior resolution")
+	// ErrOperationPrerequisiteUnresolved means a compensation prerequisite is absent or unsettled.
+	ErrOperationPrerequisiteUnresolved = errors.New("tracked operation prerequisite is unresolved")
+	// ErrOperationPrerequisiteCycle means compensation prerequisites contain a cycle.
+	ErrOperationPrerequisiteCycle = errors.New("tracked operation prerequisites contain a cycle")
 )
 
 // OperationIdentity is scoped to one transition execution, not a business entity.
@@ -38,16 +43,21 @@ type OperationRequest struct {
 	Kind              string
 	BehaviorVersion   string
 	ComparatorVersion string
-	Input             []byte
-	ResultCodec       CodecVersion
-	Preflight         func(context.Context) error
-	ValidateInput     func(context.Context, []byte) error
-	EqualInput        func(context.Context, []byte, []byte) (bool, error)
-	ValidateResult    func(context.Context, OperationResult) error
-	ClassifyDispatch  func(context.Context, OperationIdentity, error) (OperationAssessment, error)
-	Reconcile         func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error)
-	VerifyEvidence    func(context.Context, OperationBinding, OperationEvidence) error
-	VerifySafeRepeat  func(context.Context, OperationBinding, OperationAssessment, time.Time) error
+	// Compensation marks a host-defined Recover operation that has dependencies.
+	Compensation bool
+	// Prerequisites are same-execution operation keys. Nil is an incomplete
+	// declaration; an explicit empty slice declares independence.
+	Prerequisites    []string
+	Input            []byte
+	ResultCodec      CodecVersion
+	Preflight        func(context.Context) error
+	ValidateInput    func(context.Context, []byte) error
+	EqualInput       func(context.Context, []byte, []byte) (bool, error)
+	ValidateResult   func(context.Context, OperationResult) error
+	ClassifyDispatch func(context.Context, OperationIdentity, error) (OperationAssessment, error)
+	Reconcile        func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error)
+	VerifyEvidence   func(context.Context, OperationBinding, OperationEvidence) error
+	VerifySafeRepeat func(context.Context, OperationBinding, OperationAssessment, time.Time) error
 }
 
 // OperationResult is the safe result retained for replay. Typed success has
@@ -67,12 +77,16 @@ type OperationBinding struct {
 	Kind              string
 	BehaviorVersion   string
 	ComparatorVersion string
+	Compensation      bool
+	Prerequisites     []string
 	Input             []byte
 	ResultCodec       CodecVersion
 }
 
 type operationBindingWire struct {
 	ExecutionID, Key, Kind, BehaviorVersion, ComparatorVersion []byte
+	Compensation                                               bool
+	Prerequisites                                              []string
 	Input, CodecName, CodecVersion                             []byte
 }
 
@@ -80,6 +94,7 @@ func (b OperationBinding) MarshalJSON() ([]byte, error) {
 	return json.Marshal(operationBindingWire{
 		ExecutionID: []byte(b.Identity.ExecutionID), Key: []byte(b.Identity.Key),
 		Kind: []byte(b.Kind), BehaviorVersion: []byte(b.BehaviorVersion), ComparatorVersion: []byte(b.ComparatorVersion),
+		Compensation: b.Compensation, Prerequisites: b.Prerequisites,
 		Input: b.Input, CodecName: []byte(b.ResultCodec.Name), CodecVersion: []byte(b.ResultCodec.Version),
 	})
 }
@@ -92,6 +107,7 @@ func (b *OperationBinding) UnmarshalJSON(data []byte) error {
 	*b = OperationBinding{
 		Identity: OperationIdentity{ExecutionID: string(wire.ExecutionID), Key: string(wire.Key)},
 		Kind:     string(wire.Kind), BehaviorVersion: string(wire.BehaviorVersion), ComparatorVersion: string(wire.ComparatorVersion),
+		Compensation: wire.Compensation, Prerequisites: wire.Prerequisites,
 		Input: wire.Input, ResultCodec: CodecVersion{Name: string(wire.CodecName), Version: string(wire.CodecVersion)},
 	}
 	return nil
@@ -212,13 +228,15 @@ type OperationHistoryEntry struct {
 
 // OperationInspection exposes only the host-approved persisted binding and outcome.
 type OperationInspection struct {
-	Binding           OperationBinding
-	ActivityID        string
-	Generation        uint64
-	MayHaveDispatched bool
-	Result            *OperationResult
-	History           []OperationHistoryEntry
-	EvidenceConflict  bool
+	Binding             OperationBinding
+	ActivityID          string
+	Generation          uint64
+	MayHaveDispatched   bool
+	DispatchPending     bool
+	PrerequisiteBlocked bool
+	Result              *OperationResult
+	History             []OperationHistoryEntry
+	EvidenceConflict    bool
 }
 
 // OperationInspector is a host-authorized read-only inspection seam.
@@ -244,6 +262,7 @@ type operationScope struct {
 	store OperationStore
 	lease HookLease
 	clock func() time.Time
+	kind  HookKind
 }
 
 func (s *operationScope) track(ctx context.Context, req OperationRequest, dispatch func(context.Context, OperationIdentity) (OperationResult, error)) (OperationResult, error) {
@@ -259,6 +278,9 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 	if req.Key == "" || req.Kind == "" || req.BehaviorVersion == "" || req.ComparatorVersion == "" ||
 		req.ResultCodec.Name == "" || req.ResultCodec.Version == "" || req.Preflight == nil || req.ValidateInput == nil ||
 		req.EqualInput == nil || req.ValidateResult == nil || dispatch == nil {
+		return OperationResult{}, ErrInvalidRequest
+	}
+	if req.Compensation && s.kind != HookRecover {
 		return OperationResult{}, ErrInvalidRequest
 	}
 	input := slices.Clone(req.Input)
@@ -277,6 +299,7 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 	binding := OperationBinding{
 		Identity: OperationIdentity{ExecutionID: s.lease.ExecutionID, Key: req.Key},
 		Kind:     req.Kind, BehaviorVersion: req.BehaviorVersion, ComparatorVersion: req.ComparatorVersion,
+		Compensation: req.Compensation, Prerequisites: slices.Clone(req.Prerequisites),
 		Input: input, ResultCodec: req.ResultCodec,
 	}
 	result, started, err := s.store.BeginTrackedOperation(ctx, s.lease, s.clock, binding, req.EqualInput)
@@ -477,6 +500,7 @@ func (s *operationScope) applyAssessmentWithDispatch(
 		}
 		return result, nil
 	}
+
 	if !reconciliation.Resolved || reconciliation.Result == nil {
 		return OperationResult{}, ErrOperationUnresolved
 	}
@@ -569,4 +593,22 @@ func TrackOperation(ctx context.Context, request OperationRequest, dispatch func
 		return OperationResult{}, ErrOperationTrackingUnavailable
 	}
 	return tracker.track(ctx, request, dispatch)
+}
+
+// NormalizeOperationBinding clones and sorts a binding's prerequisite keys.
+func NormalizeOperationBinding(binding OperationBinding) (OperationBinding, error) {
+	binding.Input = slices.Clone(binding.Input)
+	binding.Prerequisites = slices.Clone(binding.Prerequisites)
+	for _, key := range binding.Prerequisites {
+		if key == "" {
+			return OperationBinding{}, ErrInvalidRequest
+		}
+	}
+	sort.Strings(binding.Prerequisites)
+	for i := 1; i < len(binding.Prerequisites); i++ {
+		if binding.Prerequisites[i] == binding.Prerequisites[i-1] {
+			return OperationBinding{}, ErrInvalidRequest
+		}
+	}
+	return binding, nil
 }

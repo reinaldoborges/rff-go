@@ -232,7 +232,7 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	defer cancelOperations()
 	if store, ok := w.store.(OperationStore); ok && !nilcheck.IsNil(store) {
 		operationCtx = context.WithValue(operationCtx, operationTrackerKey{}, &operationScope{
-			ctx: operationCtx, store: store, lease: lease, clock: w.config.Clock.Now,
+			ctx: operationCtx, store: store, lease: lease, clock: w.config.Clock.Now, kind: call.Kind,
 		})
 	}
 	ticker := w.config.Clock.NewTicker(w.config.RenewalInterval)

@@ -94,6 +94,17 @@ func runOperationAbort(t *testing.T, newStore func(*testing.T) OperationControlS
 	}
 	compensation := binding
 	compensation.Identity.Key = "independent-refund"
+	compensation.Compensation = true
+	compensation.Prerequisites = []string{}
+	if !race {
+		dependentCompensation := binding
+		dependentCompensation.Identity.Key = "dependent-refund"
+		dependentCompensation.Compensation = true
+		dependentCompensation.Prerequisites = []string{binding.Identity.Key}
+		if _, started, err := store.BeginTrackedOperation(ctx, recovery, clock, dependentCompensation, equal); !errors.Is(err, transition.ErrOperationPrerequisiteUnresolved) || started {
+			t.Fatalf("dependent recovery operation did not wait for the unresolved effect: started=%v err=%v", started, err)
+		}
+	}
 	if race {
 		start := make(chan struct{})
 		type operationOutcome struct {

@@ -36,6 +36,17 @@ func TestOperationProcessRestart(t *testing.T) {
 	})
 }
 
+func TestOperationRecoveryProcessRestart(t *testing.T) {
+	open := func(path string) (runtimecontract.RecoveryOperationRestartStore, error) {
+		return sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.OperationRecoveryRestartAddress) != "" {
+		runtimecontract.OperationRecoveryRestartChild(t, open)
+		return
+	}
+	runtimecontract.RunOperationRecoveryRestart(t, filepath.Join(t.TempDir(), "recovery-restart.db"), open)
+}
+
 func TestOperationRecordIsolation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "isolation.db")
 	db, err := sql.Open("sqlite3", path)
