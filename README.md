@@ -113,8 +113,8 @@ driving both scans in one process.
 outbox handoff. Unknown handoff outcomes are retried; definitive failures require
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
-`ContinuationDiscovery` and the adapters' durable marker stores are an
-incomplete reconciliation substrate, not a usable Continuation facility.
+`ContinuationDiscovery` and the adapters' durable marker stores retain
+Continuation intents for a host-scheduled `ContinuationDriver`.
 Acceptance pins an opted-in target's policy; the shared-store commit writes a
 marker atomically. Separate-store hosts must attest to atomically retaining a
 replayable marker before commit, and schedule discovery. Receipt reconciliation
@@ -123,7 +123,12 @@ its origin is ready for evaluation; `ContinuationReady` checks the successful
 receipt and original reservation release. Missing origins return
 `ErrContinuationOriginMissing`; discovery leaves those host markers
 unacknowledged for retry, and readiness diagnoses previously stored orphans.
-Evaluation is not implemented.
+The host must keep polling durable markers. The driver evaluates only the
+pinned machine version, persists its first decision, and uses the pinned
+attempt, deadline, and retry policy. Reservation waits pause an already
+started attempt. Exhaustion and definitive denial require an authorized retry;
+an authorized waiver fences evaluation and reconciles acceptance before it
+finishes. Use `ContinuationControls` for authorized control and inspection.
 The successor-acceptance substrate reserves a stable binding before a
 separate-store host records its authorization, origin revision, receipt and
 durable writer fence. Schedule `SuccessorRecovery.Reconcile` to resolve
@@ -140,15 +145,22 @@ Preparation, inspection, finalization and atomic adapter callbacks are
 trusted internal primitives, not externally authorized endpoints. Use
 `Acceptor.ReplaySuccessor` and `Acceptor.InspectSuccessor` with host disclosure
 authorization, and authorize any other disclosure separately. Internal recovery must remain
-available without replay permission. Definitive authorization denial blocks
-new delivery; audited retry controls and Continuation evaluation are not yet
-implemented.
+available without replay permission. A `ContinuationDeliveryHost` must check
+the delivery permit's expiry inside the acceptance transaction using a clock
+consistent with the runtime. Its lookup must serialize with in-flight
+acceptance, and cancellation must atomically return existing acceptance or
+supersession, or persist a tombstone that rejects every delayed delivery for
+that identity. An unknown result is not proof of absence. Do not route
+Continuation delivery through an unfenced legacy acceptance path.
 Its source must retain unacknowledged markers across restarts and provide
 pagination cursors that remain valid when earlier markers are acknowledged.
 The separate-host cancellation restart contract can be run on both adapters
 with `go test ./adapters/sqlite ./adapters/mysql -run '^TestSuccessorCancellationProcessRestart$' -count=1`
 and a disposable MySQL DSN. Its SQLite host is a test fixture, not a
 production fencing implementation.
+Driver, control, and process-restart coverage for both adapters can be run
+with `go test ./internal/successorcontract ./adapters/sqlite ./adapters/mysql -run '^(TestDeliveryPermitCheckedAtHostAcceptance|TestWaiverTombstoneRacesAcceptance|TestContinuationDriv)' -count=1`
+and a disposable MySQL DSN.
 `NotificationWorker` claims and delivers intents independently, renews claims
 while delivering, and schedules retries with its own configured timing. The
 host schedules worker calls and must make downstream delivery idempotent by

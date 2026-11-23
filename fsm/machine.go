@@ -177,6 +177,12 @@ func (m *Machine[EntityID, StateID, Event, Input]) ContinuationPolicy(target Sta
 	return policy, enabled
 }
 
+// HasContinuationBehavior reports whether this exact version can evaluate a
+// Continuation decision.
+func (m *Machine[EntityID, StateID, Event, Input]) HasContinuationBehavior() bool {
+	return m.config.Continue != nil
+}
+
 // EvaluateContinuation invokes only this machine version's behavior. It does
 // not enforce readiness, claim fencing, budgets, or decision persistence;
 // callers coordinating durable Continuations must provide those guarantees.

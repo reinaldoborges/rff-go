@@ -121,7 +121,7 @@ func (s *Store[EntityID, StateID]) CommitAtomic(
 			return err
 		}
 		if stored.Status == transition.Complete {
-			return releaseReservation(ctx, tx, stored.ID)
+			return releaseReservation(ctx, tx, stored.ID, decisionTime)
 		}
 		return nil
 	})

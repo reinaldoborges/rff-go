@@ -206,6 +206,10 @@ func (h *Host) CancelPrepared(ctx context.Context, binding Binding, beforeCommit
 }
 
 func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, error) {
+	return h.acceptSuccessor(ctx, binding, nil)
+}
+
+func (h *Host) acceptSuccessor(ctx context.Context, binding Binding, check func() error) (Result, error) {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Result{}, err
@@ -218,6 +222,11 @@ func (h *Host) AcceptSuccessor(ctx context.Context, binding Binding) (Result, er
 	pending := prior.Outcome == transition.SuccessorHostPending
 	if prior.Outcome != transition.SuccessorHostAbsent && !pending {
 		return prior, nil
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return Result{}, err
+		}
 	}
 	if h.Authorize == "temporary" {
 		return Result{}, errors.New("authorization temporarily unavailable")

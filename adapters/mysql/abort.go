@@ -37,6 +37,6 @@ func (s *Store[EntityID, StateID]) FinishAbort(
 		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return err
 		}
-		return releaseReservation(ctx, tx, lease.ExecutionID)
+		return releaseReservation(ctx, tx, lease.ExecutionID, clock())
 	})
 }

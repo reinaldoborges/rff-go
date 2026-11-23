@@ -258,6 +258,13 @@ func (s *Store[EntityID, StateID]) prepareSuccessor(
 		if err != nil {
 			return err
 		}
+		progress, err := continuationrecord.Progress(markerData)
+		if err != nil {
+			return fmt.Errorf("%w: invalid continuation progress", ErrUnsupportedSchema)
+		}
+		if progress != nil && (progress.Phase == transition.ContinuationWaiverPending || progress.Phase == transition.ContinuationWaived || progress.Phase == transition.ContinuationStopped) {
+			return transition.ErrInvalidDecision
+		}
 		if err := transition.MatchContinuationMarkers(storedMarker, marker); err != nil {
 			return err
 		}
@@ -474,6 +481,10 @@ func (s *Store[EntityID, StateID]) recordSuccessorDenial(
 		}
 		for _, prior := range record.Denials {
 			if bytes.Equal(prior, []byte(principal)) {
+				if phase == "prepared" {
+					_, err := tx.ExecContext(ctx, `UPDATE rff_successors SET phase = 'denied' WHERE digest = ?`, digest[:])
+					return err
+				}
 				return nil
 			}
 		}
