@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const adapterSchemaVersion = 1
+const adapterSchemaVersion = 2
 
 const (
 	schemaVersionDDL = `CREATE TABLE rff_schema_version (
@@ -55,6 +55,10 @@ const (
 		record LONGBLOB NOT NULL,
 		KEY rff_input_id_lookup (id(256))
 	) ENGINE=InnoDB`
+	continuationsDDL = `CREATE TABLE rff_continuations (
+		digest BINARY(32) NOT NULL PRIMARY KEY,
+		record LONGBLOB NOT NULL
+	) ENGINE=InnoDB`
 	transactionLockDDL = `CREATE TABLE rff_transaction_lock (
 		id TINYINT UNSIGNED NOT NULL PRIMARY KEY
 	) ENGINE=InnoDB`
@@ -69,6 +73,7 @@ var adapterTables = []string{
 	"rff_notification_work",
 	"rff_timers",
 	"rff_inputs",
+	"rff_continuations",
 	"rff_transaction_lock",
 }
 
@@ -116,6 +121,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			notificationWorkDDL,
 			timersDDL,
 			inputsDDL,
+			continuationsDDL,
 			transactionLockDDL,
 			schemaVersionDDL,
 		} {
@@ -168,7 +174,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		func() error { return validateLeases(ctx, tx) },
 		func() error { return validateHookWork(ctx, tx) },
 		func() error { return validateNotificationWork(ctx, tx) },
-		func() error { return validateTimers(ctx, tx, adapterSchemaVersion) },
+		func() error { return validateTimers(ctx, tx) },
 		func() error { return validateInputs(ctx, tx) },
 	} {
 		if err := validate(); err != nil {
@@ -195,6 +201,7 @@ func validateMySQLSchema(ctx context.Context, db *sql.DB) error {
 		"rff_notification_work": {{"execution_id", "longblob"}, {"work", "longblob"}},
 		"rff_timers":            {{"id", "longblob"}, {"record", "longblob"}},
 		"rff_inputs":            {{"id", "longblob"}, {"record", "longblob"}},
+		"rff_continuations":     {{"digest", "binary(32)"}, {"record", "longblob"}},
 		"rff_transaction_lock":  {{"id", "tinyint unsigned"}},
 	}
 	for table, wanted := range expected {
@@ -270,6 +277,7 @@ func validateMySQLIndexes(ctx context.Context, db *sql.DB) error {
 		"rff_notification_work": {"rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{256}, nonUnique: true}},
 		"rff_timers":            {"rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{256}, nonUnique: true}},
 		"rff_inputs":            {"rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{256}, nonUnique: true}},
+		"rff_continuations":     {"PRIMARY": {columns: []string{"digest"}, prefixLengths: []int{0}}},
 		"rff_transaction_lock":  {"PRIMARY": {columns: []string{"id"}, prefixLengths: []int{0}}},
 	}
 	for table, wanted := range expected {

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 9
+	adapterSchemaVersion = 10
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -22,6 +22,7 @@ const (
 	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	continuationsDDL     = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -35,7 +36,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
@@ -45,18 +46,19 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		"rff_notification_work": &notificationWorkExists,
 		"rff_timers":            &timersExist,
 		"rff_inputs":            &inputsExist,
+		"rff_continuations":     &continuationsExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (9)`,
+			`INSERT INTO rff_schema_version (version) VALUES (10)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -64,6 +66,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			notificationWorkDDL,
 			timersDDL,
 			inputsDDL,
+			continuationsDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -250,6 +253,27 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}
+		if !continuationsExist {
+			if schemaVersion >= 10 {
+				return fmt.Errorf("%w: continuations table missing", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, continuationsDDL); err != nil {
+				return fmt.Errorf("create continuations table: %w", err)
+			}
+		} else {
+			var definition string
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_continuations'`).Scan(&definition); err != nil {
+				return fmt.Errorf("%w: inspect continuations: %w", ErrUnsupportedSchema, err)
+			}
+			if definition != continuationsDDL {
+				return fmt.Errorf("%w: incompatible continuations table", ErrUnsupportedSchema)
+			}
+		}
+		if schemaVersion < 10 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 10`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema initialization: %w", err)
@@ -326,7 +350,8 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("%w: decode execution: %w", ErrUnsupportedSchema, err)
 		}
-		if record.SchemaVersion != transition.CurrentSchemaVersion || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
+		if !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
+			transition.ValidateContinuationSnapshot(record.Continuation) != nil || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
 		}
 		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {

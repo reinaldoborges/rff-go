@@ -354,7 +354,7 @@ func (s *Store[EntityID, StateID]) RenewTimer(ctx context.Context, lease transit
 	return lease, nil
 }
 
-func validateTimers(ctx context.Context, tx *sql.Tx, adapterVersion int) (err error) {
+func validateTimers(ctx context.Context, tx *sql.Tx) (err error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id, record FROM rff_timers`)
 	if err != nil {
 		return fmt.Errorf("%w: read timers: %w", ErrUnsupportedSchema, err)
@@ -370,12 +370,8 @@ func validateTimers(ctx context.Context, tx *sql.Tx, adapterVersion int) (err er
 		if err := rows.Scan(&id, &data); err != nil {
 			return fmt.Errorf("%w: read timer: %w", ErrUnsupportedSchema, err)
 		}
-		record, err := decodeTimer(id, data)
-		if err != nil {
+		if _, err := decodeTimer(id, data); err != nil {
 			return err
-		}
-		if adapterVersion < 9 && record.SchemaVersion != 1 {
-			return fmt.Errorf("%w: timer version is newer than adapter schema", ErrUnsupportedSchema)
 		}
 	}
 	if err := rows.Err(); err != nil {

@@ -325,7 +325,7 @@ func ensureCompatibleExecution(ctx context.Context, tx *sql.Tx, id string) error
 		return fmt.Errorf("read execution compatibility: %w", err)
 	}
 	var execution diskRecord
-	if err := json.Unmarshal(data, &execution); err != nil || execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != id {
+	if err := json.Unmarshal(data, &execution); err != nil || !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != id {
 		return fmt.Errorf("%w: invalid execution compatibility", ErrUnsupportedSchema)
 	}
 	if execution.Compatibility != nil {
@@ -385,7 +385,7 @@ func (s *Store[EntityID, StateID]) DispatchHook(ctx context.Context, lease trans
 		if err := json.Unmarshal(data, &execution); err != nil {
 			return fmt.Errorf("%w: decode dispatch execution: %w", ErrUnsupportedSchema, err)
 		}
-		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+		if !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != lease.ExecutionID {
 			return fmt.Errorf("%w: invalid dispatch execution", ErrUnsupportedSchema)
 		}
 		if execution.Compatibility != nil {
@@ -604,7 +604,7 @@ func (s *Store[EntityID, StateID]) RedeliverHook(
 		if err := json.Unmarshal(data, &execution); err != nil {
 			return fmt.Errorf("%w: decode redelivery execution: %w", ErrUnsupportedSchema, err)
 		}
-		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+		if !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != lease.ExecutionID {
 			return fmt.Errorf("%w: invalid redelivery execution", ErrUnsupportedSchema)
 		}
 		if work.BudgetUsed >= execution.Policy.MaxAttempts {
@@ -699,7 +699,7 @@ func (s *Store[EntityID, StateID]) MarkWorkSuccess(ctx context.Context, lease tr
 		if err := json.Unmarshal(data, &execution); err != nil {
 			return fmt.Errorf("%w: decode successful execution: %w", ErrUnsupportedSchema, err)
 		}
-		if execution.SchemaVersion != transition.CurrentSchemaVersion || execution.ID != lease.ExecutionID {
+		if !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != lease.ExecutionID {
 			return fmt.Errorf("%w: invalid successful execution", ErrUnsupportedSchema)
 		}
 		if execution.CommitOperationID != "" {

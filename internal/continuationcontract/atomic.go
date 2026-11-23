@@ -1,0 +1,145 @@
+package continuationcontract
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/reinaldoborges/rff-go/fsm"
+	transition "github.com/reinaldoborges/rff-go/runtime"
+)
+
+type AtomicStore interface {
+	Store
+	CommitAtomic(context.Context, transition.TransitionLease[string], func() time.Time,
+		func(context.Context, *sql.Tx, transition.Execution[string, string]) (transition.CommitReceipt, error)) (transition.CommitReceipt, error)
+	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
+}
+
+func RunAtomic(t *testing.T, fixture func(*testing.T) (AtomicStore, *sql.DB)) {
+	t.Helper()
+	tests := []struct {
+		name                string
+		notify, opted, deny bool
+		fail, ordinary      bool
+	}{
+		{name: "initial notification", notify: true, opted: true},
+		{name: "ordinary without notification", opted: true, ordinary: true},
+		{name: "rejection", opted: true, deny: true},
+		{name: "rollback", opted: true, fail: true},
+		{name: "not opted", notify: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, db := fixture(t)
+			ctx := context.Background()
+			if _, err := db.ExecContext(ctx, `CREATE TABLE continuation_test_domain (id VARCHAR(64) NOT NULL PRIMARY KEY)`); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			clock := func() time.Time { return now }
+			policy := fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour}
+			_, _, err := store.Accept(ctx, "entity", "key", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+				execution := &transition.Execution[string, string]{
+					SchemaVersion: transition.CurrentSchemaVersion, ID: "origin", Entity: "entity", Key: "key",
+					Operation: transition.Initialize, Target: "due", Status: transition.Waiting,
+					MachineID: "plan", MachineVersion: "1", Notify: tt.notify, Policy: policy,
+					AcceptedAt: now, Deadline: now.Add(time.Hour),
+				}
+				if tt.opted {
+					execution.Continuation = &transition.ContinuationSnapshot{MachineID: "plan", MachineVersion: "1", Policy: policy}
+				}
+				if tt.ordinary {
+					execution.Operation, execution.HasPrevious, execution.Previous = transition.Transition, true, "previous"
+				}
+				return execution, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := store.AcquireTransitionLease(ctx, "entity", "origin", "owner", clock, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kind := transition.HookEnter
+			if tt.ordinary {
+				kind = transition.HookTransition
+			}
+			if _, err := store.DispatchHook(ctx, lease, clock, transition.HookDispatch{Kind: kind, DueAt: now}); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.StartHook(ctx, claim, clock); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReportHook(ctx, claim, transition.HookResult{Success: true}, clock); err != nil {
+				t.Fatal(err)
+			}
+			operation, err := store.MarkWorkSuccess(ctx, lease, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			callback := func(ctx context.Context, tx *sql.Tx, _ transition.Execution[string, string]) (transition.CommitReceipt, error) {
+				calls++
+				if _, err := tx.ExecContext(ctx, `INSERT INTO continuation_test_domain (id) VALUES (?)`, "origin"); err != nil {
+					return transition.CommitReceipt{}, err
+				}
+				if tt.fail {
+					return transition.CommitReceipt{}, errors.New("injected rollback")
+				}
+				receipt := transition.CommitReceipt{ExecutionID: "origin", OperationID: operation, Outcome: transition.CommitSucceeded}
+				if tt.deny {
+					receipt.Outcome, receipt.Failure = transition.CommitDenied, &fsm.Failure{Code: "denied"}
+				}
+				return receipt, nil
+			}
+			_, err = store.CommitAtomic(ctx, lease, clock, callback)
+			if (err != nil) != tt.fail {
+				t.Fatalf("commit error: %v", err)
+			}
+			if os.Getenv("RFF_CONTINUATION_ATOMIC_CRASH") == "1" {
+				os.Exit(87)
+			}
+			var count int
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM continuation_test_domain`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if (count == 1) != (!tt.deny && !tt.fail) {
+				t.Fatalf("domain mutation count: %d", count)
+			}
+			markers, err := store.ContinuationMarkers(ctx)
+			if err != nil || (len(markers) == 1) != (tt.opted && !tt.deny && !tt.fail) {
+				t.Fatalf("unexpected markers: %+v, %v", markers, err)
+			}
+			if !tt.fail {
+				if _, err := store.CommitAtomic(ctx, lease, clock, callback); err != nil || calls != 1 {
+					t.Fatalf("commit replay reran mutation: calls=%d err=%v", calls, err)
+				}
+			}
+		})
+	}
+}
+
+func CheckAtomicAfterRestart(t *testing.T, store AtomicStore, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM continuation_test_domain`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("domain commit missing after process loss: count=%d err=%v", count, err)
+	}
+	markers, err := store.ContinuationMarkers(ctx)
+	if err != nil || len(markers) != 1 || markers[0].ExecutionID != "origin" {
+		t.Fatalf("continuation missing after process loss: %+v err=%v", markers, err)
+	}
+	if ready, err := store.ContinuationReady(ctx, "origin"); err != nil || !ready {
+		t.Fatalf("reconciled origin not ready after process loss: ready=%v err=%v", ready, err)
+	}
+}

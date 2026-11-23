@@ -59,9 +59,14 @@ driving both scans in one process.
 outbox handoff. Unknown handoff outcomes are retried; definitive failures require
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
-`ContinuationDiscovery` is only a marker-reconciliation substrate: neither
-adapter currently persists Continuation intents, and acceptance, commit and
-evaluation are not wired to it. It is not a usable Continuation facility.
+`ContinuationDiscovery` and the adapters' durable marker stores are an
+incomplete reconciliation substrate, not a usable Continuation facility.
+Acceptance pins an opted-in target's policy; the shared-store commit writes a
+marker atomically. Separate-store hosts must attest to atomically retaining a
+replayable marker before commit, and schedule discovery. Receipt reconciliation
+waits for the matching runtime marker. Listing a marker does not establish that
+its origin is ready for evaluation; `ContinuationReady` checks the successful
+receipt and original reservation release. Evaluation is not implemented.
 Its source must retain unacknowledged markers across restarts and provide
 pagination cursors that remain valid when earlier markers are acknowledged.
 `NotificationWorker` claims and delivers intents independently, renews claims

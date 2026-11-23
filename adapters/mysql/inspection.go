@@ -46,7 +46,7 @@ func (s *Store[EntityID, StateID]) InspectExecution(ctx context.Context, id stri
 			return fmt.Errorf("read execution for inspection: %w", err)
 		}
 		var record diskRecord
-		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || record.SchemaVersion != transition.CurrentSchemaVersion {
+		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || !transition.SupportedExecutionSchema(record.SchemaVersion) {
 			return fmt.Errorf("%w: invalid inspected execution", ErrUnsupportedSchema)
 		}
 		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {

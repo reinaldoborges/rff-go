@@ -31,10 +31,20 @@ type CommitReceipt struct {
 // persist a new receipt with either its domain mutation or definitive
 // rejection. It must enforce the current transition fence at its authoritative
 // commit boundary. Errors indicate unknown or transient outcomes, never a
-// definitive rejection. Hosts must not expose raw errors in receipts.
+// definitive rejection. An opted-in commit must atomically retain either a
+// runtime intent in a shared transaction or a replayable host marker.
+// Hosts must not expose raw errors in receipts.
 type CommitHost[EntityID comparable, StateID comparable] interface {
 	Commit(context.Context, TransitionLease[EntityID], Execution[EntityID, StateID]) (CommitReceipt, error)
 }
+
+// ContinuationCommitHost explicitly attests that successful opted-in commits
+// atomically retain either a runtime intent or a replayable host marker.
+type ContinuationCommitHost interface {
+	ContinuationCommitSupported() bool
+}
+
+var ErrContinuationUnavailable = errors.New("host cannot durably commit continuation intent")
 
 // CommitStore persists final host receipts under the current transition fence.
 type CommitStore[EntityID comparable, StateID comparable] interface {
@@ -118,6 +128,12 @@ func (c *CommitCoordinator[EntityID, StateID]) reconcileOne(ctx context.Context,
 	}
 	if execution.Status == CommitRejected {
 		return c.store.StartRejectedRecovery(ctx, lease, c.config.Clock)
+	}
+	if execution.Continuation != nil {
+		host, ok := c.host.(ContinuationCommitHost)
+		if !ok || !host.ContinuationCommitSupported() {
+			return ErrContinuationUnavailable
+		}
 	}
 	receipt, err := c.host.Commit(ctx, lease, execution)
 	if err != nil {

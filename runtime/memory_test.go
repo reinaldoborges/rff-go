@@ -77,6 +77,11 @@ func (s *memoryStore) Accept(ctx context.Context, entity, key string, decide tra
 }
 
 func cloneExecution(record transition.Execution[string, state]) transition.Execution[string, state] {
+	if record.Continuation != nil {
+		snapshot := *record.Continuation
+		snapshot.Policy.RetryDelays = slices.Clone(snapshot.Policy.RetryDelays)
+		record.Continuation = &snapshot
+	}
 	if record.OriginalRequest != nil {
 		original := *record.OriginalRequest
 		original.Input.Data = slices.Clone(original.Input.Data)

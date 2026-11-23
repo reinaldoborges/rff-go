@@ -232,6 +232,10 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return result, false, transition.ErrInvalidDecision
 	}
+	if err := transition.ValidateContinuationSnapshot(next.Continuation); err != nil ||
+		next.Continuation != nil && (next.Continuation.MachineID != next.MachineID || next.Continuation.MachineVersion != next.MachineVersion) {
+		return result, false, transition.ErrInvalidDecision
+	}
 	var idExists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_executions WHERE id = ?)`, next.ID).Scan(&idExists); err != nil {
 		return result, false, fmt.Errorf("check execution ID: %w", err)

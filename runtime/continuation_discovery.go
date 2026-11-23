@@ -10,6 +10,10 @@ import (
 	"github.com/reinaldoborges/rff-go/internal/nilcheck"
 )
 
+// ErrContinuationPending means an opted-in commit's marker has not yet been
+// durably reconciled into the runtime store.
+var ErrContinuationPending = errors.New("continuation marker pending")
+
 // ContinuationMarker is the host's durable evidence of an opted-in commit.
 // The host must create it atomically with the successful commit and receipt.
 type ContinuationMarker[EntityID comparable, StateID comparable] struct {
