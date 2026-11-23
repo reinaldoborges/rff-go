@@ -32,7 +32,7 @@ type RestartOperationStore interface {
 func restartBinding() transition.OperationBinding {
 	return transition.OperationBinding{
 		Identity: transition.OperationIdentity{ExecutionID: "execution", Key: "charge"},
-		Kind:     "charge", BehaviorVersion: "1", ComparatorVersion: "1",
+		Kind:     "charge", Provider: "fake-provider", BehaviorVersion: "1", ComparatorVersion: "1",
 		Input: []byte("amount=100"), ResultCodec: transition.CodecVersion{Name: "result", Version: "1"},
 	}
 }

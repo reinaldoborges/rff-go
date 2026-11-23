@@ -36,11 +36,15 @@ type OperationIdentity struct {
 // OperationRequest identifies and binds a host-selected downstream operation.
 // Input and results must contain only host-approved safe data. Preflight must
 // verify the exact behavior, comparator and result codec before dispatch.
+// Provider is a stable non-secret provider identity. The host must also bind
+// any account or routing scope in the input. Operations without a provider
+// remain usable but cannot be migrated because their origin cannot be proved.
 // EqualInput must be side-effect-free and must not re-enter the store.
 // ValidateResult must verify typed data or an immutable reference on each replay.
 type OperationRequest struct {
 	Key               string
 	Kind              string
+	Provider          string
 	BehaviorVersion   string
 	ComparatorVersion string
 	// Compensation marks a host-defined Recover operation that has dependencies.
@@ -75,6 +79,7 @@ type OperationResult struct {
 type OperationBinding struct {
 	Identity          OperationIdentity
 	Kind              string
+	Provider          string
 	BehaviorVersion   string
 	ComparatorVersion string
 	Compensation      bool
@@ -84,16 +89,16 @@ type OperationBinding struct {
 }
 
 type operationBindingWire struct {
-	ExecutionID, Key, Kind, BehaviorVersion, ComparatorVersion []byte
-	Compensation                                               bool
-	Prerequisites                                              []string
-	Input, CodecName, CodecVersion                             []byte
+	ExecutionID, Key, Kind, Provider, BehaviorVersion, ComparatorVersion []byte
+	Compensation                                                         bool
+	Prerequisites                                                        []string
+	Input, CodecName, CodecVersion                                       []byte
 }
 
 func (b OperationBinding) MarshalJSON() ([]byte, error) {
 	return json.Marshal(operationBindingWire{
 		ExecutionID: []byte(b.Identity.ExecutionID), Key: []byte(b.Identity.Key),
-		Kind: []byte(b.Kind), BehaviorVersion: []byte(b.BehaviorVersion), ComparatorVersion: []byte(b.ComparatorVersion),
+		Kind: []byte(b.Kind), Provider: []byte(b.Provider), BehaviorVersion: []byte(b.BehaviorVersion), ComparatorVersion: []byte(b.ComparatorVersion),
 		Compensation: b.Compensation, Prerequisites: b.Prerequisites,
 		Input: b.Input, CodecName: []byte(b.ResultCodec.Name), CodecVersion: []byte(b.ResultCodec.Version),
 	})
@@ -106,7 +111,7 @@ func (b *OperationBinding) UnmarshalJSON(data []byte) error {
 	}
 	*b = OperationBinding{
 		Identity: OperationIdentity{ExecutionID: string(wire.ExecutionID), Key: string(wire.Key)},
-		Kind:     string(wire.Kind), BehaviorVersion: string(wire.BehaviorVersion), ComparatorVersion: string(wire.ComparatorVersion),
+		Kind:     string(wire.Kind), Provider: string(wire.Provider), BehaviorVersion: string(wire.BehaviorVersion), ComparatorVersion: string(wire.ComparatorVersion),
 		Compensation: wire.Compensation, Prerequisites: wire.Prerequisites,
 		Input: wire.Input, ResultCodec: CodecVersion{Name: string(wire.CodecName), Version: string(wire.CodecVersion)},
 	}
@@ -298,7 +303,7 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 	}
 	binding := OperationBinding{
 		Identity: OperationIdentity{ExecutionID: s.lease.ExecutionID, Key: req.Key},
-		Kind:     req.Kind, BehaviorVersion: req.BehaviorVersion, ComparatorVersion: req.ComparatorVersion,
+		Kind:     req.Kind, Provider: req.Provider, BehaviorVersion: req.BehaviorVersion, ComparatorVersion: req.ComparatorVersion,
 		Compensation: req.Compensation, Prerequisites: slices.Clone(req.Prerequisites),
 		Input: input, ResultCodec: req.ResultCodec,
 	}
@@ -523,6 +528,7 @@ func (s *operationScope) applyAssessmentWithDispatch(
 func validOperationAssessment(binding OperationBinding, assessment OperationAssessment, now time.Time) bool {
 	evidence := assessment.Evidence
 	if evidence.Identity != binding.Identity || evidence.Outcome != assessment.Outcome ||
+		(binding.Provider != "" && evidence.Provider != binding.Provider) ||
 		evidence.Provider == "" || evidence.Scope == "" || evidence.Reference == "" ||
 		evidence.InputFingerprint == "" || evidence.Version == "" || evidence.Provenance == "" ||
 		evidence.BehaviorVersion != binding.BehaviorVersion ||

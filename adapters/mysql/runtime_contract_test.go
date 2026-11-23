@@ -64,6 +64,10 @@ func TestRuntimeOperationMigration(t *testing.T) {
 	runtimecontract.RunOperationMigration(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
 }
 
+func TestRuntimeMigrationWithoutProvider(t *testing.T) {
+	runtimecontract.RunMigrationWithoutProvider(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
+}
+
 func TestOperationProcessRestart(t *testing.T) {
 	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
 		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
@@ -82,6 +86,18 @@ func TestOperationProcessRestart(t *testing.T) {
 		_, config := newMySQLDatabase(t)
 		runtimecontract.RunOperationLateCallRestart(t, config.FormatDSN(), open)
 	})
+}
+
+func TestMigrationOperationProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.MigrationRestartStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.MigrationRestartAddress) != "" {
+		runtimecontract.MigrationRestartChild(t, open)
+		return
+	}
+	_, config := newMySQLDatabase(t)
+	runtimecontract.RunMigrationRestart(t, config.FormatDSN(), open)
 }
 
 func TestOperationRecoveryProcessRestart(t *testing.T) {

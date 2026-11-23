@@ -84,6 +84,7 @@ func validOperationHistory(binding transition.OperationBinding, history []transi
 			continue
 		}
 		if evidence.Identity != binding.Identity || evidence.Outcome != entry.Assessment.Outcome ||
+			(binding.Provider != "" && evidence.Provider != binding.Provider) ||
 			evidence.Provider == "" || evidence.Scope == "" || evidence.Reference == "" ||
 			evidence.InputFingerprint == "" || evidence.Version == "" || evidence.Provenance == "" ||
 			evidence.BehaviorVersion != binding.BehaviorVersion ||
@@ -246,7 +247,7 @@ func (s *Store[EntityID, StateID]) BeginTrackedOperation(
 				return transition.ErrOperationEvidenceConflict
 			}
 			old := record.Binding
-			if old.Kind != binding.Kind || old.BehaviorVersion != binding.BehaviorVersion ||
+			if old.Kind != binding.Kind || old.Provider != binding.Provider || old.BehaviorVersion != binding.BehaviorVersion ||
 				old.ComparatorVersion != binding.ComparatorVersion || old.ResultCodec != binding.ResultCodec ||
 				old.Compensation != binding.Compensation || !operationPrerequisitesEqual(old.Prerequisites, binding.Prerequisites) {
 				return transition.ErrConflict
@@ -372,7 +373,7 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 		if record.EvidenceConflict {
 			return transition.ErrOperationEvidenceConflict
 		}
-		if record.Binding.Identity != binding.Identity || record.Binding.Kind != binding.Kind ||
+		if record.Binding.Identity != binding.Identity || record.Binding.Kind != binding.Kind || record.Binding.Provider != binding.Provider ||
 			record.Binding.BehaviorVersion != binding.BehaviorVersion ||
 			record.Binding.ComparatorVersion != binding.ComparatorVersion || record.Binding.ResultCodec != binding.ResultCodec ||
 			record.Binding.Compensation != binding.Compensation ||

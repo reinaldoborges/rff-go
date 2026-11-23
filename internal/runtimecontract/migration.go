@@ -271,6 +271,10 @@ func RunMigration(t *testing.T, newStore func(*testing.T) MigrationStore) {
 	if _, err := authorized.Migrate(ctx, lease, clock, migration); !errors.Is(err, transition.ErrConflict) {
 		t.Fatalf("changed migration replay did not conflict: %v", err)
 	}
+	lease, err = store.AcquireTransitionLease(ctx, "entity", original.ID, "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	previousClaim := claim
 	claim, err = store.ClaimHook(ctx, "worker", clock, time.Minute)
 	if err != nil || claim.ActivityID != previousClaim.ActivityID || claim.Generation <= previousClaim.Generation {

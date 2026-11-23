@@ -119,6 +119,17 @@ func TestRuntimeOperationMigration(t *testing.T) {
 	})
 }
 
+func TestRuntimeMigrationWithoutProvider(t *testing.T) {
+	runtimecontract.RunMigrationWithoutProvider(t, func(t *testing.T) runtimecontract.OperationMigrationStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "operations.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
 func TestRuntimeStoreContract(t *testing.T) {
 	runtimecontract.Run(t, func(t *testing.T) runtimecontract.Store {
 		t.Helper()
