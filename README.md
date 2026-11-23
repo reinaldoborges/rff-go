@@ -95,7 +95,7 @@ disposable MySQL 8.4 database:
 
 ```sh
 go run ./examples/renewal -backend mysql -dsn "$RFF_MYSQL_DSN"
-go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1
+go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1 -v
 ```
 
 The explicit MySQL host test creates isolated schemas and runs real-process
@@ -109,7 +109,7 @@ race, operator denial, and tracked refund recovery. The focused SQLite command
 is:
 
 ```sh
-go test ./examples/renewal -run '^(TestRunnableRenewalScenarioUsesSQLiteByDefault|TestLostProviderResponseReconcilesAfterRealProcessRestart|TestLateProviderCallBlocksUntilEvidenceResolutionAndSeparateRetry|TestAuthorizedAbortRefundsWithoutUndoingCommittedDueState|TestAuthorizationAndSeparateStoreProtocols|TestStaleABAOriginIsSuperseded)$' -count=1
+go test ./examples/renewal -run '^(TestRunnableRenewalScenarioUsesSQLiteByDefault|TestLostProviderResponseReconcilesAfterRealProcessRestart|TestLateProviderCallBlocksUntilEvidenceResolutionAndSeparateRetry|TestAuthorizedAbortRefundsWithoutUndoingCommittedDueState|TestAuthorizationAndSeparateStoreProtocols|TestWorkloadAuthorizationIsDecidedByHost|TestStaleABAOriginIsSuperseded)$' -count=1
 ```
 
 ## Transition acceptance
