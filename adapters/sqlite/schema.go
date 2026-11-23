@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 9
+	adapterSchemaVersion = 10
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
@@ -22,6 +22,7 @@ const (
 	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
 	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	operationsDDL        = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -35,7 +36,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, operationsExist bool
 	for name, exists := range map[string]*bool{
 		"rff_schema_version":    &schemaExists,
 		"rff_executions":        &recordsExist,
@@ -45,18 +46,19 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		"rff_notification_work": &notificationWorkExists,
 		"rff_timers":            &timersExist,
 		"rff_inputs":            &inputsExist,
+		"rff_operations":        &operationsExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || operationsExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (9)`,
+			`INSERT INTO rff_schema_version (version) VALUES (10)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -64,6 +66,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			notificationWorkDDL,
 			timersDDL,
 			inputsDDL,
+			operationsDDL,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -71,6 +74,13 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			}
 		}
 	} else {
+		if !operationsExist {
+			return fmt.Errorf("%w: tracked operation table missing", ErrUnsupportedSchema)
+		}
+		var operationDefinition string
+		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rff_operations'`).Scan(&operationDefinition); err != nil || operationDefinition != operationsDDL {
+			return fmt.Errorf("%w: incompatible tracked operation table", ErrUnsupportedSchema)
+		}
 		if !recordsExist || !activeExists {
 			return fmt.Errorf("%w: adapter tables are incomplete", ErrUnsupportedSchema)
 		}
@@ -247,6 +257,14 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		if schemaVersion < 9 {
 			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 9`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
+		if err := validateOperations(ctx, tx); err != nil {
+			return err
+		}
+		if schemaVersion < 10 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 10`); err != nil {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}

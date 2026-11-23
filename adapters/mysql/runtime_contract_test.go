@@ -16,6 +16,54 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+func TestRuntimeOperationContract(t *testing.T) {
+	runtimecontract.RunOperation(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationSuccessRace(t *testing.T) {
+	runtimecontract.RunOperationSuccessRace(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationAbort(t *testing.T) {
+	runtimecontract.RunOperationAbort(t, func(t *testing.T) runtimecontract.OperationControlStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationAbortRace(t *testing.T) {
+	runtimecontract.RunOperationAbortRace(t, func(t *testing.T) runtimecontract.OperationControlStore { return openMySQL(t) })
+}
+
+func TestRuntimeConcurrentOperations(t *testing.T) {
+	runtimecontract.RunConcurrentOperations(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationMigration(t *testing.T) {
+	runtimecontract.RunOperationMigration(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
+}
+
+func TestOperationProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.OperationRestartPhase) != "" {
+		runtimecontract.OperationRestartChild(t, open)
+		return
+	}
+	for _, phase := range []string{"intent", "dispatch", "result"} {
+		t.Run(phase, func(t *testing.T) {
+			_, config := newMySQLDatabase(t)
+			runtimecontract.RunOperationRestart(t, config.FormatDSN(), phase, open)
+		})
+	}
+}
+
+func TestOperationRecordIsolation(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	runtimecontract.RunOperationIsolation(t, config.FormatDSN(), db, open, mysql.ErrUnsupportedSchema)
+}
+
 func openMySQL(t *testing.T) *mysql.Store[string, string] {
 	t.Helper()
 	_, config := newMySQLDatabase(t)

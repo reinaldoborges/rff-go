@@ -228,6 +228,13 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 		return errors.New("worker clock returned an invalid timeout")
 	}
 	defer cancelAttempt()
+	operationCtx, cancelOperations := context.WithCancel(attemptCtx)
+	defer cancelOperations()
+	if store, ok := w.store.(OperationStore); ok && !nilcheck.IsNil(store) {
+		operationCtx = context.WithValue(operationCtx, operationTrackerKey{}, &operationScope{
+			ctx: operationCtx, store: store, lease: lease, clock: w.config.Clock.Now,
+		})
+	}
 	ticker := w.config.Clock.NewTicker(w.config.RenewalInterval)
 	if nilcheck.IsNil(ticker) {
 		return errors.New("worker clock returned a nil ticker")
@@ -277,12 +284,13 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	}
 	hookDone := make(chan hookOutcome, 1)
 	go func() {
-		hookErr, err := prepared.invoke(attemptCtx, attempt)
+		hookErr, err := prepared.invoke(operationCtx, attempt)
 		hookDone <- hookOutcome{hookErr: hookErr, err: err}
 	}()
 	var result HookResult
 	select {
 	case outcome := <-hookDone:
+		cancelOperations()
 		err = outcome.err
 		if err == nil {
 			result, err = prepared.finish(attemptCtx, outcome.hookErr)
