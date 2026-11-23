@@ -20,6 +20,18 @@ func TestRuntimeOperationContract(t *testing.T) {
 	runtimecontract.RunOperation(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
 }
 
+func TestRuntimeOperationReconciliationContract(t *testing.T) {
+	runtimecontract.RunOperationReconciliation(t, func(t *testing.T) runtimecontract.OperationReconciliationStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationSafeRepeatContract(t *testing.T) {
+	runtimecontract.RunOperationSafeRepeat(t, func(t *testing.T) runtimecontract.OperationRepeatStore {
+		return openMySQL(t)
+	})
+}
+
 func TestRuntimeOperationSuccessRace(t *testing.T) {
 	runtimecontract.RunOperationSuccessRace(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
 }
@@ -54,6 +66,10 @@ func TestOperationProcessRestart(t *testing.T) {
 			runtimecontract.RunOperationRestart(t, config.FormatDSN(), phase, open)
 		})
 	}
+	t.Run("late-provider-call", func(t *testing.T) {
+		_, config := newMySQLDatabase(t)
+		runtimecontract.RunOperationLateCallRestart(t, config.FormatDSN(), open)
+	})
 }
 
 func TestOperationRecordIsolation(t *testing.T) {

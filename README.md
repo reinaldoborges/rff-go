@@ -55,14 +55,27 @@ compensation. Business deduplication across executions remains host-owned.
 The adapters durably record possible dispatch before the call and its confirmed
 result before returning. Matching calls replay the recorded result; conflicts,
 missing behavior, codecs, unverifiable equality, stale attempts and uncertain
-results fail explicitly. A dispatch error is treated as unknown, not as proof
-that nothing happened. An unresolved operation blocks work success and final
-abort, even after a process restart. `OperationInspector` exposes retained
-safe data; the host must authorize access. No automatic unknown-outcome
-reconciliation, operator resolution, or compensation-prerequisite enforcement
-is provided here. Until those facilities are implemented, the host must not
-repeat unknown effects or assume dependent compensation is safe. Fencing
-cannot stop an external call already in flight and is not an exactly-once
+results fail explicitly. A dispatch error is unknown unless the host's
+`ClassifyDispatch` callback supplies verifiable provider evidence. The
+`Reconcile` callback may establish success, a definitive failure, or
+authoritative absence. Absence permits redispatch only when evidence also
+proves every earlier call is quiescent. Unknown mutations require a
+`SafeRepeatGuarantee` bound to the exact identity, provider scope, a
+host-verified non-secret input fingerprint, and the overlap horizon; evidence
+and guarantees are revalidated at use.
+Hosts must also reject repeats of reads when a new response could change the
+original result. Evidence records should contain only safe provenance and
+validity bounds, never credentials, secrets or raw errors.
+
+An irreconcilable operation remains unresolved and blocks work success and
+final abort, including after process restart. `AuthorizedOperationResolver`
+provides an authorization, audit and idempotency boundary for evidence-backed
+operator resolutions during intervention. Resolution fences stale reports but
+does not schedule or resume work; a separately authorized retry or abort must
+pass the existing transition phase gates. `OperationInspector` exposes
+retained safe data; the host must authorize access. Compensation-prerequisite
+enforcement remains separate and is not provided here. Fencing cannot stop an
+external call already in flight, and the runtime makes no exactly-once effect
 guarantee.
 
 An execution migration with tracked operations requires the optional operation
@@ -247,7 +260,8 @@ databases. The standard `./scripts/check.sh` and CI remain MySQL-independent.
 With that DSN set, run the focused dual-adapter operation checks using:
 
 ```sh
-go test ./adapters/sqlite ./adapters/mysql -run 'TestRuntimeOperation|TestRuntimeConcurrentOperations|TestOperationProcessRestart|TestOperationRecordIsolation' -count=1
+go test ./runtime -run 'TestTrackedUnknownOperation|TestUnknownMutation|TestAuthoritativeAbsence|TestTrackedReadRepeat|TestExpiredEvidence' -count=1
+go test ./adapters/sqlite ./adapters/mysql -run 'TestRuntimeOperation(Reconciliation)?Contract|TestOperationProcessRestart|TestOperationRecordIsolation' -count=1
 ```
 
 ## Local task-manager fixture
