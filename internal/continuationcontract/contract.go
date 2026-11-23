@@ -81,6 +81,13 @@ func RunReadiness(t *testing.T, store Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	premature := transition.ContinuationMarker[string, string]{
+		SchemaVersion: 1, ExecutionID: "origin", OperationID: "not-yet-committable", Entity: "entity", Target: "due",
+		MachineID: "plan", MachineVersion: "1", Policy: policy,
+	}
+	if err := store.RecordContinuationMarker(ctx, premature); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("marker before commit operation must be rejected: %v", err)
+	}
 	lease, err := store.AcquireTransitionLease(ctx, "entity", "origin", "owner", clock, time.Hour)
 	if err != nil {
 		t.Fatal(err)

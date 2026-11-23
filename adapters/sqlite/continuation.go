@@ -78,13 +78,10 @@ func (s *Store[EntityID, StateID]) validateContinuationOrigin(ctx context.Contex
 	if err != nil {
 		return err
 	}
-	if execution.Continuation == nil || execution.CommitReceipt != nil && execution.CommitReceipt.Outcome != transition.CommitSucceeded {
+	if execution.Continuation == nil || execution.CommitOperationID == "" || execution.CommitReceipt != nil && execution.CommitReceipt.Outcome != transition.CommitSucceeded {
 		return transition.ErrConflict
 	}
 	operation := execution.CommitOperationID
-	if operation == "" {
-		operation = marker.OperationID
-	}
 	expected := transition.ContinuationMarker[EntityID, StateID]{
 		SchemaVersion: 1, ExecutionID: execution.ID, OperationID: operation, Entity: execution.Entity, Target: execution.Target,
 		MachineID: execution.Continuation.MachineID, MachineVersion: execution.Continuation.MachineVersion, Policy: execution.Continuation.Policy,
