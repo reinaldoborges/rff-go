@@ -31,6 +31,9 @@ type providerReceipt struct {
 
 func (h *Host) charge(ctx context.Context, execution fsm.ExecutionContext[string, State, Event, Input]) error {
 	input := execution.Input()
+	if handled, err := h.chargeBatch(ctx, input.PlanID, execution); handled || err != nil {
+		return err
+	}
 	opInput := providerInput{PlanID: input.PlanID, PeriodID: input.PeriodID, Amount: amountCents, Kind: "charge"}
 	encoded, err := json.Marshal(opInput)
 	if err != nil {
