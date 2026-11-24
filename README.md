@@ -218,6 +218,62 @@ the store. Continuation, typed input, timer delivery, and notification paths
 are optional and explicitly enabled. The lifecycle does not provide global
 capacity or multi-node coordination. Existing lower-level APIs remain available.
 
+#### Complete lifecycle demonstration
+
+The renewal example also has a continuously running host. Use a fresh local
+database and two terminals:
+
+```sh
+go build -o ./renewal-lifecycle ./examples/renewal
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-start-notify
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-input
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-timer
+./renewal-lifecycle -db ./lifecycle.db -action serve
+```
+
+In the other terminal, wait until `inspect` reports `AwaitingApproval`, then:
+
+```sh
+./renewal-lifecycle -db ./lifecycle.db -action inspect
+./renewal-lifecycle -db ./lifecycle.db -action approve
+./renewal-lifecycle -db ./lifecycle.db -action inspect
+./renewal-lifecycle -db ./lifecycle.db -action inspect-lifecycle
+```
+
+The approval commits `Due`; durable Continuations advance through payment to
+`Renewed`. The initial transition requests notification handoff, whose
+independent delivery is recorded by intent ID. The typed command and already
+due one-shot timer independently record host-owned receipts; they do not
+perform approval. `inspect-lifecycle` reports their receipt counts. Input is
+deliberately left pending by `enqueue-input` to demonstrate startup replay.
+The timer's fixed past deadline makes repeat scheduling idempotent. No wakeup
+is sent by these separate processes; polling discovers their durable work.
+Stop `serve` with Ctrl-C or SIGTERM, and restart it against the same database.
+Only one `serve` process may coordinate that store.
+
+The example fixes polling at 100ms, hook capacity at two, timer and notification
+capacity at one each, leases at five seconds, and shutdown at five seconds.
+It prints readiness, local hook capacity and safe per-path status each second.
+Readiness means each path checked successfully and is running, not that the
+backlog is drained; capacity can be zero while ready. Startup and later scan
+errors are logged with safe path classifications; independent paths keep
+running. Correct the cause and restart the process for stopped paths.
+Do not expose unsanitized startup errors to untrusted users.
+
+This is a local example, not an external intake or security boundary. The host
+owns intake, authorization, idempotency, domain persistence, commit fencing,
+stable identities and downstream-effect safety. Receipts in this example
+deduplicate local demonstration effects; real external effects need their own
+durable reconciliation and idempotency guarantees. A shutdown deadline error
+does not mean a cancellation-ignoring external call stopped. The example
+provides no recurring or batch scheduler, global capacity, multi-node
+coordination, production-readiness or exactly-once guarantee.
+
+The process-restart demonstration test is
+`go test ./examples/renewal -run '^TestLifecycleDemo'`. The durable SQLite
+capacity, independent progress and incomplete-hook shutdown contract is
+`go test ./adapters/sqlite -run '^TestEmbeddedLifecycleDurableProgressAndShutdown$'`.
+
 Timer delivery can be explicitly enabled before `Start` with
 `Lifecycle.EnableTimerDelivery(store, resolver, handler, TimerLifecycleConfig)`.
 Provide positive capacity, a worker ID, clock and valid lease and renewal

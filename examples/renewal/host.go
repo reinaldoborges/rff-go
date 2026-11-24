@@ -80,6 +80,10 @@ type persistence interface {
 	transition.CoordinatorStore[string, State]
 	transition.HookActivityStore[string, State]
 	transition.CommitStore[string, State]
+	transition.NotificationStore[string, State]
+	transition.InputStore
+	transition.TimerScheduleStore
+	transition.TimerDeliveryStore
 	transition.ContinuationDriveStore[string, State]
 	transition.ContinuationControlStore[string, State]
 	transition.ContinuationMarkerStore[string, State]
@@ -446,6 +450,10 @@ func (h *Host) Start(ctx context.Context, plan, period string) (string, error) {
 }
 
 func (h *Host) startOwned(ctx context.Context, plan, period, ownerKind, ownerID string) (string, error) {
+	return h.startOwnedWithNotification(ctx, plan, period, ownerKind, ownerID, transition.NotifyDisable)
+}
+
+func (h *Host) startOwnedWithNotification(ctx context.Context, plan, period, ownerKind, ownerID string, notification transition.NotificationOverride) (string, error) {
 	if plan == "" || period == "" {
 		return "", transition.ErrInvalidRequest
 	}
@@ -491,7 +499,7 @@ func (h *Host) startOwned(ctx context.Context, plan, period, ownerKind, ownerID 
 		MachineID: machineID, MachineVersion: machineVersion,
 		Input:        Input{PlanID: plan, PeriodID: period, Principal: "renewal-host"},
 		InputCodec:   (jsonCodec[Input]{version: "1"}).Version(),
-		Notification: transition.NotifyDisable,
+		Notification: notification,
 	})
 	if err != nil {
 		return "", err
