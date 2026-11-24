@@ -20,6 +20,23 @@ The checks require Go 1.27.3, CGO, and a supported C compiler for the SQLite
 adapter and race detection.
 See [AGENTS.md](AGENTS.md) for the verification commands.
 
+## Durable typed inputs
+
+Construct an `InputIngress` with a durable input store, channel, codec resolver
+and host handler, then explicitly include it in `LifecycleConfig.Inputs`.
+Each enabled channel is supervised as `input:<channel>` and is checked at
+startup and periodically using `PollInterval`; `Wakeup` is only a hint.
+Channel names must be unique and safe to expose in diagnostics. A stopped
+channel requires `RestartPath` after correction. Shutdown cancels scans; an
+unfinished input remains eligible for replay.
+
+The host owns external receivers, authentication, authorization and domain
+mapping. Handlers must durably deduplicate effects and outcomes by input ID:
+delivery can repeat, including after process restart or an unknown outcome.
+Keep channel codec and handler mappings compatible across restarts. Status
+contains classifications rather than raw errors; `Lifecycle.Err` is intended
+for trusted host diagnostics and can contain sensitive error details.
+
 ## Recurring-renewal host example
 
 `examples/renewal` is a runnable, non-production host integration using the
@@ -146,7 +163,138 @@ persist hook outcomes.
 renews their leases while working and reporting, and supports draining.
 An attempt timeout is reported without waiting for a hook that ignores context
 cancellation; such a hook may continue external side effects, which the host
-must make idempotent.
+must make idempotent. It retains its local worker slot until it actually exits.
+
+### Embedded transition lifecycle
+
+`runtime.NewLifecycle` optionally runs the existing transition and commit
+coordinators and a bounded pool of hook workers. Supply the durable store,
+versioned hook runner and classifier, fenced host commit, coordinator and
+worker lease settings, capacity, clocks, and a positive polling interval
+shorter than the coordinator lease. Call `Start(ctx)` to synchronously check
+transition and commit work and report startup errors; worker claims begin
+asynchronously. Even when `Start` reports a scan error, independent paths run
+and the host must call `Shutdown`. Thereafter the lifecycle polls without
+further requests; `Wakeup()` is only a hint and may be dropped.
+
+`Status()` reports each path's initial check, running state and safe error
+classification. Readiness requires a successful check and healthy execution
+for every path, not an empty backlog. Local available capacity is separate:
+busy hooks can exhaust capacity without making durable checks unready. Transition
+and commit reconciliation share a path and lease; hook worker paths are
+independently supervised. No other paths are enabled implicitly.
+Lifecycle hook stores must implement `CheckHookActivities`, and notification
+outboxes must implement `CheckNotificationActivities`. These methods check
+durable inventory without claiming work or consuming attempts, so checks can
+continue even when cancellation-ignoring work occupies all local slots. A
+successful inventory check does not prove a future claim or report will succeed;
+a recoverable claim or report failure remains visible until a worker can retry,
+even if an inventory check could succeed.
+
+Before `Start`, call `EnableNotifications` to explicitly configure the
+notification store, fenced handoff, delivery store, delivery function, worker
+capacity and independent delivery timing. This adds a handoff scan and bounded
+delivery worker paths to lifecycle supervision. Startup and polling recover
+durable work even without wakeups. A successful handoff completes the
+transition; delivery is independently retried by stable intent ID and never
+repeats hooks or rolls back domain state. The host must make downstream effects
+idempotent. Delivery errors whose retry was durably scheduled are surfaced and
+retried; store and handoff errors follow the normal path classification rules.
+A timed-out adapter that ignores cancellation continues to occupy local
+delivery capacity until it returns.
+
+Recognized lease conflicts are retried; use `LifecycleConfig.ClassifyError` to
+classify other errors as recoverable or fatal. Unclassified errors stop the
+affected path. Recoverable errors are signaled and retried after the configured
+poll interval, even if wakeups arrive. These retries do not renew durable
+attempt budgets or deadlines. Correct a stopped path and call `RestartPath`
+with its name from `Status()`; a new lifecycle can also be started after
+shutdown. Monitor `Errors()` and inspect `Err()` for the latest error per path.
+`Err()` retains the last observed error even after recovery; use the current
+`Status()` classification and readiness to determine whether a path is healthy.
+Unlike `Status`, `Err` and `Start` errors may contain sensitive host or store
+details; do not persist or expose them without sanitizing.
+Call `Shutdown(ctx)` to stop scans and claims and drain hooks and deliveries
+while renewing activity leases. If the context expires, unfinished work is cancelled and
+renewal stops; the error means external work may still be running. Do not
+close its dependencies until the host has accounted for any work that ignores
+cancellation. Restart reconciliation handles expired attempts under their
+existing policy and fences; external effects remain at-least-once.
+
+The host remains responsible for authorization, its durable domain commit,
+timing appropriate to its workload, and ensuring one logical lifecycle owns
+the store. Continuation, typed input, timer delivery, and notification paths
+are optional and explicitly enabled. The lifecycle does not provide global
+capacity or multi-node coordination. Existing lower-level APIs remain available.
+
+#### Complete lifecycle demonstration
+
+The renewal example also has a continuously running host. Use a fresh local
+database and two terminals:
+
+```sh
+go build -o ./renewal-lifecycle ./examples/renewal
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-start-notify
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-input
+./renewal-lifecycle -db ./lifecycle.db -action enqueue-timer
+./renewal-lifecycle -db ./lifecycle.db -action serve
+```
+
+In the other terminal, wait until `inspect` reports `AwaitingApproval`, then:
+
+```sh
+./renewal-lifecycle -db ./lifecycle.db -action inspect
+./renewal-lifecycle -db ./lifecycle.db -action approve
+./renewal-lifecycle -db ./lifecycle.db -action inspect
+./renewal-lifecycle -db ./lifecycle.db -action inspect-lifecycle
+```
+
+The approval commits `Due`; durable Continuations advance through payment to
+`Renewed`. The initial transition requests notification handoff, whose
+independent delivery is recorded by intent ID. The typed command and already
+due one-shot timer independently record host-owned receipts; they do not
+perform approval. `inspect-lifecycle` reports their receipt counts. Input is
+deliberately left pending by `enqueue-input` to demonstrate startup replay.
+The timer's fixed past deadline makes repeat scheduling idempotent. No wakeup
+is sent by these separate processes; polling discovers their durable work.
+Stop `serve` with Ctrl-C or SIGTERM, and restart it against the same database.
+Only one `serve` process may coordinate that store.
+
+The example fixes polling at 100ms, hook capacity at two, timer and notification
+capacity at one each, leases at five seconds, and shutdown at five seconds.
+It prints readiness, local hook capacity and safe per-path status each second.
+Readiness means each path checked successfully and is running, not that the
+backlog is drained; capacity can be zero while ready. Startup and later scan
+errors are logged with safe path classifications; independent paths keep
+running. Correct the cause and restart the process for stopped paths.
+Do not expose unsanitized startup errors to untrusted users.
+
+This is a local example, not an external intake or security boundary. The host
+owns intake, authorization, idempotency, domain persistence, commit fencing,
+stable identities and downstream-effect safety. Receipts in this example
+deduplicate local demonstration effects; real external effects need their own
+durable reconciliation and idempotency guarantees. A shutdown deadline error
+does not mean a cancellation-ignoring external call stopped. The example
+provides no recurring or batch scheduler, global capacity, multi-node
+coordination, production-readiness or exactly-once guarantee.
+
+The process-restart demonstration test is
+`go test ./examples/renewal -run '^TestLifecycleDemo'`. The durable SQLite
+capacity, independent progress and incomplete-hook shutdown contract is
+`go test ./adapters/sqlite -run '^TestEmbeddedLifecycleDurableProgressAndShutdown$'`.
+
+Timer delivery can be explicitly enabled before `Start` with
+`Lifecycle.EnableTimerDelivery(store, resolver, handler, TimerLifecycleConfig)`.
+Provide positive capacity, a worker ID, clock and valid lease and renewal
+intervals; the lifecycle poll interval must be shorter than the timer lease.
+Each timer worker is an independently supervised path named `timer-worker-N`.
+It checks immediately and polls thereafter, including after missed wakeups.
+The host handler authorizes any resulting domain request and durably
+deduplicates effects by timer ID. A failed delivery retains its fenced claim
+until expiry; classify recoverable host errors to retry, or explicitly restart
+a stopped path after correcting the cause. Shutdown stops new claims and
+renews active deliveries while draining; deadline expiry cancels unfinished
+deliveries, which can be recovered after their leases expire.
 
 Hooks may explicitly call `runtime.TrackOperation` with the hook's context.
 The worker supplies the capability only when its store implements
@@ -221,8 +369,9 @@ coordinator must acquire a fresh transition lease before resuming.
 The shared migration and process-restart contracts run against both adapters
 with a disposable MySQL DSN:
 `go test ./adapters/sqlite ./adapters/mysql -run '^(TestRuntimeMigrationContract|TestRuntimeOperationMigration|TestRuntimeMigrationWithoutProvider|TestContinuationMigrationContract|TestMigrationOperationProcessRestart|TestMigrationWriteProcessCrash)$' -count=1`.
-`Coordinator.Reconcile` scans persisted active executions; the host must call it
-regularly, including without wakeups, and often enough to renew its leases.
+When using the lower-level API, `Coordinator.Reconcile` scans persisted active
+executions; the host must call it regularly, including without wakeups, and
+often enough to renew its leases.
 `RunReconciliation` can schedule these scans using a bounded `WakeupQueue` and
 a polling ticker. Notify the queue after durable work changes; notifications
 are coalesced hints and can be lost. The loop performs an initial scan, owns
@@ -243,16 +392,27 @@ outbox handoff. Unknown handoff outcomes are retried; definitive failures requir
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
 `ContinuationDiscovery` and the adapters' durable marker stores retain
-Continuation intents for a host-scheduled `ContinuationDriver`.
+Continuation intents for a `ContinuationDriver`. To have the embedded
+lifecycle schedule these, call `EnableContinuation` before `Start` with the
+durable continuation store, pinned machine registry, complete driver
+configuration (including acceptor, authorized fenced delivery host, origin
+revision lookup, codecs, clock and lease duration), and a nonempty owner. The
+commit host must attest to durable Continuation commits, and the lease duration
+must exceed the lifecycle polling interval. Pass a replayable
+marker source for separate stores, or nil only when commits atomically persist
+intents in the runtime store. The independent `continuation` path scans at
+startup and polls thereafter; evaluation and delivery run asynchronously after
+the initial inventory. Its errors and interventions are supervised like other
+paths. It is not enabled merely because the store supports Continuation.
 Acceptance pins an opted-in target's policy; the shared-store commit writes a
 marker atomically. Separate-store hosts must attest to atomically retaining a
-replayable marker before commit, and schedule discovery. Receipt reconciliation
+replayable marker before commit, and enable or schedule discovery. Receipt reconciliation
 waits for the matching runtime marker. Listing a marker does not establish that
 its origin is ready for evaluation; `ContinuationReady` checks the successful
 receipt and original reservation release. Missing origins return
 `ErrContinuationOriginMissing`; discovery leaves those host markers
 unacknowledged for retry, and readiness diagnoses previously stored orphans.
-The host must keep polling durable markers. The driver evaluates only the
+Without lifecycle supervision the host must keep polling durable markers. The driver evaluates only the
 pinned machine version, persists its first decision, and uses the pinned
 attempt, deadline, and retry policy. Reservation waits pause an already
 started attempt. Exhaustion and definitive denial require an authorized retry;
@@ -291,9 +451,10 @@ Driver, control, and process-restart coverage for both adapters can be run
 with `go test ./internal/successorcontract ./adapters/sqlite ./adapters/mysql -run '^(TestDeliveryPermitCheckedAtHostAcceptance|TestWaiverTombstoneRacesAcceptance|TestContinuationDriv)' -count=1`
 and a disposable MySQL DSN.
 `NotificationWorker` claims and delivers intents independently, renews claims
-while delivering, and schedules retries with its own configured timing. The
-host schedules worker calls and must make downstream delivery idempotent by
-intent ID. A delivery error is returned even when retry scheduling succeeds.
+while delivering, and schedules retries with its own configured timing. When
+used outside the lifecycle, the host schedules worker calls. Downstream delivery
+must be idempotent by intent ID. A delivery error is returned even when retry
+scheduling succeeds.
 Timed-out deliveries may continue if the provider ignores context cancellation;
 their late results cannot complete the timed-out claim.
 When a worker cannot rehydrate a pinned hook before starting it, the adapter
@@ -309,8 +470,9 @@ or state value cannot be decoded.
 summaries, including compatibility diagnostics and hook attempt history. The
 host must authorize access and protect application-provided failure details.
 `TimerScheduler` persists typed timer events with stable IDs and original
-deadlines. The host schedules `TimerWorker.RunOne` calls and supplies a durable
-handler that deduplicates by timer ID. Delivery is at least once, and errors
+deadlines. The host can schedule `TimerWorker.RunOne` calls or enable lifecycle
+timer delivery, and supplies a durable handler that deduplicates by timer ID.
+Delivery is at least once, and errors
 leave claims to expire for recovery. Timer scheduling is not atomic with
 application state: hosts must reconcile missing timers from durable workflow
 state after a crash. Unavailable timer event codecs block only the affected

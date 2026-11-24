@@ -86,6 +86,48 @@ func TestWorkerTimeoutDoesNotWaitForUncooperativeHook(t *testing.T) {
 	}
 }
 
+func TestWorkerKeepsCapacityUntilTimedOutHookActuallyExits(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	runner, record, call := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}})
+	now := time.Now()
+	record.Policy.AttemptTimeout = time.Minute
+	record.Deadline = now.Add(time.Hour)
+	clock := &controlledTimeoutClock{
+		manualWorkerClock: &manualWorkerClock{now: now, ticker: &manualTicker{ticks: make(chan time.Time, 1)}},
+		deadline:          &controlledDeadline{done: make(chan struct{})},
+	}
+	store := &oneActivityStore{record: record, call: call}
+	worker, err := transition.NewHookWorker[string, string, string, int](store, runner, transition.WorkerConfig{
+		ID: "worker", Capacity: 1, LeaseTTL: time.Minute, RenewalInterval: time.Second, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- worker.RunOne(context.Background()) }()
+	<-started
+	close(clock.deadline.done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RunOne(context.Background()); !errors.Is(err, transition.ErrWorkerAtCapacity) {
+		t.Errorf("uncooperative hook did not retain capacity: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := worker.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("unfinished hook not reported at shutdown: %v", err)
+	}
+	close(release)
+	if err := worker.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerReportsClassifiedAttemptTimeout(t *testing.T) {
 	runner, record, call := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error {
 		t.Fatal("expired attempt ran its hook")

@@ -13,6 +13,11 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+// CheckHookActivities validates the durable inventory without a claim.
+func (s *Store[EntityID, StateID]) CheckHookActivities(ctx context.Context) error {
+	return s.hookTransaction(ctx, func(tx *sql.Tx) error { return validateHookWork(ctx, tx) })
+}
+
 // ClaimHook claims a due, unstarted hook without consuming an attempt.
 func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, clock func() time.Time, ttl time.Duration) (transition.HookLease, error) {
 	var lease transition.HookLease

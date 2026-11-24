@@ -12,9 +12,12 @@ import (
 
 // NotificationDeliveryFixture supplies independent transition and delivery ports.
 type NotificationDeliveryFixture struct {
-	Store   Store
+	Store interface {
+		Store
+		CheckHookActivities(context.Context) error
+	}
 	Handoff transition.NotificationHandoff[string, string]
-	Outbox  transition.NotificationActivityStore[string, string]
+	Outbox  transition.LifecycleNotificationStore[string, string]
 }
 
 // RunNotificationDelivery checks stable delivery identity, retry and fencing.
@@ -44,9 +47,12 @@ func RunNotificationDelivery(t *testing.T, newFixture func(*testing.T, func() ti
 	if err := coordinator.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.CheckHookActivities(ctx); err != nil {
+		t.Fatalf("check pending hook inventory: %v", err)
+	}
 	claim, err := store.ClaimHook(ctx, "hook-worker", clock, time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || claim.Generation != 1 {
+		t.Fatalf("inventory check consumed hook claim: %+v, %v", claim, err)
 	}
 	if _, err := store.StartHook(ctx, claim, clock); err != nil {
 		t.Fatal(err)
@@ -72,9 +78,20 @@ func RunNotificationDelivery(t *testing.T, newFixture func(*testing.T, func() ti
 	if err := notifications.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := outbox.CheckNotificationActivities(ctx); err != nil {
+		t.Fatalf("check pending notification inventory: %v", err)
+	}
 	first, err := outbox.ClaimNotification(ctx, "worker", clock, time.Minute)
-	if err != nil || first.Intent.ExecutionID != "execution" {
+	if err != nil || first.Intent.ExecutionID != "execution" || first.Attempt != 1 {
 		t.Fatalf("durable notification was not claimable: %+v, %v", first, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := store.CheckHookActivities(canceled); err == nil {
+		t.Fatal("canceled hook inventory check succeeded")
+	}
+	if err := outbox.CheckNotificationActivities(canceled); err == nil {
+		t.Fatal("canceled notification inventory check succeeded")
 	}
 	now = now.Add(time.Minute)
 	second, err := outbox.ClaimNotification(ctx, "replacement", clock, time.Minute)

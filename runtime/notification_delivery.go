@@ -75,6 +75,15 @@ func NewNotificationWorker[EntityID comparable, StateID comparable](
 // RunOne claims, delivers, and reports one notification. Delivery failures are
 // returned after a durable retry is scheduled; cancellation leaves an expiring claim.
 func (w *NotificationWorker[EntityID, StateID]) RunOne(ctx context.Context) error {
+	return w.runOne(ctx, nil, nil, nil)
+}
+
+type notificationDeliveryFailure struct{ err error }
+
+func (e *notificationDeliveryFailure) Error() string { return e.err.Error() }
+func (e *notificationDeliveryFailure) Unwrap() error { return e.err }
+
+func (w *NotificationWorker[EntityID, StateID]) runOne(ctx context.Context, checked func(), start func() (context.Context, bool), onDelivery func(<-chan struct{})) error {
 	delivery, err := w.store.ClaimNotification(ctx, w.config.ID, w.config.Clock.Now, w.config.LeaseTTL)
 	if err != nil {
 		return err
@@ -83,6 +92,16 @@ func (w *NotificationWorker[EntityID, StateID]) RunOne(ctx context.Context) erro
 	if delivery.Intent.ID == "" || delivery.Intent.ID != lease.IntentID || delivery.Intent.ExecutionID != lease.ExecutionID ||
 		lease.Owner != w.config.ID || lease.Generation == 0 || delivery.Attempt == 0 || !w.config.Clock.Now().Before(lease.ExpiresAt) {
 		return ErrStaleNotificationLease
+	}
+	if checked != nil {
+		checked()
+	}
+	if start != nil {
+		var ok bool
+		ctx, ok = start()
+		if !ok {
+			return context.Canceled
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -141,7 +160,12 @@ func (w *NotificationWorker[EntityID, StateID]) RunOne(ctx context.Context) erro
 		}
 	}()
 	deliveryDone := make(chan error, 1)
+	deliveryExited := make(chan struct{})
+	if onDelivery != nil {
+		onDelivery(deliveryExited)
+	}
 	go func() {
+		defer close(deliveryExited)
 		if err := attemptCtx.Err(); err != nil {
 			deliveryDone <- err
 			return
@@ -173,6 +197,9 @@ func (w *NotificationWorker[EntityID, StateID]) RunOne(ctx context.Context) erro
 	stopRenewal()
 	renewalErr := <-renewed
 	if reported {
+		if start != nil && deliveryErr != nil {
+			return &notificationDeliveryFailure{err: deliveryErr}
+		}
 		return deliveryErr
 	}
 	if reportErr != nil {
