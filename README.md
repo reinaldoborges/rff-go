@@ -167,6 +167,16 @@ busy hooks can exhaust capacity without making durable checks unready. Transitio
 and commit reconciliation share a path and lease; hook worker paths are
 independently supervised. No other paths are enabled implicitly.
 
+Before `Start`, call `EnableNotifications` to explicitly configure the
+notification store, fenced handoff, delivery store, delivery function, worker
+capacity and independent delivery timing. This adds a handoff scan and bounded
+delivery worker paths to lifecycle supervision. Startup and polling recover
+durable work even without wakeups. A successful handoff completes the
+transition; delivery is independently retried by stable intent ID and never
+repeats hooks or rolls back domain state. The host must make downstream effects
+idempotent. Delivery errors whose retry was durably scheduled are surfaced and
+retried; store and handoff errors follow the normal path classification rules.
+
 Recognized lease conflicts are retried; use `LifecycleConfig.ClassifyError` to
 classify other errors as recoverable or fatal. Unclassified errors stop the
 affected path. Recoverable errors are signaled and retried after the configured
@@ -176,8 +186,8 @@ with its name from `Status()`; a new lifecycle can also be started after
 shutdown. Monitor `Errors()` and inspect `Err()` for the latest error per path.
 Unlike `Status`, `Err` and `Start` errors may contain sensitive host or store
 details; do not persist or expose them without sanitizing.
-Call `Shutdown(ctx)` to stop scans and claims and drain hooks while renewing
-activity leases. If the context expires, unfinished hooks are cancelled and
+Call `Shutdown(ctx)` to stop scans and claims and drain hooks and deliveries
+while renewing activity leases. If the context expires, unfinished work is cancelled and
 renewal stops; the error means external work may still be running. Do not
 close its dependencies until the host has accounted for any work that ignores
 cancellation. Restart reconciliation handles expired attempts under their
@@ -185,7 +195,7 @@ existing policy and fences; external effects remain at-least-once.
 
 The host remains responsible for authorization, its durable domain commit,
 timing appropriate to its workload, and ensuring one logical lifecycle owns
-the store. This lifecycle does not run Continuation, notification, timer, or
+the store. This lifecycle does not run Continuation, timer, or
 other optional paths, and does not provide global capacity or multi-node
 coordination. Existing lower-level APIs remain available.
 
@@ -333,9 +343,10 @@ Driver, control, and process-restart coverage for both adapters can be run
 with `go test ./internal/successorcontract ./adapters/sqlite ./adapters/mysql -run '^(TestDeliveryPermitCheckedAtHostAcceptance|TestWaiverTombstoneRacesAcceptance|TestContinuationDriv)' -count=1`
 and a disposable MySQL DSN.
 `NotificationWorker` claims and delivers intents independently, renews claims
-while delivering, and schedules retries with its own configured timing. The
-host schedules worker calls and must make downstream delivery idempotent by
-intent ID. A delivery error is returned even when retry scheduling succeeds.
+while delivering, and schedules retries with its own configured timing. When
+used outside the lifecycle, the host schedules worker calls. Downstream delivery
+must be idempotent by intent ID. A delivery error is returned even when retry
+scheduling succeeds.
 Timed-out deliveries may continue if the provider ignores context cancellation;
 their late results cannot complete the timed-out claim.
 When a worker cannot rehydrate a pinned hook before starting it, the adapter

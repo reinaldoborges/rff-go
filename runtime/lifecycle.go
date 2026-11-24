@@ -50,30 +50,34 @@ type LifecycleStatus struct {
 }
 
 type lifecyclePath struct {
-	name   string
-	wake   chan struct{}
-	done   chan struct{}
-	status PathStatus
-	step   func(context.Context, func()) error
-	worker bool
-	err    error
+	name       string
+	wake       chan struct{}
+	done       chan struct{}
+	status     PathStatus
+	step       func(context.Context, func()) error
+	worker     bool
+	hookWorker bool
+	idle       error
+	err        error
 }
 
 // Lifecycle runs a single local transition coordinator and bounded hook workers.
 // The host must ensure only one logical lifecycle coordinates a store.
 type Lifecycle[EntityID comparable, StateID comparable, Event, Input any] struct {
-	worker   *HookWorker[EntityID, StateID, Event, Input]
-	interval time.Duration
-	classify func(error) PathErrorClass
-	errors   chan struct{}
+	worker      *HookWorker[EntityID, StateID, Event, Input]
+	coordinator CoordinatorConfig
+	interval    time.Duration
+	classify    func(error) PathErrorClass
+	errors      chan struct{}
 
-	mu       sync.Mutex
-	started  bool
-	stopping bool
-	cancel   context.CancelFunc
-	ctx      context.Context
-	startup  chan struct{}
-	paths    []*lifecyclePath
+	mu            sync.Mutex
+	started       bool
+	stopping      bool
+	cancel        context.CancelFunc
+	ctx           context.Context
+	startup       chan struct{}
+	paths         []*lifecyclePath
+	notifications *lifecycleNotifications[EntityID, StateID]
 }
 
 // NewLifecycle validates all dependencies and timing before any work starts.
@@ -97,12 +101,12 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		return nil, err
 	}
 	l := &Lifecycle[EntityID, StateID, Event, Input]{
-		worker: worker, interval: config.PollInterval,
+		worker: worker, coordinator: config.Coordinator, interval: config.PollInterval,
 		classify: config.ClassifyError, errors: make(chan struct{}, 1),
 	}
 	add := func(name string, worker bool, step func(context.Context, func()) error) {
 		l.paths = append(l.paths, &lifecyclePath{name: name, wake: make(chan struct{}, 1),
-			status: PathStatus{Name: name}, step: step, worker: worker})
+			status: PathStatus{Name: name}, step: step, worker: worker, hookWorker: worker, idle: ErrNoHookActivity})
 	}
 	add("transition", false, func(ctx context.Context, _ func()) error {
 		if err := coordinator.Reconcile(ctx); err != nil {
@@ -221,7 +225,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) runPath(ctx context.Context
 		if ctx.Err() != nil {
 			return
 		}
-		if path.worker && onlyPathSignal(err, ErrNoHookActivity) {
+		if path.worker && path.idle != nil && onlyPathSignal(err, path.idle) {
 			l.recordSuccess(path)
 			wait = true
 			continue
@@ -250,6 +254,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) runPath(ctx context.Context
 
 func onlyPathSignal(err, signal error) bool {
 	if err == nil {
+		return false
+	}
+	if _, ok := err.(*notificationDeliveryFailure); ok {
 		return false
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
@@ -297,6 +304,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) recordFailure(path *lifecyc
 }
 
 func classifyPathError(err error, host func(error) PathErrorClass) PathErrorClass {
+	if _, ok := err.(*notificationDeliveryFailure); ok {
+		return PathErrorRecoverable
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		result := PathErrorRecoverable
 		for _, child := range joined.Unwrap() {
@@ -315,6 +325,7 @@ func classifyPathError(err error, host func(error) PathErrorClass) PathErrorClas
 	}
 	if errors.Is(err, ErrLeaseHeld) || errors.Is(err, ErrStaleLease) ||
 		errors.Is(err, ErrStaleActivityLease) || errors.Is(err, ErrActivityLeaseHeld) ||
+		errors.Is(err, ErrStaleNotificationLease) ||
 		errors.Is(err, ErrExecutionNotActive) || errors.Is(err, ErrTransitionDeadline) {
 		return PathErrorRecoverable
 	}
@@ -353,7 +364,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Status() LifecycleStatus {
 		if !path.status.Running || !path.status.Checked || path.status.Classification != "" {
 			status.Ready = false
 		}
-		if path.worker && path.status.Running && path.status.Checked && path.status.Classification == "" {
+		if path.hookWorker && path.status.Running && path.status.Checked && path.status.Classification == "" {
 			runningWorkers++
 		}
 	}
@@ -396,6 +407,8 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) RestartPath(name string) er
 }
 
 func (l *Lifecycle[EntityID, StateID, Event, Input]) wakeWorkers() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, path := range l.paths {
 		if path.worker {
 			select {
@@ -408,6 +421,8 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) wakeWorkers() {
 
 // Wakeup is a best-effort hint; periodic durable scans remain authoritative.
 func (l *Lifecycle[EntityID, StateID, Event, Input]) Wakeup() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, path := range l.paths {
 		select {
 		case path.wake <- struct{}{}:
@@ -439,10 +454,16 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Shutdown(ctx context.Contex
 		return errors.New("lifecycle is not running")
 	}
 	l.stopping = true
+	if l.notifications != nil {
+		l.notifications.stopClaims()
+	}
 	l.cancel()
 	startup := l.startup
 	l.mu.Unlock()
 	err := l.worker.Shutdown(ctx)
+	if l.notifications != nil {
+		err = errors.Join(err, l.notifications.shutdown(ctx))
+	}
 	select {
 	case <-startup:
 	case <-ctx.Done():
