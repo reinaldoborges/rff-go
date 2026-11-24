@@ -58,6 +58,8 @@ go run ./examples/renewal -db ./lost.db -plan lost-plan -action drive
 For a possible late call, `drive` stops at intervention while lookup remains
 inconclusive. The fake late call is released only by the explicit command;
 evidence resolution and retry are separate authorized actions:
+Retry and abort require a caller-chosen request ID. Reuse it after a lost
+response; choose a new ID only for a new control decision.
 
 ```sh
 go run ./examples/renewal -db ./late.db -plan late-plan -action start
@@ -66,7 +68,7 @@ go run ./examples/renewal -db ./late.db -plan late-plan -action charge-once -pro
 go run ./examples/renewal -db ./late.db -plan late-plan -action drive
 go run ./examples/renewal -db ./late.db -plan late-plan -action late-call
 go run ./examples/renewal -db ./late.db -plan late-plan -action resolve
-go run ./examples/renewal -db ./late.db -plan late-plan -action retry
+go run ./examples/renewal -db ./late.db -plan late-plan -action retry -request-id late-retry-1
 go run ./examples/renewal -db ./late.db -plan late-plan -action drive
 ```
 
@@ -81,7 +83,7 @@ go run ./examples/renewal -db ./refund.db -plan refund-plan -action start
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action drive
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action approve
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action charge-once -provider-mode fail-after-charge
-go run ./examples/renewal -db ./refund.db -plan refund-plan -action abort
+go run ./examples/renewal -db ./refund.db -plan refund-plan -action abort -request-id refund-abort-1
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action drive
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action configure -provider-mode normal
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action reattempt
@@ -96,12 +98,27 @@ disposable MySQL 8.4 database:
 ```sh
 go run ./examples/renewal -backend mysql -dsn "$RFF_MYSQL_DSN"
 go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1 -v
+go test ./examples/renewal -run '^TestBatchMySQLScenarioAndProcessRestart$' -count=1 -v
 ```
 
 The explicit MySQL host test creates isolated schemas and runs real-process
 restart scenarios against both shared and separate runtime/host stores. It
 checks workload allow/deny decisions on MySQL and uses a deterministic
 A-to-B-to-A barrier for stale-origin fencing.
+
+The batch test exercises host-owned stable membership, cursor and
+per-record progress in one transition; a process restart after a confirmed
+tracked effect; blocking on an inconclusive effect; and a separate durable
+fan-out to one FSM entity per record. Both batch modes run against shared and
+separate stores, with host-owned record claims rather than a framework batch
+scheduler. Claims also fence standalone starts. For a blocked batch member,
+`ApplyLateProviderCall` records provider evidence for the member;
+`ResolveCharge` and `Retry` operate on the batch execution. Abort compensates
+each confirmed member effect independently and waits for unknown outcomes.
+The fan-out cursor counts the contiguous completed prefix, and accepted
+member executions are recovered after a process restart.
+See [runtime conformance verification](docs/testing-runtime-conformance.md)
+for the exact MySQL prerequisites, commands, and full gate.
 
 The fixture tests include shared-store SQLite, separate-store SQLite, actual
 process restarts, an inconclusive/late-call barrier, a stale A-to-B-to-A origin
@@ -404,9 +421,9 @@ MySQL-specific schema and concurrency tests locally with
 `./scripts/check-mysql.sh`, which requires `RFF_MYSQL_DSN` to point to a
 disposable MySQL 8.4 database with privileges to create and drop isolated test
 databases. The script also runs the recurring-renewal host scenario and
-real-process restart test against that MySQL DSN; adapter-only MySQL coverage
-does not substitute for host integration. The standard `./scripts/check.sh`
-and CI remain MySQL-independent.
+the batch conformance scenario with real-process restart against that MySQL
+DSN; adapter-only MySQL coverage does not substitute for host integration.
+The standard `./scripts/check.sh` and CI remain MySQL-independent.
 With that DSN set, run the focused dual-adapter operation checks using:
 
 ```sh

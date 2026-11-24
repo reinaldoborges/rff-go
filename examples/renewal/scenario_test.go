@@ -64,7 +64,8 @@ func TestLateProviderCallBlocksUntilEvidenceResolutionAndSeparateRetry(t *testin
 	if resolved.Binding.Identity != before.Binding.Identity || resolved.Result == nil {
 		t.Fatalf("operator resolution did not preserve the original operation: before=%#v resolved=%#v", before, resolved)
 	}
-	runCLI(t, "-action", "retry", "-db", db, "-plan", plan)
+	runCLI(t, "-action", "retry", "-request-id", "retry-lost-response", "-db", db, "-plan", plan)
+	runCLI(t, "-action", "retry", "-request-id", "retry-lost-response", "-db", db, "-plan", plan)
 	final := runCLI(t, "-action", "drive", "-db", db, "-plan", plan)
 	if !strings.Contains(final, "state=Renewed") || !strings.Contains(final, "charges=1") {
 		t.Fatalf("separately authorized retry did not finish the renewal:\n%s", final)
@@ -100,7 +101,7 @@ func TestAuthorizedAbortRefundsWithoutUndoingCommittedDueState(t *testing.T) {
 	if err != nil || blocked.State != Due || blocked.ActiveStatus != transition.NeedsIntervention || blocked.Charges != 1 {
 		t.Fatalf("failure did not leave Due committed with a confirmed charge: status=%#v err=%v", blocked, err)
 	}
-	if err := host.Abort(ctx, plan, "operator"); err != nil {
+	if err := host.Abort(ctx, plan, "operator", plan+"-abort"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.Drive(ctx); err != nil {
@@ -163,7 +164,7 @@ func TestAuthorizationAndSeparateStoreProtocols(t *testing.T) {
 	if err != nil || status.State != Renewed || status.Charges != 1 {
 		t.Fatalf("separate-store marker and successor protocol failed: status=%#v err=%v", status, err)
 	}
-	if err := host.Retry(ctx, plan, "untrusted"); err == nil {
+	if err := host.Retry(ctx, plan, "untrusted", plan+"-unauthorized"); err == nil {
 		t.Fatal("unauthorized operator control succeeded")
 	}
 }
@@ -218,11 +219,330 @@ func runWorkloadAuthorizationScenario(t *testing.T, host *Host) {
 	}
 	t.Logf("driving explicitly denied workload on %s host", host.dialect)
 	if err := host.Drive(ctx); !errors.Is(err, transition.ErrSuccessorDenied) {
+		status, inspectErr := host.Inspect(ctx, deniedPlan, period, "operator")
+		t.Logf("denied workload status after drive failure: status=%#v inspectErr=%v", status, inspectErr)
 		t.Fatalf("host workload denial did not block successor acceptance: %v", err)
 	}
 	denied, err := host.Inspect(ctx, deniedPlan, period, "operator")
 	if err != nil || denied.State != Due || denied.Charges != 0 {
 		t.Fatalf("denied workload advanced or charged the plan: status=%#v err=%v", denied, err)
+	}
+}
+
+func runOperatorAuthorizationScenario(t *testing.T, host *Host, suffix string) {
+	t.Helper()
+	ctx := context.Background()
+	plan := "operator-denial-" + suffix
+	const period = "2026-11"
+	if _, err := host.Start(ctx, plan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, plan, period, "untrusted"); err == nil {
+		t.Fatal("unauthorized manual approval succeeded")
+	}
+	if _, err := host.Inspect(ctx, plan, period, "untrusted"); err == nil {
+		t.Fatal("unauthorized inspection disclosed host state")
+	}
+	if _, err := host.Approve(ctx, plan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, plan, providerFailAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := host.Inspect(ctx, plan, period, "operator")
+	if err != nil || status.State != Due || status.ActiveStatus != transition.NeedsIntervention {
+		t.Fatalf("authorization scenario did not reach intervention: status=%#v err=%v", status, err)
+	}
+	if err := host.Retry(ctx, plan, "untrusted", plan+"-unauthorized"); err == nil {
+		t.Fatal("unauthorized hook control succeeded")
+	}
+	if _, err := host.Inspect(ctx, plan, period, "untrusted"); err == nil {
+		t.Fatal("unauthorized intervention inspection disclosed host state")
+	}
+}
+
+func TestRetryControlLostResponseReplay(t *testing.T) {
+	for _, separate := range []bool{false, true} {
+		name := "shared"
+		if separate {
+			name = "separate"
+		}
+		t.Run(name, func(t *testing.T) {
+			runtimePath := sqlitePath(t, "control-replay-runtime-"+name)
+			hostPath := runtimePath
+			if separate {
+				hostPath = sqlitePath(t, "control-replay-host-"+name)
+			}
+			host, err := openSQLite(runtimePath, hostPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer host.Close()
+			runRetryControlLostResponseReplay(t, host, "control-replay-"+name)
+		})
+	}
+}
+
+func runRetryControlLostResponseReplay(t *testing.T, host *Host, plan string) {
+	t.Helper()
+	ctx := context.Background()
+	const period = "2026-11"
+	requestID := plan + "-stable-retry"
+	if _, err := host.Start(ctx, plan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, plan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, plan, providerFailAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, plan, "operator", requestID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := host.InspectControl(ctx, plan, "operator", requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, plan, "operator", requestID); err != nil {
+		t.Fatalf("lost response replay of same request was not idempotent: %v", err)
+	}
+	replayed, err := host.InspectControl(ctx, plan, "operator", requestID)
+	if err != nil || !first.AcceptedAt.Equal(replayed.AcceptedAt) || !first.Deadline.Equal(replayed.Deadline) {
+		t.Fatalf("control replay changed its accepted cycle: first=%#v replay=%#v err=%v", first, replayed, err)
+	}
+	if err := host.Abort(ctx, plan, "operator", requestID); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("changed control semantics were not rejected: %v", err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, plan, "operator", requestID); err != nil {
+		t.Fatalf("replay after later intervention failed: %v", err)
+	}
+	blocked, err := host.Inspect(ctx, plan, period, "operator")
+	if err != nil || blocked.ActiveStatus != transition.NeedsIntervention {
+		t.Fatalf("replayed request started a second control cycle: status=%#v err=%v", blocked, err)
+	}
+	if err := host.SetProviderMode(ctx, plan, providerNormal); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, plan, "operator", plan+"-second-retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, plan, "operator", requestID); err != nil {
+		t.Fatalf("completed execution lost the control receipt: %v", err)
+	}
+	after, err := host.InspectControl(ctx, plan, "operator", requestID)
+	if err != nil || !first.Deadline.Equal(after.Deadline) || !first.AcceptedAt.Equal(after.AcceptedAt) {
+		t.Fatalf("terminal replay renewed control budget: first=%#v after=%#v err=%v", first, after, err)
+	}
+	abortPlan, abortID := plan+"-abort", plan+"-stable-abort"
+	if _, err := host.Start(ctx, abortPlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, abortPlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, abortPlan, providerFailAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Abort(ctx, abortPlan, "operator", abortID); err != nil {
+		t.Fatal(err)
+	}
+	abortReceipt, err := host.InspectControl(ctx, abortPlan, "operator", abortID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Abort(ctx, abortPlan, "operator", abortID); err != nil {
+		t.Fatalf("abort replay after completion: %v", err)
+	}
+	if err := host.Retry(ctx, abortPlan, "operator", abortID); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("abort replay accepted changed action: %v", err)
+	}
+	replayedAbort, err := host.InspectControl(ctx, abortPlan, "operator", abortID)
+	if err != nil || !abortReceipt.AcceptedAt.Equal(replayedAbort.AcceptedAt) || !abortReceipt.Deadline.Equal(replayedAbort.Deadline) {
+		t.Fatalf("abort replay renewed control budget: first=%#v replay=%#v err=%v", abortReceipt, replayedAbort, err)
+	}
+}
+
+func TestSQLiteHostIdempotencyGuaranteeMatrix(t *testing.T) {
+	for _, separate := range []bool{false, true} {
+		name := "shared"
+		if separate {
+			name = "separate"
+		}
+		t.Run(name, func(t *testing.T) {
+			runtimePath := sqlitePath(t, "guarantee-runtime-"+name)
+			hostPath := runtimePath
+			if separate {
+				hostPath = sqlitePath(t, "guarantee-host-"+name)
+			}
+			host, err := openSQLite(runtimePath, hostPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer host.Close()
+			runHostGuaranteeMatrix(t, host, "sqlite-"+name)
+		})
+	}
+}
+
+func runHostGuaranteeMatrix(t *testing.T, host *Host, suffix string) {
+	t.Helper()
+	for _, tc := range []struct {
+		mode   providerGuaranteeMode
+		repeat bool
+	}{
+		{providerGuaranteeShort, false},
+		{providerGuaranteeExpired, false},
+		{providerGuaranteeMismatch, false},
+		{providerGuaranteeValid, true},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			ctx := context.Background()
+			plan := "guarantee-" + suffix + "-" + string(tc.mode)
+			const period = "2026-11"
+			if _, err := host.Start(ctx, plan, period); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := host.Approve(ctx, plan, period, "operator"); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.SetProviderMode(ctx, plan, providerLateCall); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.SetProviderGuarantee(ctx, plan, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.Drive(ctx); err != nil {
+				t.Fatal(err)
+			}
+			status, err := host.Inspect(ctx, plan, period, "operator")
+			if err != nil || status.State != Due || status.ActiveStatus != transition.NeedsIntervention || status.Charges != 0 || status.GuaranteeOffers == 0 {
+				t.Fatalf("unknown provider result was not blocked: status=%#v err=%v", status, err)
+			}
+			if (!tc.repeat && status.ProviderCalls != 1) || (tc.repeat && status.ProviderCalls < 2) {
+				t.Fatalf("guarantee %s allowed wrong number of provider dispatches: calls=%d", tc.mode, status.ProviderCalls)
+			}
+		})
+	}
+}
+
+func runRenewalRecoveryScenario(t *testing.T, host *Host, suffix string) {
+	t.Helper()
+	ctx := context.Background()
+	const period = "2026-11"
+
+	latePlan := "late-recovery-" + suffix
+	if _, err := host.Start(ctx, latePlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, latePlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, latePlan, providerLateCall); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := host.Inspect(ctx, latePlan, period, "operator")
+	if err != nil || unknown.State != Due || unknown.ActiveStatus != transition.NeedsIntervention || unknown.Charges != 0 {
+		t.Fatalf("late provider call did not block the committed origin: status=%#v err=%v", unknown, err)
+	}
+	if err := host.ApplyLateProviderCall(ctx, latePlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.ResolveCharge(ctx, latePlan, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Retry(ctx, latePlan, "operator", latePlan+"-retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := host.Inspect(ctx, latePlan, period, "operator")
+	if err != nil || renewed.State != Renewed || renewed.Charges != 1 {
+		t.Fatalf("evidence-backed retry did not settle renewal: status=%#v err=%v", renewed, err)
+	}
+
+	refundPlan := "refund-recovery-" + suffix
+	if _, err := host.Start(ctx, refundPlan, period); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Approve(ctx, refundPlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, refundPlan, providerFailAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := host.Inspect(ctx, refundPlan, period, "operator")
+	if err != nil || blocked.State != Due || blocked.ActiveStatus != transition.NeedsIntervention || blocked.Charges != 1 {
+		t.Fatalf("pre-commit failure did not preserve Due with a tracked charge: status=%#v err=%v", blocked, err)
+	}
+	if err := host.Abort(ctx, refundPlan, "operator", refundPlan+"-abort"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aborted, err := host.Inspect(ctx, refundPlan, period, "operator")
+	if err != nil || aborted.State != Due || aborted.Refunds != 1 {
+		t.Fatalf("tracked refund did not preserve the committed origin: status=%#v err=%v", aborted, err)
+	}
+	if _, err := host.Reattempt(ctx, refundPlan, period, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetProviderMode(ctx, refundPlan, providerNormal); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Drive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err = host.Inspect(ctx, refundPlan, period, "operator")
+	if err != nil || renewed.State != Renewed || renewed.Charges != 2 || renewed.Refunds != 1 {
+		t.Fatalf("retry after confirmed recovery did not finish renewal: status=%#v err=%v", renewed, err)
 	}
 }
 
@@ -327,6 +647,14 @@ func TestMySQLHostScenarioAndProcessRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	runWorkloadAuthorizationScenario(t, sharedHost)
+	runOperatorAuthorizationScenario(t, sharedHost, "mysql-shared-"+strconv.Itoa(os.Getpid()))
+	runRenewalRecoveryScenario(t, sharedHost, "mysql-shared-"+strconv.Itoa(os.Getpid()))
+	t.Run("shared-control-replay", func(t *testing.T) {
+		runRetryControlLostResponseReplay(t, sharedHost, "mysql-shared-control-"+strconv.Itoa(os.Getpid()))
+	})
+	t.Run("shared-guarantees", func(t *testing.T) {
+		runHostGuaranteeMatrix(t, sharedHost, "mysql-shared")
+	})
 	if err := sharedHost.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +665,15 @@ func TestMySQLHostScenarioAndProcessRestart(t *testing.T) {
 	}
 	defer separateHost.Close()
 	runStaleABAOriginScenario(t, separateHost)
+	separateHost.beforeSuccessorAccept = nil
+	runOperatorAuthorizationScenario(t, separateHost, "mysql-separate-"+strconv.Itoa(os.Getpid()))
+	runRenewalRecoveryScenario(t, separateHost, "mysql-separate-"+strconv.Itoa(os.Getpid()))
+	t.Run("separate-control-replay", func(t *testing.T) {
+		runRetryControlLostResponseReplay(t, separateHost, "mysql-separate-control-"+strconv.Itoa(os.Getpid()))
+	})
+	t.Run("separate-guarantees", func(t *testing.T) {
+		runHostGuaranteeMatrix(t, separateHost, "mysql-separate")
+	})
 }
 
 func newRenewalMySQLDatabases(t *testing.T, dsn string, count int) []string {

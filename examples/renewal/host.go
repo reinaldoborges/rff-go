@@ -117,6 +117,8 @@ type Host struct {
 	shared                bool
 	dialect               string
 	clock                 func() time.Time
+	afterBatchEffect      func(string)
+	afterFanoutAccept     func(string)
 	machines              *fsm.Registry[string, State, Event, Input]
 	acceptor              *transition.Acceptor[string, State, Event, Input]
 	coordinator           *transition.Coordinator[string, State]
@@ -274,7 +276,7 @@ func newHost(store persistence, closeStore func() error, db *sql.DB, shared bool
 	}
 	host.driver, err = transition.NewContinuationDriver[string, State, Event, Input](store, host.machines,
 		transition.ContinuationDriverConfig[string, State, Event, Input]{
-			Clock: host.clock, LeaseDuration: 5 * time.Second,
+			Clock: host.clock, LeaseDuration: 30 * time.Second,
 			EventCodec: eventCodec.Version(), InputCodec: inputCodec.Version(),
 			ResolveEvent: resolveEvent, ResolveInput: resolveInput, Acceptor: host.acceptor, Host: host,
 			OriginRevision: host.originRevision,
@@ -324,14 +326,22 @@ func (h *Host) initialize() error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS renewal_plans (plan_id VARCHAR(255) PRIMARY KEY, period_id VARCHAR(255) NOT NULL, state VARCHAR(64) NOT NULL, revision BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_workload_grants (plan_id VARCHAR(255) NOT NULL, principal VARCHAR(255) NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (plan_id, principal))`,
+		`CREATE TABLE IF NOT EXISTS renewal_control_requests (request_id VARCHAR(255) PRIMARY KEY, plan_id VARCHAR(255) NOT NULL, principal VARCHAR(255) NOT NULL, action VARCHAR(32) NOT NULL, execution_id VARCHAR(255) NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_commit_receipts (execution_id VARCHAR(255) PRIMARY KEY, plan_id VARCHAR(255) NOT NULL, operation_id VARCHAR(255) NOT NULL, state VARCHAR(64) NOT NULL, revision BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_markers (execution_id VARCHAR(255) PRIMARY KEY, marker BLOB NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS renewal_fences (plan_id VARCHAR(255) PRIMARY KEY, execution_id VARCHAR(255) NOT NULL, origin_revision BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_successors (origin_execution_id VARCHAR(255) PRIMARY KEY, binding BLOB NOT NULL, outcome VARCHAR(32) NOT NULL, principal VARCHAR(255) NOT NULL, decision VARCHAR(64) NOT NULL, accepted_at TIMESTAMP NOT NULL, cancellation BLOB)`,
 		`CREATE TABLE IF NOT EXISTS renewal_provider_settings (plan_id VARCHAR(255) PRIMARY KEY, mode VARCHAR(64) NOT NULL, consumed INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS renewal_provider_guarantees (plan_id VARCHAR(255) PRIMARY KEY, guarantee_mode VARCHAR(32) NOT NULL, offers BIGINT NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS renewal_provider_dispatches (dispatch_id VARCHAR(64) PRIMARY KEY, plan_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_provider_ops (provider_key VARCHAR(64) PRIMARY KEY, execution_id VARCHAR(255) NOT NULL, operation_key VARCHAR(255) NOT NULL, kind VARCHAR(32) NOT NULL, plan_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, fingerprint VARCHAR(64) NOT NULL, input BLOB NOT NULL, status VARCHAR(32) NOT NULL, result BLOB, related_key VARCHAR(64), created_at TIMESTAMP NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS renewal_period_effects (plan_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, provider_key VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL, PRIMARY KEY (plan_id, period_id))`,
 		`CREATE TABLE IF NOT EXISTS renewal_completed_periods (plan_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, execution_id VARCHAR(255) NOT NULL, PRIMARY KEY (plan_id, period_id))`,
+		`CREATE TABLE IF NOT EXISTS renewal_batch_runs (batch_id VARCHAR(255) PRIMARY KEY, period_id VARCHAR(255) NOT NULL, cursor_ordinal BIGINT NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS renewal_batch_records (batch_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, ordinal BIGINT NOT NULL, record_id VARCHAR(255) NOT NULL, status VARCHAR(32) NOT NULL, PRIMARY KEY (batch_id, record_id), UNIQUE (batch_id, ordinal))`,
+		`CREATE TABLE IF NOT EXISTS renewal_record_claims (record_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, owner_kind VARCHAR(32) NOT NULL, owner_id VARCHAR(255) NOT NULL, PRIMARY KEY (record_id, period_id))`,
+		`CREATE TABLE IF NOT EXISTS renewal_fanout_runs (run_id VARCHAR(255) PRIMARY KEY, period_id VARCHAR(255) NOT NULL, cursor_ordinal BIGINT NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS renewal_fanout_records (run_id VARCHAR(255) NOT NULL, period_id VARCHAR(255) NOT NULL, ordinal BIGINT NOT NULL, record_id VARCHAR(255) NOT NULL, execution_id VARCHAR(255) NOT NULL, status VARCHAR(32) NOT NULL, PRIMARY KEY (run_id, record_id), UNIQUE (run_id, ordinal))`,
 	}
 	for _, statement := range statements {
 		if _, err := h.db.Exec(statement); err != nil {
@@ -343,7 +353,7 @@ func (h *Host) initialize() error {
 
 func (h *Host) machine() (*fsm.Machine[string, State, Event, Input], error) {
 	policy := fsm.Policy{MaxAttempts: 3, AttemptTimeout: 5 * time.Second, OverallTimeout: time.Minute, RetryDelays: []time.Duration{10 * time.Millisecond}}
-	continuationPolicy := fsm.Policy{MaxAttempts: 3, AttemptTimeout: 5 * time.Second, OverallTimeout: time.Minute, RetryDelays: []time.Duration{10 * time.Millisecond}}
+	continuationPolicy := fsm.Policy{MaxAttempts: 3, AttemptTimeout: 30 * time.Second, OverallTimeout: time.Minute, RetryDelays: []time.Duration{10 * time.Millisecond}}
 	noOp := fsm.NoopHandler[string, State, Event, Input]{}
 	return fsm.NewMachine(fsm.Config[string, State, Event, Input]{
 		ID: machineID, Version: machineVersion,
@@ -432,11 +442,22 @@ func (p *paymentHandler) Recover(ctx context.Context, execution fsm.ExecutionCon
 }
 
 func (h *Host) Start(ctx context.Context, plan, period string) (string, error) {
+	return h.startOwned(ctx, plan, period, "standalone", plan)
+}
+
+func (h *Host) startOwned(ctx context.Context, plan, period, ownerKind, ownerID string) (string, error) {
 	if plan == "" || period == "" {
 		return "", transition.ErrInvalidRequest
 	}
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
+		return "", err
+	}
+	if err := h.claimRecord(ctx, tx, plan, period, ownerKind, ownerID); err != nil {
+		_ = tx.Rollback()
+		if isRecordClaimConflict(err) {
+			return "", transition.ErrConflict
+		}
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_plans (plan_id, period_id, state, revision) VALUES (?, ?, '', 0)`, plan, period); err != nil {
@@ -601,14 +622,15 @@ func (h *Host) Drive(ctx context.Context) error {
 			}
 			switch progress.Phase {
 			case transition.ContinuationAccepted, transition.ContinuationStopped,
-				transition.ContinuationSuperseded, transition.ContinuationWaived:
+				transition.ContinuationSuperseded, transition.ContinuationWaived,
+				transition.ContinuationIntervention:
 				continue
 			}
 			if err := h.driver.Drive(ctx, marker, "renewal-continuation"); err != nil {
 				if errors.Is(err, transition.ErrBusy) || errors.Is(err, transition.ErrLeaseHeld) {
 					continue
 				}
-				return fmt.Errorf("drive continuation %s: %w", marker.ExecutionID, err)
+				return fmt.Errorf("drive continuation %s for %v -> %v: %w", marker.ExecutionID, marker.Entity, marker.Target, err)
 			}
 			continued = true
 		}
@@ -806,6 +828,44 @@ func (h *Host) commitTransaction(ctx context.Context, tx *sql.Tx, execution tran
 	if err != nil || input.PlanID != execution.Entity || input.PeriodID != planPeriod {
 		return rejectedReceipt(execution, "renewal_input_mismatch"), nil
 	}
+	var batchPeriod string
+	batchErr := tx.QueryRowContext(ctx, h.lockQuery(`SELECT period_id FROM renewal_batch_runs WHERE batch_id = ?`),
+		execution.Entity).Scan(&batchPeriod)
+	isBatch := batchErr == nil
+	if batchErr != nil && !errors.Is(batchErr, sql.ErrNoRows) {
+		return transition.CommitReceipt{}, batchErr
+	}
+	var batchRecords []string
+	if isBatch && execution.Target == Renewed {
+		if batchPeriod != planPeriod {
+			return rejectedReceipt(execution, "batch_period_mismatch"), nil
+		}
+		rows, err := tx.QueryContext(ctx, h.lockQuery(`SELECT record_id, status FROM renewal_batch_records WHERE batch_id = ? ORDER BY ordinal`),
+			execution.Entity)
+		if err != nil {
+			return transition.CommitReceipt{}, err
+		}
+		for rows.Next() {
+			var recordID, status string
+			if err := rows.Scan(&recordID, &status); err != nil {
+				_ = rows.Close()
+				return transition.CommitReceipt{}, err
+			}
+			if status != "complete" {
+				_ = rows.Close()
+				return rejectedReceipt(execution, "batch_record_incomplete"), nil
+			}
+			batchRecords = append(batchRecords, recordID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return transition.CommitReceipt{}, err
+		}
+		_ = rows.Close()
+		if len(batchRecords) == 0 {
+			return rejectedReceipt(execution, "batch_empty"), nil
+		}
+	}
 	if execution.Target == Renewed {
 		var count int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM renewal_completed_periods WHERE plan_id = ? AND period_id = ?`, execution.Entity, planPeriod).Scan(&count); err != nil {
@@ -814,9 +874,26 @@ func (h *Host) commitTransaction(ctx context.Context, tx *sql.Tx, execution tran
 		if count != 0 {
 			return rejectedReceipt(execution, "renewal_period_already_completed"), nil
 		}
-		var effectStatus string
-		if err := tx.QueryRowContext(ctx, `SELECT status FROM renewal_period_effects WHERE plan_id = ? AND period_id = ?`, execution.Entity, planPeriod).Scan(&effectStatus); err != nil || effectStatus != "charged" {
-			return rejectedReceipt(execution, "payment_not_confirmed"), nil
+		effectRecords := []string{execution.Entity}
+		if isBatch {
+			effectRecords = batchRecords
+		}
+		for _, recordID := range effectRecords {
+			var effectStatus string
+			if err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT status FROM renewal_period_effects WHERE plan_id = ? AND period_id = ?`),
+				recordID, planPeriod).Scan(&effectStatus); err != nil || effectStatus != "charged" {
+				return rejectedReceipt(execution, "payment_not_confirmed"), nil
+			}
+			if isBatch {
+				var completed int
+				if err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT COUNT(*) FROM renewal_completed_periods WHERE plan_id = ? AND period_id = ?`),
+					recordID, planPeriod).Scan(&completed); err != nil {
+					return transition.CommitReceipt{}, err
+				}
+				if completed != 0 {
+					return rejectedReceipt(execution, "renewal_period_already_completed"), nil
+				}
+			}
 		}
 	}
 	if revision < 0 || revision == math.MaxInt64 {
@@ -839,6 +916,12 @@ func (h *Host) commitTransaction(ctx context.Context, tx *sql.Tx, execution tran
 		if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_completed_periods (plan_id, period_id, execution_id) VALUES (?, ?, ?)`,
 			execution.Entity, planPeriod, execution.ID); err != nil {
 			return rejectedReceipt(execution, "renewal_period_already_completed"), nil
+		}
+		for _, recordID := range batchRecords {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_completed_periods (plan_id, period_id, execution_id) VALUES (?, ?, ?)`,
+				recordID, planPeriod, execution.ID); err != nil {
+				return transition.CommitReceipt{}, err
+			}
 		}
 	}
 	if execution.Continuation != nil {

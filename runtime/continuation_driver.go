@@ -233,7 +233,7 @@ func (d *ContinuationDriver[E, S, Event, Input]) Drive(ctx context.Context, mark
 		if !now.Before(progress.Deadline) || !now.Before(progress.AttemptDeadline(marker.Policy)) {
 			return d.fail(ctx, lease, machine, context.DeadlineExceeded)
 		}
-		return err
+		return fmt.Errorf("record continuation decision: %w", err)
 	}
 	if persisted.Continue {
 		return d.deliver(ctx, marker, lease, machine, persisted)
@@ -397,7 +397,7 @@ func (d *ContinuationDriver[E, S, Event, Input]) deliver(ctx context.Context, ma
 	}
 	if err != nil {
 		if errors.Is(err, ErrStaleLease) {
-			return err
+			return fmt.Errorf("prepare continuation successor: %w", err)
 		}
 		return d.fail(ctx, lease, machine, err)
 	}
