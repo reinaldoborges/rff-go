@@ -137,6 +137,10 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) Status() WorkerStatus {
 
 // RunOne claims and executes at most one hook activity.
 func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context) error {
+	return w.runOne(ctx, nil)
+}
+
+func (w *HookWorker[EntityID, StateID, Event, Input]) runOne(ctx context.Context, checked func()) error {
 	w.mu.Lock()
 	if w.draining {
 		w.mu.Unlock()
@@ -175,6 +179,9 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	lease, err := w.store.ClaimHook(claimCtx, w.config.ID, w.config.Clock.Now, w.config.LeaseTTL)
 	if err != nil {
 		return err
+	}
+	if checked != nil {
+		checked()
 	}
 	if err := claimCtx.Err(); err != nil {
 		return err

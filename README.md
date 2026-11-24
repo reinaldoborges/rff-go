@@ -155,12 +155,27 @@ coordinators and a bounded pool of hook workers. Supply the durable store,
 versioned hook runner and classifier, fenced host commit, coordinator and
 worker lease settings, capacity, clocks, and a positive polling interval
 shorter than the coordinator lease. Call `Start(ctx)` to synchronously check
-durable work and report startup errors. Thereafter the lifecycle polls without
+transition and commit work and report startup errors; worker claims begin
+asynchronously. Even when `Start` reports a scan error, independent paths run
+and the host must call `Shutdown`. Thereafter the lifecycle polls without
 further requests; `Wakeup()` is only a hint and may be dropped.
 
-Monitor `Errors()` and inspect `Err()`: a background error is retained and
-stops the affected coordinator or worker loop. Correct the cause and create a
-new lifecycle; automatic supervision and readiness are not provided here.
+`Status()` reports each path's initial check, running state and safe error
+classification. Readiness requires a successful check and healthy execution
+for every path, not an empty backlog. Local available capacity is separate:
+busy hooks can exhaust capacity without making durable checks unready. Transition
+and commit reconciliation share a path and lease; hook worker paths are
+independently supervised. No other paths are enabled implicitly.
+
+Recognized lease conflicts are retried; use `LifecycleConfig.ClassifyError` to
+classify other errors as recoverable or fatal. Unclassified errors stop the
+affected path. Recoverable errors are signaled and retried after the configured
+poll interval, even if wakeups arrive. These retries do not renew durable
+attempt budgets or deadlines. Correct a stopped path and call `RestartPath`
+with its name from `Status()`; a new lifecycle can also be started after
+shutdown. Monitor `Errors()` and inspect `Err()` for the latest error per path.
+Unlike `Status`, `Err` and `Start` errors may contain sensitive host or store
+details; do not persist or expose them without sanitizing.
 Call `Shutdown(ctx)` to stop scans and claims and drain hooks while renewing
 activity leases. If the context expires, unfinished hooks are cancelled and
 renewal stops; the error means external work may still be running. Do not

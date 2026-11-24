@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,20 @@ type lifecycleHandler struct {
 	started chan string
 	blockA  <-chan struct{}
 	blockB  <-chan struct{}
+}
+
+var errLifecycleStoreUnavailable = errors.New("temporary lifecycle store failure")
+
+type lifecycleFaultStore struct {
+	*sqlite.Store[string, string]
+	failScan atomic.Bool
+}
+
+func (s *lifecycleFaultStore) ActiveExecutionIDs(ctx context.Context) ([]string, error) {
+	if s.failScan.Load() {
+		return nil, errLifecycleStoreUnavailable
+	}
+	return s.Store.ActiveExecutionIDs(ctx)
 }
 
 func (h lifecycleHandler) Enter(_ context.Context, e fsm.ExecutionContext[string, string, string, string]) error {
@@ -115,24 +130,36 @@ func TestEmbeddedLifecycleDurableProgressAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	acceptor = newAcceptor()
-	newLifecycle := func() *transition.Lifecycle[string, string, string, string] {
+	newLifecycle := func(faultStore *lifecycleFaultStore) *transition.Lifecycle[string, string, string, string] {
 		t.Helper()
 		host := &localCommitHost{store: store, clock: time.Now}
-		l, err := transition.NewLifecycle[string, string, string, string](store, runner, runner, host, transition.LifecycleConfig{
+		l, err := transition.NewLifecycle[string, string, string, string](faultStore, runner, runner, host, transition.LifecycleConfig{
 			Coordinator: transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: 300 * time.Millisecond, Clock: time.Now},
 			Worker: transition.WorkerConfig{ID: "worker", Capacity: 2, LeaseTTL: 150 * time.Millisecond,
 				RenewalInterval: 30 * time.Millisecond, Clock: transition.SystemWorkerClock{}},
 			PollInterval: 20 * time.Millisecond,
+			ClassifyError: func(err error) transition.PathErrorClass {
+				if errors.Is(err, errLifecycleStoreUnavailable) {
+					return transition.PathErrorRecoverable
+				}
+				return transition.PathErrorUnclassified
+			},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return l
 	}
-	l := newLifecycle()
-	if err := l.Start(ctx); err != nil {
-		t.Fatal(err)
+	faultStore := &lifecycleFaultStore{Store: store}
+	faultStore.failScan.Store(true)
+	l := newLifecycle(faultStore)
+	if err := l.Start(ctx); !errors.Is(err, errLifecycleStoreUnavailable) {
+		t.Fatalf("initial failure not surfaced: %v", err)
 	}
+	if l.Status().Ready {
+		t.Fatal("failed initial scan marked ready")
+	}
+	faultStore.failScan.Store(false)
 	seen := map[string]bool{}
 	for len(seen) < 2 {
 		select {
@@ -141,6 +168,13 @@ func TestEmbeddedLifecycleDurableProgressAndShutdown(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("concurrent hooks did not start: %v, error %v", seen, l.Err())
 		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !l.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if status := l.Status(); !status.Ready || status.Capacity.Available != 0 {
+		t.Fatalf("busy hooks changed readiness or capacity incorrectly: %+v", status)
 	}
 	accept("c") // No wakeup: polling must discover it.
 	closeB.Do(func() { close(releaseB) })
@@ -185,12 +219,12 @@ func TestEmbeddedLifecycleDurableProgressAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	acceptor = newAcceptor()
-	l = newLifecycle()
+	l = newLifecycle(&lifecycleFaultStore{Store: store})
 	if err := l.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 	waitComplete("d")
-	deadline := time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		execution, _, err := acceptor.Accept(ctx, transition.Request[string, string, string, string]{
 			Entity: "a", Key: "a", Operation: transition.Initialize, MachineID: "task", MachineVersion: "1",

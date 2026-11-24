@@ -22,6 +22,34 @@ func TestLifecycleRejectsMissingDependencies(t *testing.T) {
 	}
 }
 
+func TestLifecycleReportsInitialReadinessAndCapacity(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	store := &lifecycleTestStore{}
+	l, err := transition.NewLifecycle[string, string, string, int](store, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator:  transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker:       transition.WorkerConfig{ID: "worker", Capacity: 1, LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Status().Ready {
+		t.Fatal("unstarted lifecycle is ready")
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer l.Shutdown(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for !l.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := l.Status()
+	if !status.Ready || status.Capacity.Available != 1 {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
 func TestLifecycleRejectsInvalidTimingAndCapacity(t *testing.T) {
 	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
 	store := &lifecycleTestStore{}
@@ -47,19 +75,66 @@ type lifecycleTestStore struct {
 	transition.LifecycleStore[string, string]
 	fail       atomic.Bool
 	claimFails atomic.Bool
+	scans      atomic.Int64
+	claims     atomic.Int64
 }
 
 var errLifecycleScan = errors.New("scan failed")
 var errLifecycleClaim = errors.New("claim failed")
 
 func (s *lifecycleTestStore) ActiveExecutionIDs(context.Context) ([]string, error) {
+	s.scans.Add(1)
 	if s.fail.Load() {
 		return nil, errLifecycleScan
 	}
 	return nil, nil
 }
 
+func TestLifecycleRetriesRecoverableInitialScans(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	store := &lifecycleTestStore{}
+	store.fail.Store(true)
+	l, err := transition.NewLifecycle[string, string, string, int](store, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator:  transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker:       transition.WorkerConfig{ID: "worker", Capacity: 1, LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 30 * time.Millisecond,
+		ClassifyError: func(err error) transition.PathErrorClass {
+			if errors.Is(err, errLifecycleScan) {
+				return transition.PathErrorRecoverable
+			}
+			return transition.PathErrorUnclassified
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); !errors.Is(err, errLifecycleScan) {
+		t.Fatalf("initial failure not surfaced: %v", err)
+	}
+	defer l.Shutdown(context.Background())
+	if l.Status().Ready {
+		t.Fatal("failed initial scan marked ready")
+	}
+	initial := store.scans.Load()
+	for i := 0; i < 10; i++ {
+		l.Wakeup()
+	}
+	time.Sleep(10 * time.Millisecond)
+	if store.scans.Load() != initial {
+		t.Fatal("retry ignored backoff")
+	}
+	store.fail.Store(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for !l.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !l.Status().Ready {
+		t.Fatalf("recovered scans never became ready: %+v", l.Status())
+	}
+}
+
 func (s *lifecycleTestStore) ClaimHook(context.Context, string, func() time.Time, time.Duration) (transition.HookLease, error) {
+	s.claims.Add(1)
 	if s.claimFails.Load() {
 		return transition.HookLease{}, errLifecycleClaim
 	}
@@ -89,8 +164,12 @@ func TestLifecycleExposesStartupAndBackgroundScanFailures(t *testing.T) {
 		return l
 	}
 	store.fail.Store(true)
-	if err := newLifecycle().Start(context.Background()); !errors.Is(err, errLifecycleScan) {
+	startup := newLifecycle()
+	if err := startup.Start(context.Background()); !errors.Is(err, errLifecycleScan) {
 		t.Fatalf("initial scan error not returned: %v", err)
+	}
+	if err := startup.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	store.fail.Store(false)
 	l := newLifecycle()
