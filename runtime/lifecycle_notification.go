@@ -20,6 +20,7 @@ type notificationSlot struct {
 
 type lifecycleNotifications[EntityID comparable, StateID comparable] struct {
 	worker   *NotificationWorker[EntityID, StateID]
+	capacity int
 	mu       sync.Mutex
 	draining bool
 	drained  chan struct{}
@@ -51,7 +52,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) EnableNotifications(
 	if err != nil {
 		return err
 	}
-	n := &lifecycleNotifications[EntityID, StateID]{worker: worker, slots: make(map[*notificationSlot]struct{})}
+	n := &lifecycleNotifications[EntityID, StateID]{worker: worker, capacity: config.Capacity, slots: make(map[*notificationSlot]struct{})}
 	l.notifications = n
 	l.paths = append(l.paths, &lifecyclePath{
 		name: "notification-handoff", wake: make(chan struct{}, 1),
@@ -74,12 +75,15 @@ func (n *lifecycleNotifications[EntityID, StateID]) runOne(ctx context.Context, 
 		n.mu.Unlock()
 		return context.Canceled
 	}
+	if len(n.slots) >= n.capacity {
+		n.mu.Unlock()
+		return ErrWorkerAtCapacity
+	}
 	claimCtx, cancel := context.WithCancel(ctx)
 	slot := &notificationSlot{claimCancel: cancel}
 	n.slots[slot] = struct{}{}
 	n.mu.Unlock()
 	var exited <-chan struct{}
-	var workCtx context.Context
 	defer func() {
 		cancel()
 		release := func() {
@@ -103,25 +107,17 @@ func (n *lifecycleNotifications[EntityID, StateID]) runOne(ctx context.Context, 
 		}
 		release()
 	}()
-	err := n.worker.runOne(claimCtx, checked, func() (context.Context, bool) {
+	return n.worker.runOne(claimCtx, checked, func() (context.Context, bool) {
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		if n.draining || claimCtx.Err() != nil {
 			return nil, false
 		}
-		var workCancel context.CancelFunc
-		workCtx, workCancel = context.WithCancel(context.Background())
+		workCtx, workCancel := context.WithCancel(context.Background())
 		slot.claimCancel = nil
 		slot.workCancel = workCancel
 		return workCtx, true
 	}, func(ch <-chan struct{}) { exited = ch })
-	if exited != nil {
-		select {
-		case <-exited:
-		case <-workCtx.Done():
-		}
-	}
-	return err
 }
 
 func (n *lifecycleNotifications[EntityID, StateID]) stopClaims() {

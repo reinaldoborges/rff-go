@@ -176,6 +176,8 @@ transition; delivery is independently retried by stable intent ID and never
 repeats hooks or rolls back domain state. The host must make downstream effects
 idempotent. Delivery errors whose retry was durably scheduled are surfaced and
 retried; store and handoff errors follow the normal path classification rules.
+A timed-out adapter that ignores cancellation continues to occupy local
+delivery capacity until it returns.
 
 Recognized lease conflicts are retried; use `LifecycleConfig.ClassifyError` to
 classify other errors as recoverable or fatal. Unclassified errors stop the

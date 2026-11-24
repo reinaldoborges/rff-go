@@ -77,6 +77,7 @@ func TestLifecycleNotificationFailureIsIsolatedAndRestartable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	config := transition.LifecycleNotificationConfig{Capacity: 1, Worker: transition.NotificationWorkerConfig{
 		ID: "notification", LeaseTTL: time.Second, RenewalInterval: time.Millisecond,
 		AttemptTimeout: time.Second, RetryDelay: time.Millisecond, Clock: transition.SystemWorkerClock{},
@@ -133,5 +134,68 @@ func TestLifecycleNotificationFailureIsIsolatedAndRestartable(t *testing.T) {
 	}
 	if !l.Status().Ready {
 		t.Fatalf("restart did not restore readiness: %+v", l.Status())
+	}
+}
+
+type blockingNotificationStore struct {
+	lifecycleNotificationStore
+	claims atomic.Int64
+}
+
+func (s *blockingNotificationStore) ClaimNotification(_ context.Context, owner string, now func() time.Time, ttl time.Duration) (transition.NotificationDelivery[string, string], error) {
+	s.claims.Add(1)
+	return transition.NotificationDelivery[string, string]{
+		Intent:  transition.NotificationIntent[string, string]{ID: "intent", ExecutionID: "execution"},
+		Lease:   transition.NotificationLease{IntentID: "intent", ExecutionID: "execution", Owner: owner, Generation: 1, ExpiresAt: now().Add(ttl)},
+		Attempt: 1,
+	}, nil
+}
+
+func (*blockingNotificationStore) RetryNotificationDelivery(context.Context, transition.NotificationLease, func() time.Time, time.Time) error {
+	return nil
+}
+
+func TestLifecycleReportsTimedOutDeliveryWithoutExceedingCapacity(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	store := &blockingNotificationStore{}
+	l, err := transition.NewLifecycle[string, string, string, int](&lifecycleTestStore{}, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator: transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker: transition.WorkerConfig{ID: "hook", Capacity: 1, LeaseTTL: time.Second,
+			RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	defer close(release)
+	if err := l.EnableNotifications(store, lifecycleNotificationHandoff{}, store, func(context.Context, transition.NotificationDelivery[string, string]) error {
+		<-release
+		return nil
+	}, transition.LifecycleNotificationConfig{Capacity: 1, Worker: transition.NotificationWorkerConfig{
+		ID: "notification", LeaseTTL: time.Second, RenewalInterval: 500 * time.Millisecond,
+		AttemptTimeout: 30 * time.Millisecond, RetryDelay: time.Millisecond, Clock: transition.SystemWorkerClock{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_ = l.Shutdown(ctx)
+	}()
+	select {
+	case <-l.Errors():
+		if !errors.Is(l.Err(), context.DeadlineExceeded) {
+			t.Fatalf("delivery timeout not surfaced: %v", l.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("delivery timeout was not surfaced while adapter remained active")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := store.claims.Load(); got != 1 {
+		t.Fatalf("claimed %d deliveries while capacity was occupied", got)
 	}
 }
