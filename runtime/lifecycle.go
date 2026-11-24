@@ -68,19 +68,21 @@ type lifecyclePath struct {
 // Lifecycle runs a single local transition coordinator and bounded hook workers.
 // The host must ensure only one logical lifecycle coordinates a store.
 type Lifecycle[EntityID comparable, StateID comparable, Event, Input any] struct {
-	worker     *HookWorker[EntityID, StateID, Event, Input]
-	commitHost CommitHost[EntityID, StateID]
-	interval   time.Duration
-	classify   func(error) PathErrorClass
-	errors     chan struct{}
+	worker      *HookWorker[EntityID, StateID, Event, Input]
+	commitHost  CommitHost[EntityID, StateID]
+	coordinator CoordinatorConfig
+	interval    time.Duration
+	classify    func(error) PathErrorClass
+	errors      chan struct{}
 
-	mu       sync.Mutex
-	started  bool
-	stopping bool
-	cancel   context.CancelFunc
-	ctx      context.Context
-	startup  chan struct{}
-	paths    []*lifecyclePath
+	mu            sync.Mutex
+	started       bool
+	stopping      bool
+	cancel        context.CancelFunc
+	ctx           context.Context
+	startup       chan struct{}
+	paths         []*lifecyclePath
+	notifications *lifecycleNotifications[EntityID, StateID]
 }
 
 // NewLifecycle validates all dependencies and timing before any work starts.
@@ -104,7 +106,7 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		return nil, err
 	}
 	l := &Lifecycle[EntityID, StateID, Event, Input]{
-		worker: worker, commitHost: host, interval: config.PollInterval,
+		worker: worker, commitHost: host, coordinator: config.Coordinator, interval: config.PollInterval,
 		classify: config.ClassifyError, errors: make(chan struct{}, 1),
 	}
 	add := func(name string, worker bool, step func(context.Context, func()) error) {
@@ -290,6 +292,9 @@ func onlyPathSignal(err, signal error) bool {
 	if err == nil {
 		return false
 	}
+	if _, ok := err.(*notificationDeliveryFailure); ok {
+		return false
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		children := joined.Unwrap()
 		if len(children) == 0 {
@@ -335,6 +340,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) recordFailure(path *lifecyc
 }
 
 func classifyPathError(err error, host func(error) PathErrorClass) PathErrorClass {
+	if _, ok := err.(*notificationDeliveryFailure); ok {
+		return PathErrorRecoverable
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		result := PathErrorRecoverable
 		for _, child := range joined.Unwrap() {
@@ -353,6 +361,7 @@ func classifyPathError(err error, host func(error) PathErrorClass) PathErrorClas
 	}
 	if errors.Is(err, ErrLeaseHeld) || errors.Is(err, ErrStaleLease) ||
 		errors.Is(err, ErrStaleActivityLease) || errors.Is(err, ErrActivityLeaseHeld) ||
+		errors.Is(err, ErrStaleNotificationLease) ||
 		errors.Is(err, ErrExecutionNotActive) || errors.Is(err, ErrTransitionDeadline) ||
 		errors.Is(err, ErrContinuationOriginMissing) || errors.Is(err, ErrContinuationIntervention) ||
 		errors.Is(err, ErrSuccessorDenied) {
@@ -436,6 +445,8 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) RestartPath(name string) er
 }
 
 func (l *Lifecycle[EntityID, StateID, Event, Input]) wakeWorkers() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, path := range l.paths {
 		if path.worker {
 			select {
@@ -448,6 +459,8 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) wakeWorkers() {
 
 // Wakeup is a best-effort hint; periodic durable scans remain authoritative.
 func (l *Lifecycle[EntityID, StateID, Event, Input]) Wakeup() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, path := range l.paths {
 		select {
 		case path.wake <- struct{}{}:
@@ -479,6 +492,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Shutdown(ctx context.Contex
 		return errors.New("lifecycle is not running")
 	}
 	l.stopping = true
+	if l.notifications != nil {
+		l.notifications.stopClaims()
+	}
 	l.cancel()
 	for _, path := range l.paths {
 		if path.stop != nil {
@@ -497,6 +513,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Shutdown(ctx context.Contex
 		}
 	}()
 	err := l.worker.Shutdown(ctx)
+	if l.notifications != nil {
+		err = errors.Join(err, l.notifications.shutdown(ctx))
+	}
 	select {
 	case <-startup:
 	case <-ctx.Done():
