@@ -13,6 +13,7 @@ import (
 
 type DriveStore interface {
 	Store
+	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
 	transition.SuccessorRecoveryStore[string, string]
 	AcquireContinuation(context.Context, transition.ContinuationMarker[string, string], string, func() time.Time, time.Duration) (transition.ContinuationLease, error)
 	StartContinuation(context.Context, transition.ContinuationLease, func() time.Time) error
@@ -668,6 +669,63 @@ func RunDriveQueuedDeadline(t *testing.T, store DriveStore) {
 	}
 	if err := store.StartContinuation(ctx, lease, clock); !errors.Is(err, transition.ErrContinuationIntervention) {
 		t.Fatalf("time queued after origin release must consume the deadline: %v", err)
+	}
+}
+
+func PrepareDriveQueuedDeadlineRestart(t *testing.T, store DriveStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	marker := transition.ContinuationMarker[string, string]{
+		SchemaVersion: 1, ExecutionID: "origin", Entity: "entity", Target: "due",
+		MachineID: "plan", MachineVersion: "1",
+		Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: 10 * time.Second},
+	}
+	marker = PrepareOrigin(t, store, marker)
+	if err := store.RecordContinuationMarker(ctx, marker); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AcquireTransitionLease(ctx, marker.Entity, marker.ExecutionID, "owner", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordCommitReceipt(ctx, origin, clock, transition.CommitReceipt{
+		ExecutionID: marker.ExecutionID, OperationID: marker.OperationID, Outcome: transition.CommitSucceeded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func CheckDriveQueuedDeadlineRestart(t *testing.T, store DriveStore) {
+	t.Helper()
+	ctx := context.Background()
+	markers, err := store.ContinuationMarkers(ctx)
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("markers after delayed discovery: %+v, %v", markers, err)
+	}
+	marker := markers[0]
+	readyAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	progress, err := store.ReadContinuation(ctx, marker.ExecutionID)
+	if err != nil || !progress.CycleStarted.Equal(readyAt) ||
+		!progress.Deadline.Equal(readyAt.Add(marker.Policy.OverallTimeout)) {
+		t.Fatalf("durable origin release did not start the cycle before restart: progress=%+v err=%v", progress, err)
+	}
+	now := readyAt.Add(marker.Policy.OverallTimeout)
+	clock := func() time.Time { return now }
+	if ready, err := store.ContinuationReady(ctx, marker.ExecutionID); err != nil || !ready {
+		t.Fatalf("released origin must remain discoverable after deadline: ready=%v err=%v", ready, err)
+	}
+	lease, err := store.AcquireContinuation(ctx, marker, "worker-after-restart", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartContinuation(ctx, lease, clock); !errors.Is(err, transition.ErrContinuationIntervention) {
+		t.Fatalf("queueing before delayed discovery must consume the deadline: %v", err)
+	}
+	progress, err = store.ReadContinuation(ctx, marker.ExecutionID)
+	if err != nil || progress.CycleStarted != readyAt || progress.Phase != transition.ContinuationIntervention {
+		t.Fatalf("acquisition reset the durable readiness budget: progress=%+v err=%v", progress, err)
 	}
 }
 

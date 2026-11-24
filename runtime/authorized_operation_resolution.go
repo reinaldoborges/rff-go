@@ -77,7 +77,7 @@ func (r *AuthorizedOperationResolver) Resolve(ctx context.Context, request Opera
 		ctx, request.Identity, request.ID, authorization.Principal, authorization.Reason, request.Assessment,
 	)
 	if err != nil {
-		return OperationInspection{}, err
+		return replayed, err
 	}
 	if found {
 		return replayed, nil

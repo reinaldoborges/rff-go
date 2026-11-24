@@ -41,6 +41,9 @@ type OperationIdentity struct {
 // remain usable but cannot be migrated because their origin cannot be proved.
 // EqualInput must be side-effect-free and must not re-enter the store.
 // ValidateResult must verify typed data or an immutable reference on each replay.
+// VerifySafeRepeat must authenticate the provider guarantee and prove that its
+// OverlapUntil bounds the latest possible effect of both old and repeat calls;
+// this horizon is independent of the hook deadline.
 type OperationRequest struct {
 	Key               string
 	Kind              string
@@ -210,9 +213,9 @@ type OperationEvidence struct {
 }
 
 // SafeRepeatGuarantee records the provider's idempotency window for this exact
-// operation, including the overlap horizon for old and repeated dispatches.
-// The guarantee must cover the remaining hook attempt so late calls cannot
-// outlive the provider's idempotency window.
+// operation. OverlapUntil is the provider-verified latest instant that either
+// the original or repeated dispatch could still take effect; it is not the
+// hook deadline. ValidUntil must extend through this effect horizon.
 type SafeRepeatGuarantee struct {
 	Identity          OperationIdentity
 	Provider          string
@@ -279,12 +282,11 @@ type OperationReconciliationStore interface {
 }
 
 type operationScope struct {
-	ctx             context.Context
-	store           OperationStore
-	lease           HookLease
-	clock           func() time.Time
-	attemptDeadline time.Time
-	kind            HookKind
+	ctx   context.Context
+	store OperationStore
+	lease HookLease
+	clock func() time.Time
+	kind  HookKind
 }
 
 func (s *operationScope) track(ctx context.Context, req OperationRequest, dispatch func(context.Context, OperationIdentity) (OperationResult, error)) (OperationResult, error) {
@@ -481,7 +483,13 @@ func (s *operationScope) applyAssessmentWithDispatch(
 	allowDispatch bool,
 ) (OperationResult, error) {
 	now := s.clock()
-	if !validOperationAssessment(binding, assessment, now) {
+	missingSuccessResult := assessment.Outcome == OperationOutcomeSucceeded &&
+		(assessment.Result == nil || !ValidOperationResult(*assessment.Result, binding.ResultCodec) ||
+			assessment.Result.Unavailable || assessment.Result.FailureCode != "")
+	if missingSuccessResult && !validOperationEvidence(binding, assessment, now) {
+		return OperationResult{}, ErrCompatibility
+	}
+	if !missingSuccessResult && !validOperationAssessment(binding, assessment, now) {
 		return OperationResult{}, ErrCompatibility
 	}
 	if req.VerifyEvidence == nil {
@@ -491,8 +499,22 @@ func (s *operationScope) applyAssessmentWithDispatch(
 		return OperationResult{}, fmt.Errorf("%w: operation evidence is unverifiable", ErrCompatibility)
 	}
 	now = s.clock()
-	if !validOperationAssessment(binding, assessment, now) {
+	if missingSuccessResult {
+		if !validOperationEvidence(binding, assessment, now) {
+			return OperationResult{}, ErrOperationUnresolved
+		}
+	} else if !validOperationAssessment(binding, assessment, now) {
 		return OperationResult{}, ErrOperationUnresolved
+	}
+	if assessment.Outcome == OperationOutcomeSucceeded && !missingSuccessResult {
+		validated := *assessment.Result
+		validated.Data = slices.Clone(assessment.Result.Data)
+		if err := req.ValidateResult(ctx, validated); err != nil {
+			missingSuccessResult = true
+		}
+	}
+	if missingSuccessResult {
+		assessment.Result = &OperationResult{Codec: binding.ResultCodec, Unavailable: true}
 	}
 	if assessment.Repeat != nil {
 		if req.VerifySafeRepeat == nil ||
@@ -501,7 +523,8 @@ func (s *operationScope) applyAssessmentWithDispatch(
 			return OperationResult{}, ErrOperationUnresolved
 		}
 		now = s.clock()
-		if !repeatCoversAttempt(binding, assessment, now, s.attemptDeadline) {
+		if !validOperationAssessment(binding, assessment, now) ||
+			!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) {
 			return OperationResult{}, ErrOperationUnresolved
 		}
 	}
@@ -509,7 +532,11 @@ func (s *operationScope) applyAssessmentWithDispatch(
 	if !ok {
 		return OperationResult{}, ErrOperationUnresolved
 	}
-	reconciliation, err := store.ReconcileTrackedOperation(ctx, s.lease, s.clock, binding, assessment, req.EqualInput)
+	reconcileContext := ctx
+	if missingSuccessResult {
+		reconcileContext = context.WithoutCancel(ctx)
+	}
+	reconciliation, err := store.ReconcileTrackedOperation(reconcileContext, s.lease, s.clock, binding, assessment, req.EqualInput)
 	if err != nil {
 		return OperationResult{}, err
 	}
@@ -535,7 +562,8 @@ func (s *operationScope) applyAssessmentWithDispatch(
 				return OperationResult{}, ErrOperationUnresolved
 			}
 			now = s.clock()
-			if !repeatCoversAttempt(binding, assessment, now, s.attemptDeadline) {
+			if !validOperationAssessment(binding, assessment, now) ||
+				!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) {
 				return OperationResult{}, ErrOperationUnresolved
 			}
 		}
@@ -582,6 +610,9 @@ func (s *operationScope) applyAssessmentWithDispatch(
 	if !ValidOperationResult(result, req.ResultCodec) {
 		return OperationResult{}, ErrCompatibility
 	}
+	if result.Unavailable {
+		return OperationResult{}, fmt.Errorf("%w: confirmed operation result is unavailable", ErrCompatibility)
+	}
 	if result.FailureCode != "" {
 		return result, ErrOperationFailed
 	}
@@ -594,7 +625,7 @@ func (s *operationScope) applyAssessmentWithDispatch(
 	return result, nil
 }
 
-func validOperationAssessment(binding OperationBinding, assessment OperationAssessment, now time.Time) bool {
+func validOperationEvidence(binding OperationBinding, assessment OperationAssessment, now time.Time) bool {
 	evidence := assessment.Evidence
 	if evidence.Identity != binding.Identity || evidence.Outcome != assessment.Outcome ||
 		(binding.Provider != "" && evidence.Provider != binding.Provider) ||
@@ -609,6 +640,13 @@ func validOperationAssessment(binding OperationBinding, assessment OperationAsse
 	if evidence.ValidUntil.Before(evidence.ObservedAt) {
 		return false
 	}
+	return true
+}
+
+func validOperationAssessment(binding OperationBinding, assessment OperationAssessment, now time.Time) bool {
+	if !validOperationEvidence(binding, assessment, now) {
+		return false
+	}
 	switch assessment.Outcome {
 	case OperationOutcomeSucceeded:
 		return assessment.Repeat == nil && assessment.Result != nil && ValidOperationResult(*assessment.Result, binding.ResultCodec) &&
@@ -621,6 +659,19 @@ func validOperationAssessment(binding OperationBinding, assessment OperationAsse
 	default:
 		return false
 	}
+}
+
+// OperationReconciliationAssessmentValid additionally permits a confirmed
+// success to carry the runtime's unavailable-result marker.
+func OperationReconciliationAssessmentValid(binding OperationBinding, assessment OperationAssessment, now time.Time) bool {
+	if !validOperationEvidence(binding, assessment, now) {
+		return false
+	}
+	if assessment.Outcome == OperationOutcomeSucceeded &&
+		assessment.Result != nil && assessment.Result.Unavailable {
+		return assessment.Repeat == nil && ValidOperationResult(*assessment.Result, binding.ResultCodec)
+	}
+	return validOperationAssessment(binding, assessment, now)
 }
 
 // OperationAssessmentValid checks the structural binding and validity interval
@@ -651,16 +702,6 @@ func validSafeRepeat(binding OperationBinding, evidence OperationEvidence, repea
 		!repeat.ValidUntil.IsZero() && !repeat.OverlapUntil.IsZero() &&
 		!now.Before(repeat.ValidFrom) && now.Before(repeat.ValidUntil) &&
 		!now.After(repeat.OverlapUntil) && !repeat.ValidUntil.Before(repeat.OverlapUntil)
-}
-
-func repeatCoversAttempt(binding OperationBinding, assessment OperationAssessment, now, attemptDeadline time.Time) bool {
-	if assessment.Repeat == nil || attemptDeadline.IsZero() || !attemptDeadline.After(now) ||
-		!validOperationAssessment(binding, assessment, now) ||
-		!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) {
-		return false
-	}
-	repeat := assessment.Repeat
-	return !repeat.ValidUntil.Before(attemptDeadline) && !repeat.OverlapUntil.Before(attemptDeadline)
 }
 
 type operationTracker interface {

@@ -90,6 +90,32 @@ func TestContinuationDriveStartedProcessRestart(t *testing.T) {
 	continuationcontract.CheckDriveStartedRestart(t, store)
 }
 
+func TestContinuationQueuedReadinessProcessRestart(t *testing.T) {
+	path := os.Getenv("RFF_SQLITE_QUEUE_READY_RESTART")
+	if path != "" {
+		store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		continuationcontract.PrepareDriveQueuedDeadlineRestart(t, store)
+		os.Exit(87)
+	}
+	path = filepath.Join(t.TempDir(), "queued-readiness-restart.db")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestContinuationQueuedReadinessProcessRestart$")
+	cmd.Env = append(os.Environ(), "RFF_SQLITE_QUEUE_READY_RESTART="+path)
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatal("expected process loss")
+	} else if exit := new(exec.ExitError); !errors.As(err, &exit) || exit.ExitCode() != 87 {
+		t.Fatalf("unexpected child failure: %v: %s", err, output)
+	}
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	continuationcontract.CheckDriveQueuedDeadlineRestart(t, store)
+}
+
 func TestContinuationDriverAcceptanceProcessRestart(t *testing.T) {
 	path, hostPath := os.Getenv("RFF_DRIVER_SQLITE"), os.Getenv("RFF_DRIVER_HOST")
 	if path != "" {

@@ -149,6 +149,9 @@ type CrossStore interface {
 	Store
 	transition.CommitStore[string, string]
 	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
+	ReadContinuation(context.Context, string) (transition.ContinuationProgress, error)
+	AcquireContinuation(context.Context, transition.ContinuationMarker[string, string], string, func() time.Time, time.Duration) (transition.ContinuationLease, error)
+	StartContinuation(context.Context, transition.ContinuationLease, func() time.Time) error
 }
 
 func RunCrossStoreCrash(t *testing.T, store CrossStore, host *CrossStoreHost) {
@@ -209,6 +212,8 @@ func RunCrossStoreCrash(t *testing.T, store CrossStore, host *CrossStoreHost) {
 func CheckCrossStoreRestart(t *testing.T, store CrossStore, host *CrossStoreHost) {
 	t.Helper()
 	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
 	discovery, err := transition.NewContinuationDiscovery[string, string](store, host)
 	if err != nil {
 		t.Fatal(err)
@@ -216,9 +221,8 @@ func CheckCrossStoreRestart(t *testing.T, store CrossStore, host *CrossStoreHost
 	if err := discovery.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	coordinator, err := transition.NewCommitCoordinator[string, string](store, host, transition.CoordinatorConfig{
-		ID: "owner", Clock: func() time.Time { return now }, LeaseTTL: time.Hour,
+		ID: "owner", Clock: clock, LeaseTTL: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -238,8 +242,27 @@ func CheckCrossStoreRestart(t *testing.T, store CrossStore, host *CrossStoreHost
 	if err != nil || len(markers) != 1 {
 		t.Fatalf("marker lost or duplicated: %+v, %v", markers, err)
 	}
+	readinessObservedAt := now
+	progress, err := store.ReadContinuation(ctx, markers[0].ExecutionID)
+	if err != nil || progress.CycleStarted != readinessObservedAt ||
+		!progress.Deadline.Equal(readinessObservedAt.Add(markers[0].Policy.OverallTimeout)) {
+		t.Fatalf("durable cross-store readiness did not start its cycle: progress=%+v err=%v", progress, err)
+	}
+	now = now.Add(markers[0].Policy.OverallTimeout)
 	if ready, err := store.ContinuationReady(ctx, "origin"); err != nil || !ready {
-		t.Fatalf("origin not ready after replay: ready=%v err=%v", ready, err)
+		t.Fatalf("delayed discovery must still observe the released origin: ready=%v err=%v", ready, err)
+	}
+	lease, err := store.AcquireContinuation(ctx, markers[0], "worker-after-restart", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartContinuation(ctx, lease, clock); !errors.Is(err, transition.ErrContinuationIntervention) {
+		t.Fatalf("delayed cross-store discovery must consume the cycle deadline: %v", err)
+	}
+	progress, err = store.ReadContinuation(ctx, markers[0].ExecutionID)
+	if err != nil || progress.CycleStarted != readinessObservedAt ||
+		progress.Phase != transition.ContinuationIntervention {
+		t.Fatalf("acquisition reset the cross-store readiness budget: progress=%+v err=%v", progress, err)
 	}
 	var count int
 	if err := host.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM host_domain`).Scan(&count); err != nil || count != 1 {

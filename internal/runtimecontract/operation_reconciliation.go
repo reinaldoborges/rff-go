@@ -181,10 +181,85 @@ func RunOperationReconciliation(t *testing.T, newStore func(*testing.T) Operatio
 	if err != nil || !inspection.EvidenceConflict {
 		t.Fatalf("conflicting evidence was not retained for intervention: %+v %v", inspection, err)
 	}
+	historyCount := len(inspection.History)
+	replayedConflict, replayErr := resolver.Resolve(ctx, conflictingRequest)
+	if !errors.Is(replayErr, transition.ErrOperationEvidenceConflict) ||
+		!replayedConflict.EvidenceConflict || len(replayedConflict.History) != historyCount {
+		t.Fatalf("conflicting resolution replay hid conflict or duplicated audit history: inspection=%+v err=%v", replayedConflict, replayErr)
+	}
 	if activityID == "" {
 		t.Fatal("hook activity identity was not retained")
 	}
 	RunOperationResolutionReplayAfterRetry(t, newStore)
+	RunReconciliationSuccessUnavailable(t, newStore)
+}
+
+func RunReconciliationSuccessUnavailable(
+	t *testing.T,
+	newStore func(*testing.T) OperationReconciliationStore,
+) {
+	t.Helper()
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	_, _, err := store.Accept(ctx, "entity", "missing-result", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "missing-result", Entity: "entity", Key: "missing-result",
+			Operation: transition.Initialize, Status: transition.Waiting, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "missing-result", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, lease, clock); err != nil {
+		t.Fatal(err)
+	}
+	binding := transition.OperationBinding{
+		Identity: transition.OperationIdentity{ExecutionID: "missing-result", Key: "charge"},
+		Kind:     "charge", BehaviorVersion: "v1", ComparatorVersion: "bytes-v1",
+		Input: []byte("amount=100"), ResultCodec: transition.CodecVersion{Name: "receipt", Version: "v1"},
+	}
+	equal := func(_ context.Context, a, b []byte) (bool, error) { return string(a) == string(b), nil }
+	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, binding, equal); err != nil || !started {
+		t.Fatalf("operation did not retain its unknown dispatch: started=%v err=%v", started, err)
+	}
+	assessment := transition.OperationAssessment{
+		Outcome: transition.OperationOutcomeSucceeded,
+		Evidence: transition.OperationEvidence{
+			Identity: binding.Identity, Outcome: transition.OperationOutcomeSucceeded,
+			Provider: "payment-sandbox", Scope: "merchant-7", Reference: "lookup-125",
+			InputFingerprint: "input-fingerprint-v1",
+			Version:          "lookup-v1", Provenance: "authoritative-query",
+			BehaviorVersion: binding.BehaviorVersion, ComparatorVersion: binding.ComparatorVersion,
+			ObservedAt: now, ValidUntil: now.Add(time.Minute),
+		},
+		Result: &transition.OperationResult{Codec: binding.ResultCodec, Unavailable: true},
+	}
+	reconciled, err := store.ReconcileTrackedOperation(ctx, lease, clock, binding, assessment, equal)
+	if err != nil || !reconciled.Resolved || reconciled.Result == nil || !reconciled.Result.Unavailable {
+		t.Fatalf("confirmed success without typed result was not durably settled: %+v %v", reconciled, err)
+	}
+	inspection, err := store.InspectTrackedOperation(ctx, binding.Identity)
+	if err != nil || inspection.Result == nil || !inspection.Result.Unavailable {
+		t.Fatalf("durable inspection did not expose known success with unavailable result: %+v %v", inspection, err)
+	}
+	replayed, started, err := store.BeginTrackedOperation(ctx, lease, clock, binding, equal)
+	if err != nil || started || replayed == nil || !replayed.Unavailable {
+		t.Fatalf("settled success did not block a later dispatch: result=%+v started=%v err=%v", replayed, started, err)
+	}
 }
 
 func RunOperationResolutionReplayAfterRetry(

@@ -183,8 +183,11 @@ result cannot be retained is durably marked unavailable and blocks redispatch.
 Unknown mutations require a `SafeRepeatGuarantee` bound to the exact identity,
 provider scope, host-verified non-secret input fingerprint, and overlap
 horizon; evidence and guarantees are revalidated immediately before dispatch,
-and the guarantee must cover the remaining hook-attempt horizon to account for
-late calls.
+and a required host verifier must prove that the guarantee's `OverlapUntil`
+covers the latest possible effect of both old and repeated calls. This provider
+effect horizon is independent of the hook deadline; the guarantee must remain
+valid through `OverlapUntil`, and repeats fail closed when that horizon cannot
+be established.
 Hosts must also reject repeats of reads when a new response could change the
 original result. Evidence records should contain only safe provenance and
 validity bounds, never credentials, secrets or raw errors.

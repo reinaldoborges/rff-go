@@ -392,7 +392,7 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 		if !matches {
 			return transition.ErrConflict
 		}
-		if !transition.OperationAssessmentValid(binding, assessment, now) {
+		if !transition.OperationReconciliationAssessmentValid(binding, assessment, now) {
 			return transition.ErrCompatibility
 		}
 		if len(record.History) > 0 {
@@ -419,6 +419,15 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 		}
 		if record.Result != nil && record.Result.FailureCode == "" {
 			if assessment.Outcome == transition.OperationOutcomeUnknown {
+				record.History = append(record.History, transition.OperationHistoryEntry{Assessment: assessment, RecordedAt: now})
+				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+					return err
+				}
+				result = transition.OperationReconciliation{Result: cloneOperationResult(record.Result), Resolved: true}
+				return operationClaim(ctx, tx, lease, clock())
+			}
+			if assessment.Outcome == transition.OperationOutcomeSucceeded &&
+				assessment.Result != nil && assessment.Result.Unavailable {
 				record.History = append(record.History, transition.OperationHistoryEntry{Assessment: assessment, RecordedAt: now})
 				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
 					return err
@@ -592,11 +601,11 @@ func (s *Store[EntityID, StateID]) ReplayOperationResolution(
 			return transition.ErrConflict
 		}
 		found, err = operationResolutionReplay(record, requestID, principal, reason, assessment)
-		if err != nil {
-			return err
-		}
 		if found {
 			inspection = operationInspection(record)
+		}
+		if err != nil {
+			return err
 		}
 		return nil
 	})
@@ -638,11 +647,17 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 			return transition.ErrConflict
 		}
 		found, err := operationResolutionReplay(record, requestID, principal, reason, assessment)
+		if found {
+			inspection = operationInspection(record)
+		}
 		if err != nil {
+			if errors.Is(err, transition.ErrOperationEvidenceConflict) {
+				deferredErr = err
+				return nil
+			}
 			return err
 		}
 		if found {
-			inspection = operationInspection(record)
 			return nil
 		}
 		if execution.Status != transition.NeedsIntervention {
@@ -739,6 +754,9 @@ func operationResolutionReplay(
 			continue
 		}
 		if entry.Principal == principal && entry.Reason == reason && sameOperationAssessment(entry.Assessment, assessment) {
+			if record.EvidenceConflict {
+				return true, transition.ErrOperationEvidenceConflict
+			}
 			return true, nil
 		}
 		return false, transition.ErrConflict
