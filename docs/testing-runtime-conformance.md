@@ -25,7 +25,6 @@ CHECKS_CONTAINER='<unique-Go-container-name>'
 MYSQL_GATEWAY="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CHECKS_CONTAINER")"
 RFF_MYSQL_DSN="root:rff-test@tcp(${MYSQL_GATEWAY}:${MYSQL_PORT})/rff_test?parseTime=true"
 docker exec -e RFF_MYSQL_DSN="$RFF_MYSQL_DSN" "$CHECKS_CONTAINER" ./scripts/check-mysql.sh
-docker stop "$MYSQL_CONTAINER"
 ```
 
 `scripts/check-mysql.sh` fails if `RFF_MYSQL_DSN` is unset. It runs all MySQL
@@ -37,12 +36,14 @@ docker exec -e RFF_MYSQL_DSN="$RFF_MYSQL_DSN" "$CHECKS_CONTAINER" \
   go test ./examples/renewal -run '^TestMySQLHostScenarioAndProcessRestart$' -count=1 -v
 docker exec -e RFF_MYSQL_DSN="$RFF_MYSQL_DSN" "$CHECKS_CONTAINER" \
   go test ./examples/renewal -run '^TestBatchMySQLScenarioAndProcessRestart$' -count=1 -v
+docker stop "$MYSQL_CONTAINER"
 ```
 
 These are not adapter-only checks: the host scenario covers shared and
 separate runtime/domain stores, and the batch scenario covers both store
 layouts, real child-process termination and restart after a confirmed effect,
-unknown-effect blocking, durable fan-out, and concurrent host record claims.
+unknown-effect blocking and resolution, fan-out partial-acceptance process
+restart, durable fan-out, and concurrent host record claims.
 The host test logs the server version; the batch test uses the same MySQL 8.4
 version assertion. A skipped MySQL host or batch test is unverified, not a
 passing gate.

@@ -49,16 +49,54 @@ func (h *Host) charge(ctx context.Context, execution fsm.ExecutionContext[string
 
 func (h *Host) refund(ctx context.Context, execution fsm.ExecutionContext[string, State, Event, Input]) error {
 	input := execution.Input()
-	chargeIdentity := transition.OperationIdentity{ExecutionID: execution.Attempt().ExecutionID, Key: "charge"}
+	rows, err := h.db.QueryContext(ctx, `SELECT record_id FROM renewal_batch_records WHERE batch_id = ? ORDER BY ordinal`, input.PlanID)
+	if err != nil {
+		return err
+	}
+	var members []string
+	for rows.Next() {
+		var member string
+		if err := rows.Scan(&member); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		members = append(members, member)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return h.refundRecord(ctx, execution.Attempt().ExecutionID, input.PlanID, input.PeriodID, "charge", "refund")
+	}
+	for _, member := range members {
+		chargeKey := "charge:" + member
+		_, err := h.store.InspectTrackedOperation(ctx, transition.OperationIdentity{ExecutionID: execution.Attempt().ExecutionID, Key: chargeKey})
+		if errors.Is(err, transition.ErrOperationNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := h.refundRecord(ctx, execution.Attempt().ExecutionID, member, input.PeriodID, chargeKey, "refund:"+member); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Host) refundRecord(ctx context.Context, executionID, plan, period, chargeKey, refundKey string) error {
+	chargeIdentity := transition.OperationIdentity{ExecutionID: executionID, Key: chargeKey}
 	opInput := providerInput{
-		PlanID: input.PlanID, PeriodID: input.PeriodID, Amount: amountCents,
+		PlanID: plan, PeriodID: period, Amount: amountCents,
 		Kind: "refund", ChargeKey: providerKey(chargeIdentity),
 	}
 	encoded, err := json.Marshal(opInput)
 	if err != nil {
 		return err
 	}
-	request := h.operationRequest("refund", opInput, encoded, true, []string{"charge"})
+	request := h.operationRequest(refundKey, opInput, encoded, true, []string{chargeKey})
 	result, err := transition.TrackOperation(ctx, request, h.dispatchProvider)
 	if err != nil {
 		return err
@@ -370,13 +408,13 @@ func (h *Host) InspectCharge(ctx context.Context, plan, period, principal string
 	if principal != "operator" {
 		return transition.OperationInspection{}, errors.New("operation inspection denied")
 	}
-	var executionID string
-	err := h.db.QueryRowContext(ctx, `SELECT execution_id FROM renewal_provider_ops WHERE plan_id = ? AND period_id = ? AND kind = 'charge' ORDER BY created_at DESC LIMIT 1`,
-		plan, period).Scan(&executionID)
+	var executionID, operationKey string
+	err := h.db.QueryRowContext(ctx, `SELECT execution_id, operation_key FROM renewal_provider_ops WHERE plan_id = ? AND period_id = ? AND kind = 'charge' ORDER BY created_at DESC LIMIT 1`,
+		plan, period).Scan(&executionID, &operationKey)
 	if err != nil {
 		return transition.OperationInspection{}, err
 	}
-	return h.store.InspectTrackedOperation(ctx, transition.OperationIdentity{ExecutionID: executionID, Key: "charge"})
+	return h.store.InspectTrackedOperation(ctx, transition.OperationIdentity{ExecutionID: executionID, Key: operationKey})
 }
 
 func (h *Host) ResolveCharge(ctx context.Context, plan, actor string) error {
@@ -387,7 +425,15 @@ func (h *Host) ResolveCharge(ctx context.Context, plan, actor string) error {
 	if err != nil {
 		return err
 	}
-	identity := transition.OperationIdentity{ExecutionID: execution.ID, Key: "charge"}
+	key := "charge"
+	var recordID string
+	err = h.db.QueryRowContext(ctx, `SELECT record_id FROM renewal_batch_records WHERE batch_id = ? AND status = 'pending' ORDER BY ordinal LIMIT 1`, plan).Scan(&recordID)
+	if err == nil {
+		key = "charge:" + recordID
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	identity := transition.OperationIdentity{ExecutionID: execution.ID, Key: key}
 	inspection, err := h.store.InspectTrackedOperation(ctx, identity)
 	if err != nil {
 		return err
@@ -400,7 +446,7 @@ func (h *Host) ResolveCharge(ctx context.Context, plan, actor string) error {
 		return transition.ErrOperationUnresolved
 	}
 	_, err = h.resolver.Resolve(ctx, transition.OperationResolutionRequest{
-		ID: "resolve:" + execution.ID, Identity: identity, Assessment: assessment,
+		ID: "resolve:" + execution.ID + ":" + key, Identity: identity, Assessment: assessment,
 		VerifyEvidence: h.verifyEvidence,
 		ValidateResult: func(_ context.Context, binding transition.OperationBinding, result transition.OperationResult) error {
 			var input providerInput
@@ -447,7 +493,11 @@ func (h *Host) control(ctx context.Context, plan, actor string, action transitio
 	if err != nil {
 		return err
 	}
-	id := "operator-" + string(action) + "-" + execution.ID
+	id, err := randomID()
+	if err != nil {
+		return err
+	}
+	id = "operator-" + string(action) + "-" + id
 	_, err = h.controls.Hook(ctx, lease, h.clock, transition.HookControl{ID: id, Action: action})
 	return err
 }

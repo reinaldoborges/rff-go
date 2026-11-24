@@ -118,6 +118,7 @@ type Host struct {
 	dialect               string
 	clock                 func() time.Time
 	afterBatchEffect      func(string)
+	afterFanoutAccept     func(string)
 	machines              *fsm.Registry[string, State, Event, Input]
 	acceptor              *transition.Acceptor[string, State, Event, Input]
 	coordinator           *transition.Coordinator[string, State]
@@ -438,11 +439,22 @@ func (p *paymentHandler) Recover(ctx context.Context, execution fsm.ExecutionCon
 }
 
 func (h *Host) Start(ctx context.Context, plan, period string) (string, error) {
+	return h.startOwned(ctx, plan, period, "standalone", plan)
+}
+
+func (h *Host) startOwned(ctx context.Context, plan, period, ownerKind, ownerID string) (string, error) {
 	if plan == "" || period == "" {
 		return "", transition.ErrInvalidRequest
 	}
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
+		return "", err
+	}
+	if err := h.claimRecord(ctx, tx, plan, period, ownerKind, ownerID); err != nil {
+		_ = tx.Rollback()
+		if isRecordClaimConflict(err) {
+			return "", transition.ErrConflict
+		}
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO renewal_plans (plan_id, period_id, state, revision) VALUES (?, ?, '', 0)`, plan, period); err != nil {

@@ -109,7 +109,13 @@ per-record progress in one transition; a process restart after a confirmed
 tracked effect; blocking on an inconclusive effect; and a separate durable
 fan-out to one FSM entity per record. Both batch modes run against shared and
 separate stores, with host-owned record claims rather than a framework batch
-scheduler. See [runtime conformance verification](docs/testing-runtime-conformance.md)
+scheduler. Claims also fence standalone starts. For a blocked batch member,
+`ApplyLateProviderCall` records provider evidence for the member;
+`ResolveCharge` and `Retry` operate on the batch execution. Abort compensates
+each confirmed member effect independently and waits for unknown outcomes.
+The fan-out cursor counts the contiguous completed prefix, and accepted
+member executions are recovered after a process restart.
+See [runtime conformance verification](docs/testing-runtime-conformance.md)
 for the exact MySQL prerequisites, commands, and full gate.
 
 The fixture tests include shared-store SQLite, separate-store SQLite, actual

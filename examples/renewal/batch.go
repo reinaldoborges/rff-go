@@ -17,6 +17,7 @@ type BatchRecordProgress struct {
 	RecordID        string
 	Complete        bool
 	Effects         int
+	Refunds         int
 	OperationStatus string
 }
 
@@ -154,10 +155,33 @@ func (h *Host) startBatch(ctx context.Context, batchID, period string, recordIDs
 		_ = tx.Rollback()
 		return "", err
 	}
+	if err := h.claimRecord(ctx, tx, batchID, period, "batch", batchID); err != nil {
+		_ = tx.Rollback()
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
-	return h.Start(ctx, batchID, period)
+	return h.startOwned(ctx, batchID, period, "batch", batchID)
+}
+
+func (h *Host) claimRecord(ctx context.Context, tx *sql.Tx, record, period, kind, owner string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO renewal_record_claims (record_id, period_id, owner_kind, owner_id) VALUES (?, ?, ?, ?)`, record, period, kind, owner)
+	if err == nil {
+		return nil
+	}
+	if !isDuplicate(err) {
+		return err
+	}
+	var storedKind, storedOwner string
+	if err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT owner_kind, owner_id FROM renewal_record_claims WHERE record_id = ? AND period_id = ?`),
+		record, period).Scan(&storedKind, &storedOwner); err != nil {
+		return err
+	}
+	if storedKind != kind || storedOwner != owner {
+		return transition.ErrConflict
+	}
+	return nil
 }
 
 func (h *Host) BatchProgress(ctx context.Context, batchID string) (BatchProgress, error) {
@@ -188,9 +212,13 @@ func (h *Host) BatchProgress(ctx context.Context, batchID string) (BatchProgress
 	_ = rows.Close()
 	progress := BatchProgress{Cursor: cursor, Records: make([]BatchRecordProgress, 0, len(records))}
 	for _, record := range records {
-		var effects int
+		var effects, refunds int
 		if err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM renewal_provider_ops WHERE plan_id = ? AND period_id = ? AND kind = 'charge' AND status = 'succeeded'`,
 			record.recordID, period).Scan(&effects); err != nil {
+			return BatchProgress{}, err
+		}
+		if err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM renewal_provider_ops WHERE plan_id = ? AND period_id = ? AND kind = 'refund' AND status = 'succeeded'`,
+			record.recordID, period).Scan(&refunds); err != nil {
 			return BatchProgress{}, err
 		}
 		var operationStatus string
@@ -202,7 +230,7 @@ func (h *Host) BatchProgress(ctx context.Context, batchID string) (BatchProgress
 			return BatchProgress{}, err
 		}
 		progress.Records = append(progress.Records, BatchRecordProgress{
-			Ordinal: record.ordinal, RecordID: record.recordID, Complete: record.complete, Effects: effects, OperationStatus: operationStatus,
+			Ordinal: record.ordinal, RecordID: record.recordID, Complete: record.complete, Effects: effects, Refunds: refunds, OperationStatus: operationStatus,
 		})
 	}
 	return progress, nil
@@ -310,14 +338,31 @@ func (h *Host) startFanout(ctx context.Context, runID, period string, recordIDs 
 		return err
 	}
 	for _, id := range recordIDs {
-		executionID, err := h.Start(ctx, id, period)
-		if err != nil {
+		if err := h.acceptFanoutRecord(ctx, runID, id, period); err != nil {
 			return err
 		}
-		if _, err := h.db.ExecContext(ctx, `UPDATE renewal_fanout_records SET execution_id = ? WHERE run_id = ? AND record_id = ? AND execution_id = ''`,
-			executionID, runID, id); err != nil {
-			return err
-		}
+	}
+	return nil
+}
+
+func (h *Host) acceptFanoutRecord(ctx context.Context, runID, id, period string) error {
+	executionID, err := h.startOwned(ctx, id, period, "fanout", runID)
+	if err != nil {
+		return err
+	}
+	if h.afterFanoutAccept != nil {
+		h.afterFanoutAccept(id)
+	}
+	if _, err := h.db.ExecContext(ctx, `UPDATE renewal_fanout_records SET execution_id = ? WHERE run_id = ? AND record_id = ? AND execution_id = ''`,
+		executionID, runID, id); err != nil {
+		return err
+	}
+	var stored string
+	if err := h.db.QueryRowContext(ctx, `SELECT execution_id FROM renewal_fanout_records WHERE run_id = ? AND record_id = ?`, runID, id).Scan(&stored); err != nil {
+		return err
+	}
+	if stored != executionID {
+		return transition.ErrConflict
 	}
 	return nil
 }
@@ -381,7 +426,7 @@ func (h *Host) DriveFanout(ctx context.Context, runID string) error {
 		return err
 	}
 	for _, record := range progress.Records {
-		if _, err := h.Start(ctx, record.EntityID, period); err != nil {
+		if err := h.acceptFanoutRecord(ctx, runID, record.EntityID, period); err != nil {
 			return err
 		}
 	}
@@ -509,6 +554,11 @@ func (h *Host) markFanoutRecordComplete(ctx context.Context, runID string, recor
 	if err != nil {
 		return err
 	}
+	var priorCursor int
+	if err := tx.QueryRowContext(ctx, h.lockQuery(`SELECT cursor_ordinal FROM renewal_fanout_runs WHERE run_id = ?`), runID).Scan(&priorCursor); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE renewal_fanout_records SET status = 'complete' WHERE run_id = ? AND record_id = ? AND status = 'pending'`,
 		runID, record.recordID)
 	if err != nil {
@@ -532,8 +582,20 @@ func (h *Host) markFanoutRecordComplete(ctx context.Context, runID string, recor
 			return fmt.Errorf("fan-out entity %q lost its host progress claim", record.recordID)
 		}
 	}
+	var firstPending sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MIN(ordinal) FROM renewal_fanout_records WHERE run_id = ? AND status <> 'complete'`, runID).Scan(&firstPending); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	var cursor int64
+	if firstPending.Valid {
+		cursor = firstPending.Int64 - 1
+	} else if err := tx.QueryRowContext(ctx, `SELECT MAX(ordinal) FROM renewal_fanout_records WHERE run_id = ?`, runID).Scan(&cursor); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE renewal_fanout_runs SET cursor_ordinal = ? WHERE run_id = ? AND cursor_ordinal < ?`,
-		record.ordinal, runID, record.ordinal); err != nil {
+		cursor, runID, cursor); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
