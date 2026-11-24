@@ -77,9 +77,7 @@ func (c jsonCodec[T]) Equal(ctx context.Context, stored []byte, incoming T) (boo
 
 type persistence interface {
 	transition.AcceptanceStore[string, State]
-	transition.CoordinatorStore[string, State]
-	transition.HookActivityStore[string, State]
-	transition.CommitStore[string, State]
+	transition.LifecycleStore[string, State]
 	transition.NotificationStore[string, State]
 	transition.InputStore
 	transition.TimerScheduleStore

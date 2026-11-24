@@ -72,6 +72,11 @@ type NotificationOutbox[EntityID comparable, StateID comparable] struct {
 	clock func() time.Time
 }
 
+// CheckNotificationActivities validates the durable inventory without a claim.
+func (o *NotificationOutbox[EntityID, StateID]) CheckNotificationActivities(ctx context.Context) error {
+	return o.store.hookTransaction(ctx, func(tx *sql.Tx) error { return validateNotificationWork(ctx, tx) })
+}
+
 // NewNotificationOutbox binds the outbox to a store and fence clock.
 func NewNotificationOutbox[EntityID comparable, StateID comparable](
 	store *Store[EntityID, StateID], clock func() time.Time,

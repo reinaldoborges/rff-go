@@ -13,6 +13,8 @@ type LifecycleStore[EntityID comparable, StateID comparable] interface {
 	CoordinatorStore[EntityID, StateID]
 	CommitStore[EntityID, StateID]
 	HookActivityStore[EntityID, StateID]
+	// CheckHookActivities validates durable hook inventory without claiming work.
+	CheckHookActivities(context.Context) error
 }
 
 // PathErrorClass is a safe description of a progress-path failure.
@@ -57,12 +59,14 @@ type lifecyclePath struct {
 	done       chan struct{}
 	status     PathStatus
 	step       func(context.Context, func()) error
+	check      func(context.Context) error
 	worker     bool
 	hook       bool
 	empty      error
 	stop       func()
 	cancelWork func()
 	err        error
+	checkError bool
 }
 
 // Lifecycle runs a single local transition coordinator and bounded hook workers.
@@ -125,6 +129,7 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		})
 		l.paths[len(l.paths)-1].hook = true
 		l.paths[len(l.paths)-1].empty = ErrNoHookActivity
+		l.paths[len(l.paths)-1].check = store.CheckHookActivities
 	}
 	if err := l.addInputs(config.Inputs, add); err != nil {
 		return nil, err
@@ -182,7 +187,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Start(ctx context.Context) 
 			if err != nil {
 				results <- fmt.Errorf("initial %s scan: %w", path.name, err)
 				if checkCtx.Err() == nil {
-					l.recordFailure(path, err)
+					l.recordFailure(path, err, false)
 				}
 			} else {
 				l.recordSuccess(path)
@@ -267,11 +272,24 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) runPath(ctx context.Context
 			continue
 		}
 		if path.worker && onlyPathSignal(err, ErrWorkerAtCapacity) {
+			if path.check != nil && l.canCheckCapacity(path) {
+				err := path.check(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					if l.recordFailure(path, err, true) != PathErrorRecoverable {
+						return
+					}
+				} else {
+					l.recordSuccess(path)
+				}
+			}
 			wait = true
 			continue
 		}
 		if err != nil {
-			if l.recordFailure(path, err) != PathErrorRecoverable {
+			if l.recordFailure(path, err, false) != PathErrorRecoverable {
 				return
 			}
 			wait = true
@@ -319,17 +337,26 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) pathRecovering(path *lifecy
 	return path.status.Classification == PathErrorRecoverable
 }
 
+func (l *Lifecycle[EntityID, StateID, Event, Input]) canCheckCapacity(path *lifecyclePath) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// A read-only check cannot establish that a failed claim or report recovered.
+	return path.status.Classification == "" || path.checkError
+}
+
 func (l *Lifecycle[EntityID, StateID, Event, Input]) recordSuccess(path *lifecyclePath) {
 	l.mu.Lock()
 	path.status.Checked = true
 	path.status.Classification = ""
+	path.checkError = false
 	l.mu.Unlock()
 }
 
-func (l *Lifecycle[EntityID, StateID, Event, Input]) recordFailure(path *lifecyclePath, err error) PathErrorClass {
+func (l *Lifecycle[EntityID, StateID, Event, Input]) recordFailure(path *lifecyclePath, err error, checkError bool) PathErrorClass {
 	class := classifyPathError(err, l.classify)
 	l.mu.Lock()
 	path.status.Classification = class
+	path.checkError = checkError
 	path.err = fmt.Errorf("%s: %w", path.name, err)
 	l.mu.Unlock()
 	select {
@@ -437,6 +464,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) RestartPath(name string) er
 			}
 			path.status.Checked = false
 			path.status.Classification = ""
+			path.checkError = false
 			l.launchLocked(path, false)
 			return nil
 		}

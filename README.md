@@ -183,6 +183,13 @@ for every path, not an empty backlog. Local available capacity is separate:
 busy hooks can exhaust capacity without making durable checks unready. Transition
 and commit reconciliation share a path and lease; hook worker paths are
 independently supervised. No other paths are enabled implicitly.
+Lifecycle hook stores must implement `CheckHookActivities`, and notification
+outboxes must implement `CheckNotificationActivities`. These methods check
+durable inventory without claiming work or consuming attempts, so checks can
+continue even when cancellation-ignoring work occupies all local slots. A
+successful inventory check does not prove a future claim or report will succeed;
+a recoverable claim or report failure remains visible until a worker can retry,
+even if an inventory check could succeed.
 
 Before `Start`, call `EnableNotifications` to explicitly configure the
 notification store, fenced handoff, delivery store, delivery function, worker

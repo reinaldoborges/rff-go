@@ -13,6 +13,13 @@ type LifecycleNotificationConfig struct {
 	Worker   NotificationWorkerConfig
 }
 
+// LifecycleNotificationStore checks durable delivery inventory without claiming
+// work or consuming an attempt, including while delivery capacity is occupied.
+type LifecycleNotificationStore[EntityID comparable, StateID comparable] interface {
+	NotificationActivityStore[EntityID, StateID]
+	CheckNotificationActivities(context.Context) error
+}
+
 type notificationSlot struct {
 	claimCancel context.CancelFunc
 	workCancel  context.CancelFunc
@@ -32,7 +39,7 @@ type lifecycleNotifications[EntityID comparable, StateID comparable] struct {
 // using the stable notification intent ID.
 func (l *Lifecycle[EntityID, StateID, Event, Input]) EnableNotifications(
 	store NotificationStore[EntityID, StateID], handoff NotificationHandoff[EntityID, StateID],
-	outbox NotificationActivityStore[EntityID, StateID],
+	outbox LifecycleNotificationStore[EntityID, StateID],
 	deliver func(context.Context, NotificationDelivery[EntityID, StateID]) error,
 	config LifecycleNotificationConfig,
 ) error {
@@ -63,7 +70,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) EnableNotifications(
 		name := fmt.Sprintf("notification-worker-%d", i)
 		l.paths = append(l.paths, &lifecyclePath{
 			name: name, wake: make(chan struct{}, 1), status: PathStatus{Name: name},
-			worker: true, empty: ErrNoNotificationActivity, step: n.runOne,
+			worker: true, empty: ErrNoNotificationActivity, step: n.runOne, check: outbox.CheckNotificationActivities,
 		})
 	}
 	return nil

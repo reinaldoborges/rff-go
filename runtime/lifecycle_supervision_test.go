@@ -5,11 +5,134 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+type occupiedHookStore struct {
+	lifecycleTestStore
+	activity  *oneActivityStore
+	claims    atomic.Int64
+	checks    atomic.Int64
+	checkFail atomic.Bool
+}
+
+var errHookInventory = errors.New("hook inventory unavailable")
+
+func (s *occupiedHookStore) ClaimHook(ctx context.Context, owner string, clock func() time.Time, ttl time.Duration) (transition.HookLease, error) {
+	s.claims.Add(1)
+	return s.activity.ClaimHook(ctx, owner, clock, ttl)
+}
+
+func (s *occupiedHookStore) InspectHook(ctx context.Context, lease transition.HookLease, clock func() time.Time) (transition.Execution[string, string], transition.HookCall, error) {
+	return s.activity.InspectHook(ctx, lease, clock)
+}
+
+func (s *occupiedHookStore) StartHook(ctx context.Context, lease transition.HookLease, clock func() time.Time) (transition.StartedHook, error) {
+	return s.activity.StartHook(ctx, lease, clock)
+}
+
+func (s *occupiedHookStore) RenewHook(ctx context.Context, lease transition.HookLease, clock func() time.Time, ttl time.Duration) (transition.HookLease, error) {
+	return s.activity.RenewHook(ctx, lease, clock, ttl)
+}
+
+func (*occupiedHookStore) ReportHook(context.Context, transition.HookLease, transition.HookResult, func() time.Time) error {
+	return errors.New("report failed")
+}
+
+func (s *occupiedHookStore) BlockHookCompatibility(ctx context.Context, lease transition.HookLease, diagnostic transition.CompatibilityDiagnostic, clock func() time.Time) error {
+	return s.activity.BlockHookCompatibility(ctx, lease, diagnostic, clock)
+}
+
+func (s *occupiedHookStore) CheckHookActivities(context.Context) error {
+	s.checks.Add(1)
+	if s.checkFail.Load() {
+		return errHookInventory
+	}
+	return nil
+}
+
+func TestLifecycleRestartWithOccupiedHookChecksStoreWithoutClaiming(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	runner, record, call := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}})
+	record.Policy.AttemptTimeout = 30 * time.Millisecond
+	record.Deadline = time.Now().Add(time.Minute)
+	store := &occupiedHookStore{activity: &oneActivityStore{record: record, call: call}}
+	l, err := transition.NewLifecycle[string, string, string, int](store, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator: transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker: transition.WorkerConfig{ID: "worker", Capacity: 1, LeaseTTL: time.Second,
+			RenewalInterval: 100 * time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 10 * time.Millisecond,
+		ClassifyError: func(err error) transition.PathErrorClass {
+			if errors.Is(err, errHookInventory) {
+				return transition.PathErrorRecoverable
+			}
+			return transition.PathErrorUnclassified
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_ = l.Shutdown(ctx)
+		cancel()
+		close(release)
+		_ = l.Shutdown(context.Background())
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook did not start")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		path := l.Status().Paths[1]
+		if !path.Running && path.Classification == transition.PathErrorUnclassified {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("report failure did not stop worker: %+v", l.Status())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkFail.Store(true)
+	if err := l.RestartPath("hook-worker-0"); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		path := l.Status().Paths[1]
+		if path.Running && path.Classification == transition.PathErrorRecoverable && store.checks.Load() > 0 {
+			if path.Checked || l.Status().Ready || !errors.Is(l.Err(), errHookInventory) {
+				t.Fatalf("failed inventory check reported healthy: %+v", l.Status())
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity blocked inventory check: %+v", l.Status())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkFail.Store(false)
+	for !l.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := l.Status()
+	if !status.Ready || status.Paths[1].Classification != "" || status.Capacity.Available != 0 ||
+		store.checks.Load() < 2 || store.claims.Load() != 1 || !errors.Is(l.Err(), errHookInventory) {
+		t.Fatalf("occupied hook prevented readiness or caused another claim: %+v", status)
+	}
+}
 
 type joinedFailureStore struct {
 	lifecycleTestStore

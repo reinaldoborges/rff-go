@@ -82,6 +82,8 @@ type lifecycleTestStore struct {
 var errLifecycleScan = errors.New("scan failed")
 var errLifecycleClaim = errors.New("claim failed")
 
+func (*lifecycleTestStore) CheckHookActivities(context.Context) error { return nil }
+
 func (s *lifecycleTestStore) ActiveExecutionIDs(context.Context) ([]string, error) {
 	s.scans.Add(1)
 	if s.fail.Load() {

@@ -44,6 +44,8 @@ type lifecycleNotificationStore struct {
 	fail atomic.Bool
 }
 
+func (*lifecycleNotificationStore) CheckNotificationActivities(context.Context) error { return nil }
+
 func (*lifecycleNotificationStore) ActiveExecutionIDs(context.Context) ([]string, error) {
 	return nil, nil
 }
@@ -155,13 +157,78 @@ func (*blockingNotificationStore) RetryNotificationDelivery(context.Context, tra
 	return nil
 }
 
-type failedNotificationReportStore struct{ blockingNotificationStore }
-
-func (*failedNotificationReportStore) RetryNotificationDelivery(context.Context, transition.NotificationLease, func() time.Time, time.Time) error {
-	return errors.New("report failed")
+type failedNotificationReportStore struct {
+	blockingNotificationStore
+	checks    atomic.Int64
+	checkFail atomic.Bool
 }
 
-func TestLifecycleRestartAtCapacityDoesNotInventSuccessfulCheck(t *testing.T) {
+var errNotificationReport = errors.New("report failed")
+
+func (*failedNotificationReportStore) RetryNotificationDelivery(context.Context, transition.NotificationLease, func() time.Time, time.Time) error {
+	return errNotificationReport
+}
+
+func (s *failedNotificationReportStore) CheckNotificationActivities(context.Context) error {
+	s.checks.Add(1)
+	if s.checkFail.Load() {
+		return errors.New("inventory unavailable")
+	}
+	return nil
+}
+
+func TestLifecycleInventoryCheckDoesNotHideRecoverableReportFailure(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	store := &failedNotificationReportStore{}
+	l, err := transition.NewLifecycle[string, string, string, int](&lifecycleTestStore{}, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator:  transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker:       transition.WorkerConfig{ID: "hook", Capacity: 1, LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 10 * time.Millisecond,
+		ClassifyError: func(err error) transition.PathErrorClass {
+			if errors.Is(err, errNotificationReport) || errors.Is(err, context.DeadlineExceeded) {
+				return transition.PathErrorRecoverable
+			}
+			return transition.PathErrorUnclassified
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	defer close(release)
+	if err := l.EnableNotifications(store, lifecycleNotificationHandoff{}, store, func(context.Context, transition.NotificationDelivery[string, string]) error {
+		<-release
+		return nil
+	}, transition.LifecycleNotificationConfig{Capacity: 1, Worker: transition.NotificationWorkerConfig{
+		ID: "notification", LeaseTTL: time.Second, RenewalInterval: 500 * time.Millisecond,
+		AttemptTimeout: 30 * time.Millisecond, RetryDelay: time.Millisecond, Clock: transition.SystemWorkerClock{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_ = l.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !errors.Is(l.Err(), errNotificationReport) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !errors.Is(l.Err(), errNotificationReport) {
+		t.Fatal("delivery report failure not observed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	status := l.Status()
+	path := status.Paths[len(status.Paths)-1]
+	if status.Ready || path.Classification != transition.PathErrorRecoverable {
+		t.Fatalf("inventory check hid unretried report failure: %+v", status)
+	}
+}
+
+func TestLifecycleRestartAtCapacityChecksStoreWithoutClaiming(t *testing.T) {
 	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
 	store := &failedNotificationReportStore{}
 	l, err := transition.NewLifecycle[string, string, string, int](&lifecycleTestStore{}, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
@@ -203,14 +270,34 @@ func TestLifecycleRestartAtCapacityDoesNotInventSuccessfulCheck(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	store.checkFail.Store(true)
 	if err := l.RestartPath("notification-worker-0"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	for {
+		status := l.Status()
+		path := status.Paths[len(status.Paths)-1]
+		if !path.Running && path.Classification == transition.PathErrorUnclassified && store.checks.Load() > 0 {
+			if status.Ready || path.Checked {
+				t.Fatalf("failed inventory check reported healthy: %+v", status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity prevented failed inventory check: %+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkFail.Store(false)
+	if err := l.RestartPath("notification-worker-0"); err != nil {
+		t.Fatal(err)
+	}
+	for !l.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	status := l.Status()
-	path := status.Paths[len(status.Paths)-1]
-	if status.Ready || !path.Running || path.Checked || store.claims.Load() != 1 {
-		t.Fatalf("capacity was mistaken for a successful restart check: %+v", status)
+	if !status.Ready || store.checks.Load() < 2 || store.claims.Load() != 1 {
+		t.Fatalf("capacity blocked successful inventory check or caused another claim: %+v", status)
 	}
 }
 

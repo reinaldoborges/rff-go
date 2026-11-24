@@ -79,7 +79,7 @@ func (h *Host) enqueueDemoTimer(ctx context.Context, plan, period string) error 
 	return err
 }
 
-func (h *Host) demoOutbox() (transition.NotificationHandoff[string, State], transition.NotificationActivityStore[string, State], error) {
+func (h *Host) demoOutbox() (transition.NotificationHandoff[string, State], transition.LifecycleNotificationStore[string, State], error) {
 	switch store := h.store.(type) {
 	case *sqlite.Store[string, State]:
 		outbox, err := sqlite.NewNotificationOutbox(store, h.clock)
