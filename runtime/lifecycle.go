@@ -29,6 +29,8 @@ type LifecycleConfig struct {
 	Coordinator  CoordinatorConfig
 	Worker       WorkerConfig
 	PollInterval time.Duration
+	// Inputs explicitly enables independently supervised typed input channels.
+	Inputs []LifecycleInput
 	// ClassifyError classifies errors not recognized by the framework. It may
 	// be called concurrently and must not expose error text in diagnostics.
 	ClassifyError func(error) PathErrorClass
@@ -115,6 +117,9 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 			return worker.runOne(context.Background(), checked)
 		})
 	}
+	if err := l.addInputs(config.Inputs, add); err != nil {
+		return nil, err
+	}
 	return l, nil
 }
 
@@ -138,41 +143,67 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Start(ctx context.Context) 
 	checkCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(runCtx, cancel)
 	defer func() { stop(); cancel() }()
-	var initial error
+	stopStartup := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.stopping = true
+		l.cancel()
+		l.mu.Unlock()
+		_ = l.worker.Shutdown(ctx)
+	})
+	defer stopStartup()
+	results := make(chan error, len(l.paths))
+	var checks sync.WaitGroup
 	for _, path := range l.paths {
 		if path.worker {
+			l.mu.Lock()
+			if !l.stopping && checkCtx.Err() == nil {
+				l.launchLocked(path, false)
+			}
+			l.mu.Unlock()
 			continue
 		}
-		if checkCtx.Err() != nil {
-			initial = errors.Join(initial, checkCtx.Err())
-			break
-		}
-		err := path.step(checkCtx, nil)
-		if err != nil {
-			initial = errors.Join(initial, fmt.Errorf("initial %s scan: %w", path.name, err))
-			if checkCtx.Err() == nil {
-				l.recordFailure(path, err)
+		checks.Add(1)
+		go func(path *lifecyclePath) {
+			defer checks.Done()
+			if err := checkCtx.Err(); err != nil {
+				results <- err
+				return
 			}
-		} else {
-			l.recordSuccess(path)
-		}
+			err := path.step(checkCtx, nil)
+			if err != nil {
+				results <- fmt.Errorf("initial %s scan: %w", path.name, err)
+				if checkCtx.Err() == nil {
+					l.recordFailure(path, err)
+				}
+			} else {
+				l.recordSuccess(path)
+			}
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			if !l.stopping && checkCtx.Err() == nil && path.status.Classification != PathErrorFatal && path.status.Classification != PathErrorUnclassified {
+				l.launchLocked(path, true)
+			}
+		}(path)
+	}
+	checks.Wait()
+	close(results)
+	var initial error
+	for err := range results {
+		initial = errors.Join(initial, err)
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.stopping {
-		return errors.Join(initial, context.Canceled)
+		l.mu.Unlock()
+		return errors.Join(initial, ctx.Err(), context.Canceled)
 	}
 	if ctx.Err() != nil {
 		l.stopping = true
 		l.cancel()
+		l.mu.Unlock()
+		_ = l.worker.Shutdown(ctx)
 		return errors.Join(initial, ctx.Err())
 	}
-	for _, path := range l.paths {
-		if path.status.Classification == PathErrorFatal || path.status.Classification == PathErrorUnclassified {
-			continue
-		}
-		l.launchLocked(path, !path.worker)
-	}
+	l.mu.Unlock()
 	return initial
 }
 

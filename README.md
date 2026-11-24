@@ -20,6 +20,23 @@ The checks require Go 1.27.3, CGO, and a supported C compiler for the SQLite
 adapter and race detection.
 See [AGENTS.md](AGENTS.md) for the verification commands.
 
+## Durable typed inputs
+
+Construct an `InputIngress` with a durable input store, channel, codec resolver
+and host handler, then explicitly include it in `LifecycleConfig.Inputs`.
+Each enabled channel is supervised as `input:<channel>` and is checked at
+startup and periodically using `PollInterval`; `Wakeup` is only a hint.
+Channel names must be unique and safe to expose in diagnostics. A stopped
+channel requires `RestartPath` after correction. Shutdown cancels scans; an
+unfinished input remains eligible for replay.
+
+The host owns external receivers, authentication, authorization and domain
+mapping. Handlers must durably deduplicate effects and outcomes by input ID:
+delivery can repeat, including after process restart or an unknown outcome.
+Keep channel codec and handler mappings compatible across restarts. Status
+contains classifications rather than raw errors; `Lifecycle.Err` is intended
+for trusted host diagnostics and can contain sensitive error details.
+
 ## Recurring-renewal host example
 
 `examples/renewal` is a runnable, non-production host integration using the
