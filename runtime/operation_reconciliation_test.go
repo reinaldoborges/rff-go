@@ -16,6 +16,7 @@ type reconciliationTestStore struct {
 	repeat     []SafeRepeatGuarantee
 	activityID string
 	generation uint64
+	onRepeat   func()
 }
 
 func (s *reconciliationTestStore) BeginTrackedOperation(_ context.Context, lease HookLease, _ func() time.Time, binding OperationBinding, equal func(context.Context, []byte, []byte) (bool, error)) (*OperationResult, bool, error) {
@@ -64,6 +65,9 @@ func (s *reconciliationTestStore) ReconcileTrackedOperation(_ context.Context, l
 	if OperationMayRepeat(binding, assessment, clock()) && s.activityID != lease.ActivityID {
 		s.activityID, s.generation = lease.ActivityID, lease.Generation
 		s.started = true
+		if s.onRepeat != nil {
+			s.onRepeat()
+		}
 		return OperationReconciliation{Dispatch: true}, nil
 	}
 	s.activityID, s.generation = lease.ActivityID, lease.Generation
@@ -96,7 +100,7 @@ func TestUnknownMutationRepeatsOnlyWithCurrentExactGuarantee(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	dispatches := 0
@@ -156,7 +160,7 @@ func TestRepeatedDispatchFailureDoesNotLoopWithinAttempt(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	dispatches := 0
@@ -199,7 +203,7 @@ func TestAuthoritativeAbsenceRequiresQuiescence(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	dispatches := 0
@@ -227,7 +231,7 @@ func TestTrackedReadRepeatMustPreserveOriginalResult(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	req.Kind = "read"
@@ -264,7 +268,7 @@ func TestExpiredEvidenceCannotAuthorizeRepeat(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	dispatches := 0
@@ -287,13 +291,175 @@ func TestExpiredEvidenceCannotAuthorizeRepeat(t *testing.T) {
 	}
 }
 
+func TestRepeatEvidenceIsRecheckedAfterStoreClaim(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	req := reconciliationRequest()
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		if dispatches == 1 {
+			return OperationResult{}, errors.New("response lost")
+		}
+		return OperationResult{Codec: req.ResultCodec, Data: []byte("receipt")}, nil
+	}
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) {
+		t.Fatalf("first outcome was not unknown: %v", err)
+	}
+	lease.ActivityID, lease.Generation = "activity-2", 2
+	scope.lease = lease
+	evidence := reconciliationEvidence(OperationIdentity{ExecutionID: "execution", Key: "charge"}, now)
+	evidence.Outcome = OperationOutcomeUnknown
+	repeat := SafeRepeatGuarantee{
+		Identity: evidence.Identity, Provider: evidence.Provider, Scope: evidence.Scope, Reference: evidence.Reference,
+		InputFingerprint: evidence.InputFingerprint, Version: "idempotency-v1",
+		BehaviorVersion: "v1", ComparatorVersion: "bytes-v1",
+		ValidFrom: now.Add(-time.Second), ValidUntil: now.Add(2 * time.Minute), OverlapUntil: now.Add(time.Minute),
+	}
+	req.Reconcile = func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error) {
+		return OperationAssessment{Outcome: OperationOutcomeUnknown, Evidence: evidence, Repeat: &repeat}, nil
+	}
+	req.VerifyEvidence = func(context.Context, OperationBinding, OperationEvidence) error { return nil }
+	req.VerifySafeRepeat = func(context.Context, OperationBinding, OperationAssessment, time.Time) error { return nil }
+	store.onRepeat = func() { now = now.Add(time.Minute + time.Second) }
+
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) || dispatches != 1 {
+		t.Fatalf("repeat proceeded after evidence and guarantee expired during claim: dispatches=%d err=%v", dispatches, err)
+	}
+}
+
+func TestRepeatGuaranteeCoversTheWholeAttemptHorizon(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(90 * time.Second)}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	req := reconciliationRequest()
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		if dispatches == 1 {
+			return OperationResult{}, errors.New("response lost")
+		}
+		return OperationResult{Codec: req.ResultCodec, Data: []byte("receipt")}, nil
+	}
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) {
+		t.Fatalf("first outcome was not unknown: %v", err)
+	}
+	lease.ActivityID, lease.Generation = "activity-2", 2
+	scope.lease = lease
+	evidence := reconciliationEvidence(OperationIdentity{ExecutionID: "execution", Key: "charge"}, now)
+	evidence.Outcome = OperationOutcomeUnknown
+	repeat := SafeRepeatGuarantee{
+		Identity: evidence.Identity, Provider: evidence.Provider, Scope: evidence.Scope, Reference: evidence.Reference,
+		InputFingerprint: evidence.InputFingerprint, Version: "idempotency-v1",
+		BehaviorVersion: "v1", ComparatorVersion: "bytes-v1",
+		ValidFrom: now.Add(-time.Second), ValidUntil: now.Add(2 * time.Minute), OverlapUntil: now.Add(time.Minute),
+	}
+	req.Reconcile = func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error) {
+		return OperationAssessment{Outcome: OperationOutcomeUnknown, Evidence: evidence, Repeat: &repeat}, nil
+	}
+	req.VerifyEvidence = func(context.Context, OperationBinding, OperationEvidence) error { return nil }
+	req.VerifySafeRepeat = func(context.Context, OperationBinding, OperationAssessment, time.Time) error { return nil }
+
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) || dispatches != 1 {
+		t.Fatalf("short guarantee permitted a late overlapping call: dispatches=%d err=%v", dispatches, err)
+	}
+}
+
+func TestRepeatEvidenceIsVerifiedImmediatelyBeforeDispatch(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	req := reconciliationRequest()
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		if dispatches == 1 {
+			return OperationResult{}, errors.New("response lost")
+		}
+		return OperationResult{Codec: req.ResultCodec, Data: []byte("receipt")}, nil
+	}
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) {
+		t.Fatalf("first outcome was not unknown: %v", err)
+	}
+	lease.ActivityID, lease.Generation = "activity-2", 2
+	scope.lease = lease
+	evidence := reconciliationEvidence(OperationIdentity{ExecutionID: "execution", Key: "charge"}, now)
+	evidence.Outcome = OperationOutcomeUnknown
+	repeat := SafeRepeatGuarantee{
+		Identity: evidence.Identity, Provider: evidence.Provider, Scope: evidence.Scope, Reference: evidence.Reference,
+		InputFingerprint: evidence.InputFingerprint, Version: "idempotency-v1",
+		BehaviorVersion: "v1", ComparatorVersion: "bytes-v1",
+		ValidFrom: now.Add(-time.Second), ValidUntil: now.Add(2 * time.Minute), OverlapUntil: now.Add(time.Minute),
+	}
+	req.Reconcile = func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error) {
+		return OperationAssessment{Outcome: OperationOutcomeUnknown, Evidence: evidence, Repeat: &repeat}, nil
+	}
+	evidenceVerifications := 0
+	req.VerifyEvidence = func(context.Context, OperationBinding, OperationEvidence) error {
+		evidenceVerifications++
+		now = now.Add(10 * time.Second)
+		return nil
+	}
+	req.VerifySafeRepeat = func(_ context.Context, _ OperationBinding, _ OperationAssessment, verifiedAt time.Time) error {
+		if !verifiedAt.Equal(now) {
+			return errors.New("repeat check used a stale verification time")
+		}
+		return nil
+	}
+
+	result, err := TrackOperation(ctx, req, dispatch)
+	if err != nil || string(result.Data) != "receipt" || dispatches != 2 || evidenceVerifications != 2 {
+		t.Fatalf("repeat did not use freshly verified evidence: result=%+v dispatches=%d verifications=%d err=%v",
+			result, dispatches, evidenceVerifications, err)
+	}
+}
+
+func TestKnownSuccessWithUnavailableResultIsDurablySettled(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(time.Minute)}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	req := reconciliationRequest()
+	req.ValidateResult = func(context.Context, OperationResult) error { return errors.New("required receipt unavailable") }
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		return OperationResult{Codec: req.ResultCodec, Data: []byte("receipt")}, nil
+	}
+
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrCompatibility) {
+		t.Fatalf("unavailable required result was not rejected: %v", err)
+	}
+	if store.result == nil || !store.result.Unavailable || dispatches != 1 {
+		t.Fatalf("confirmed success was not durably marked result-unavailable: result=%+v dispatches=%d", store.result, dispatches)
+	}
+
+	lease.ActivityID, lease.Generation = "activity-2", 2
+	scope.lease = lease
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrCompatibility) || dispatches != 1 {
+		t.Fatalf("known success with unavailable result permitted a later dispatch: dispatches=%d err=%v", dispatches, err)
+	}
+}
+
 func TestTrackedUnknownOperationReconcilesConfirmedSuccess(t *testing.T) {
 	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 	store := &reconciliationTestStore{}
 	identity := OperationIdentity{ExecutionID: "execution", Key: "charge"}
 	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
-	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock, attemptDeadline: now.Add(30 * time.Second)}
 	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
 	req := reconciliationRequest()
 	dispatches := 0

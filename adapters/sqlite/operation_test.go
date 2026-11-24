@@ -200,8 +200,8 @@ func TestTrackedOperationReplaysWithinHook(t *testing.T) {
 		if _, err := transition.TrackOperation(ctx, missing, missingDispatch); !errors.Is(err, transition.ErrCompatibility) {
 			return errors.New("missing result was treated as success")
 		}
-		if _, err := transition.TrackOperation(ctx, missing, missingDispatch); !errors.Is(err, transition.ErrOperationUnresolved) || missingCalls != 1 {
-			return errors.New("missing result was redispatched")
+		if _, err := transition.TrackOperation(ctx, missing, missingDispatch); !errors.Is(err, transition.ErrCompatibility) || missingCalls != 1 {
+			return errors.New("known success with unavailable result was not settled")
 		}
 		writeFail := req
 		writeFail.Key = "write-fail"

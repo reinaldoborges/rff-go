@@ -14,6 +14,7 @@ type OperationReconciliationStore interface {
 	OperationStore
 	transition.OperationReconciliationStore
 	transition.OperationResolutionStore
+	transition.CheckedHookControlStore[string, string]
 }
 
 // RunOperationReconciliation exercises durable unknown resolution, operator
@@ -130,6 +131,10 @@ func RunOperationReconciliation(t *testing.T, newStore func(*testing.T) Operatio
 		inspection.History[len(inspection.History)-1].Principal != "operator-1" {
 		t.Fatalf("authorized resolution was not durably audited: %+v %v", inspection, err)
 	}
+	execution, err := store.ReadActiveExecution(ctx, "reconciliation")
+	if err != nil || execution.Status != transition.NeedsIntervention {
+		t.Fatalf("operator resolution resumed work without a separate retry: status=%s err=%v", execution.Status, err)
+	}
 	duplicate, err := resolver.Resolve(ctx, request)
 	if err != nil || len(duplicate.History) != len(inspection.History) || authorizationCalls != 2 {
 		t.Fatalf("identical resolution replay was not idempotent and reauthorized: %+v calls=%d err=%v", duplicate, authorizationCalls, err)
@@ -150,7 +155,7 @@ func RunOperationReconciliation(t *testing.T, newStore func(*testing.T) Operatio
 	if err := store.CompleteTrackedOperation(ctx, lease, clock, binding.Identity, *assessment.Result); !errors.Is(err, transition.ErrStaleActivityLease) {
 		t.Fatalf("operator resolution did not fence the stale hook report: %v", err)
 	}
-	execution, err := store.ReadActiveExecution(ctx, "reconciliation")
+	execution, err = store.ReadActiveExecution(ctx, "reconciliation")
 	if err != nil || execution.Status != transition.NeedsIntervention || providerCalls != 1 {
 		t.Fatalf("operator resolution resumed or redispatched work: status=%s calls=%d err=%v", execution.Status, providerCalls, err)
 	}
@@ -178,5 +183,113 @@ func RunOperationReconciliation(t *testing.T, newStore func(*testing.T) Operatio
 	}
 	if activityID == "" {
 		t.Fatal("hook activity identity was not retained")
+	}
+	RunOperationResolutionReplayAfterRetry(t, newStore)
+}
+
+func RunOperationResolutionReplayAfterRetry(
+	t *testing.T,
+	newStore func(*testing.T) OperationReconciliationStore,
+) {
+	t.Helper()
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	_, _, err := store.Accept(ctx, "entity", "resolution-replay", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "resolution-replay", Entity: "entity", Key: "resolution-replay",
+			Operation: transition.Initialize, Status: transition.Waiting, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "resolution-replay", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, lease, clock); err != nil {
+		t.Fatal(err)
+	}
+	binding := transition.OperationBinding{
+		Identity: transition.OperationIdentity{ExecutionID: "resolution-replay", Key: "charge"},
+		Kind:     "charge", BehaviorVersion: "v1", ComparatorVersion: "bytes-v1",
+		Input: []byte("amount=100"), ResultCodec: transition.CodecVersion{Name: "receipt", Version: "v1"},
+	}
+	equal := func(_ context.Context, a, b []byte) (bool, error) { return string(a) == string(b), nil }
+	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, binding, equal); err != nil || !started {
+		t.Fatalf("operation did not mark dispatch before provider work: started=%v err=%v", started, err)
+	}
+	if err := store.ReportHook(ctx, lease, transition.HookResult{
+		Failure: fsm.Failure{Code: "provider-response-lost"}, Disposition: fsm.DispositionIntervention,
+	}, clock); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterHookIntervention(ctx, fence, clock); err != nil {
+		t.Fatal(err)
+	}
+	evidence := transition.OperationEvidence{
+		Identity: binding.Identity, Outcome: transition.OperationOutcomeSucceeded,
+		Provider: "payment-sandbox", Scope: "merchant-7", Reference: "lookup-replay",
+		InputFingerprint: "input-fingerprint-v1", Version: "lookup-v1", Provenance: "authoritative-query",
+		BehaviorVersion: binding.BehaviorVersion, ComparatorVersion: binding.ComparatorVersion,
+		ObservedAt: now, ValidUntil: now.Add(time.Minute),
+	}
+	assessment := transition.OperationAssessment{
+		Outcome: transition.OperationOutcomeSucceeded, Evidence: evidence,
+		Result: &transition.OperationResult{Codec: binding.ResultCodec, Data: []byte("receipt-replay")},
+	}
+	authorizationCalls := 0
+	resolver, err := transition.NewAuthorizedOperationResolver(store, func(context.Context, transition.OperationResolutionRequest) (transition.OperationResolutionAuthorization, error) {
+		authorizationCalls++
+		return transition.OperationResolutionAuthorization{Principal: "operator-1", Reason: "verified provider receipt"}, nil
+	}, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := transition.OperationResolutionRequest{
+		ID: "resolution-replay-1", Identity: binding.Identity, Assessment: assessment,
+		VerifyEvidence: func(context.Context, transition.OperationBinding, transition.OperationEvidence) error { return nil },
+		ValidateResult: func(context.Context, transition.OperationBinding, transition.OperationResult) error { return nil },
+	}
+	initial, err := resolver.Resolve(ctx, request)
+	if err != nil || initial.Result == nil {
+		t.Fatalf("initial resolution failed: inspection=%+v err=%v", initial, err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := store.ApplyCheckedHookControl(ctx, fence, clock, transition.HookControl{
+		ID: "retry-after-resolution", Action: transition.RetryIntervention,
+	}, func(transition.Execution[string, string], transition.HookCall) error { return nil }); err != nil {
+		t.Fatalf("separate retry did not leave intervention: %v", err)
+	}
+	execution, err := store.ReadActiveExecution(ctx, "resolution-replay")
+	if err != nil || execution.Status != transition.Waiting {
+		t.Fatalf("separate retry did not leave intervention: status=%s err=%v", execution.Status, err)
+	}
+	controlCount := len(execution.Controls)
+	replayRequest := request
+	replayRequest.VerifyEvidence = nil
+	replayRequest.ValidateResult = nil
+	replayed, err := resolver.Resolve(ctx, replayRequest)
+	if err != nil || len(replayed.History) != len(initial.History) || authorizationCalls != 2 {
+		t.Fatalf("expired resolution replay after retry was not authorized and idempotent: %+v calls=%d err=%v", replayed, authorizationCalls, err)
+	}
+	execution, err = store.ReadActiveExecution(ctx, "resolution-replay")
+	if err != nil || execution.Status != transition.Waiting || len(execution.Controls) != controlCount {
+		t.Fatalf("resolution replay created a control cycle: status=%s controls=%d err=%v", execution.Status, len(execution.Controls), err)
+	}
+	changed := replayRequest
+	changed.Assessment.Result = &transition.OperationResult{Codec: binding.ResultCodec, Data: []byte("different-receipt")}
+	if _, err := resolver.Resolve(ctx, changed); !errors.Is(err, transition.ErrConflict) {
+		t.Fatalf("changed resolution replay did not conflict after retry: %v", err)
 	}
 }

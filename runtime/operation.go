@@ -66,10 +66,13 @@ type OperationRequest struct {
 
 // OperationResult is the safe result retained for replay. Typed success has
 // non-nil Data, including for an empty encoding. NoResult is explicit and has
-// nil Data. A nonempty safe FailureCode represents a definitive failure; raw
-// errors must not be put in this field. Unknown outcomes are returned as errors.
+// nil Data. The runtime sets Unavailable when confirmed success lacks a valid
+// required result; that outcome is settled and cannot be redispatched. A
+// nonempty safe FailureCode represents a definitive failure; raw errors must
+// not be put in this field.
 type OperationResult struct {
 	NoResult    bool
+	Unavailable bool
 	Codec       CodecVersion
 	Data        []byte
 	FailureCode string
@@ -120,12 +123,16 @@ func (b *OperationBinding) UnmarshalJSON(data []byte) error {
 
 type operationResultWire struct {
 	NoResult                      bool
+	Unavailable                   bool
 	CodecName, CodecVersion, Data []byte
 	FailureCode                   []byte
 }
 
 func (r OperationResult) MarshalJSON() ([]byte, error) {
-	return json.Marshal(operationResultWire{NoResult: r.NoResult, CodecName: []byte(r.Codec.Name), CodecVersion: []byte(r.Codec.Version), Data: r.Data, FailureCode: []byte(r.FailureCode)})
+	return json.Marshal(operationResultWire{
+		NoResult: r.NoResult, Unavailable: r.Unavailable,
+		CodecName: []byte(r.Codec.Name), CodecVersion: []byte(r.Codec.Version), Data: r.Data, FailureCode: []byte(r.FailureCode),
+	})
 }
 
 func (r *OperationResult) UnmarshalJSON(data []byte) error {
@@ -133,7 +140,10 @@ func (r *OperationResult) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
-	*r = OperationResult{NoResult: wire.NoResult, Codec: CodecVersion{Name: string(wire.CodecName), Version: string(wire.CodecVersion)}, Data: wire.Data, FailureCode: string(wire.FailureCode)}
+	*r = OperationResult{
+		NoResult: wire.NoResult, Unavailable: wire.Unavailable,
+		Codec: CodecVersion{Name: string(wire.CodecName), Version: string(wire.CodecVersion)}, Data: wire.Data, FailureCode: string(wire.FailureCode),
+	}
 	return nil
 }
 
@@ -141,6 +151,9 @@ func (r *OperationResult) UnmarshalJSON(data []byte) error {
 func ValidOperationResult(result OperationResult, codec CodecVersion) bool {
 	if result.Codec != codec {
 		return false
+	}
+	if result.Unavailable {
+		return !result.NoResult && result.Data == nil && result.FailureCode == ""
 	}
 	if result.FailureCode != "" {
 		return !result.NoResult && result.Data == nil
@@ -153,7 +166,8 @@ func ValidOperationResult(result OperationResult, codec CodecVersion) bool {
 
 func sameOperationResult(a, b *OperationResult) bool {
 	return a != nil && b != nil && a.Codec == b.Codec && a.NoResult == b.NoResult &&
-		a.FailureCode == b.FailureCode && (a.Data == nil) == (b.Data == nil) && slices.Equal(a.Data, b.Data)
+		a.Unavailable == b.Unavailable && a.FailureCode == b.FailureCode &&
+		(a.Data == nil) == (b.Data == nil) && slices.Equal(a.Data, b.Data)
 }
 
 // OperationStore persists starts and outcomes under the current hook fence.
@@ -196,7 +210,9 @@ type OperationEvidence struct {
 }
 
 // SafeRepeatGuarantee records the provider's idempotency window for this exact
-// operation, including the horizon during which old and repeated calls may act.
+// operation, including the overlap horizon for old and repeated dispatches.
+// The guarantee must cover the remaining hook attempt so late calls cannot
+// outlive the provider's idempotency window.
 type SafeRepeatGuarantee struct {
 	Identity          OperationIdentity
 	Provider          string
@@ -263,11 +279,12 @@ type OperationReconciliationStore interface {
 }
 
 type operationScope struct {
-	ctx   context.Context
-	store OperationStore
-	lease HookLease
-	clock func() time.Time
-	kind  HookKind
+	ctx             context.Context
+	store           OperationStore
+	lease           HookLease
+	clock           func() time.Time
+	attemptDeadline time.Time
+	kind            HookKind
 }
 
 func (s *operationScope) track(ctx context.Context, req OperationRequest, dispatch func(context.Context, OperationIdentity) (OperationResult, error)) (OperationResult, error) {
@@ -320,15 +337,18 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 	if !started && result != nil && result.FailureCode != "" && req.Reconcile != nil {
 		return s.reconcile(ctx, req, binding, dispatch)
 	}
+	if !started && result != nil && result.Unavailable {
+		return OperationResult{}, fmt.Errorf("%w: confirmed operation result is unavailable", ErrCompatibility)
+	}
 	if started {
 		if s.ctx.Err() != nil || ctx.Err() != nil {
 			return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
 		}
 		resultValue, dispatchErr := dispatch(ctx, binding.Identity)
-		if s.ctx.Err() != nil || ctx.Err() != nil {
-			return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
-		}
 		if dispatchErr != nil {
+			if s.ctx.Err() != nil || ctx.Err() != nil {
+				return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
+			}
 			if req.ClassifyDispatch != nil {
 				assessment, classifyErr := req.ClassifyDispatch(ctx, binding.Identity, dispatchErr)
 				if classifyErr == nil {
@@ -340,6 +360,9 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 		result = &resultValue
 	}
 	if result == nil || !ValidOperationResult(*result, req.ResultCodec) {
+		if started {
+			return OperationResult{}, s.recordUnavailableSuccess(ctx, binding)
+		}
 		return OperationResult{}, ErrCompatibility
 	}
 	if s.ctx.Err() != nil || ctx.Err() != nil {
@@ -361,10 +384,10 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 		toValidate := *result
 		toValidate.Data = slices.Clone(result.Data)
 		if err := req.ValidateResult(ctx, toValidate); err != nil {
+			if started {
+				return OperationResult{}, s.recordUnavailableSuccess(ctx, binding)
+			}
 			if s.ctx.Err() != nil || ctx.Err() != nil {
-				if started {
-					return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
-				}
 				return OperationResult{}, ErrStaleActivityLease
 			}
 			return OperationResult{}, fmt.Errorf("%w: operation result is unavailable", ErrCompatibility)
@@ -394,11 +417,24 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 	if s.ctx.Err() != nil || ctx.Err() != nil {
 		return OperationResult{}, ErrStaleActivityLease
 	}
+	if result.Unavailable {
+		return OperationResult{}, fmt.Errorf("%w: confirmed operation result is unavailable", ErrCompatibility)
+	}
 	result.Data = slices.Clone(result.Data)
 	if result.FailureCode != "" {
 		return *result, ErrOperationFailed
 	}
 	return *result, nil
+}
+
+func (s *operationScope) recordUnavailableSuccess(ctx context.Context, binding OperationBinding) error {
+	result := OperationResult{Codec: binding.ResultCodec, Unavailable: true}
+	if err := s.store.CompleteTrackedOperation(
+		context.WithoutCancel(ctx), s.lease, s.clock, binding.Identity, result,
+	); err != nil {
+		return errors.Join(ErrOperationUnresolved, err)
+	}
+	return fmt.Errorf("%w: confirmed operation result is unavailable", ErrCompatibility)
 }
 
 func (s *operationScope) reconcile(
@@ -454,10 +490,18 @@ func (s *operationScope) applyAssessmentWithDispatch(
 	if err := req.VerifyEvidence(ctx, binding, assessment.Evidence); err != nil {
 		return OperationResult{}, fmt.Errorf("%w: operation evidence is unverifiable", ErrCompatibility)
 	}
+	now = s.clock()
+	if !validOperationAssessment(binding, assessment, now) {
+		return OperationResult{}, ErrOperationUnresolved
+	}
 	if assessment.Repeat != nil {
 		if req.VerifySafeRepeat == nil ||
 			!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) ||
 			req.VerifySafeRepeat(ctx, binding, assessment, now) != nil {
+			return OperationResult{}, ErrOperationUnresolved
+		}
+		now = s.clock()
+		if !repeatCoversAttempt(binding, assessment, now, s.attemptDeadline) {
 			return OperationResult{}, ErrOperationUnresolved
 		}
 	}
@@ -473,11 +517,36 @@ func (s *operationScope) applyAssessmentWithDispatch(
 		if !allowDispatch {
 			return OperationResult{}, ErrOperationUnresolved
 		}
-		result, dispatchErr := dispatch(ctx, binding.Identity)
+		now = s.clock()
+		if !validOperationAssessment(binding, assessment, now) {
+			return OperationResult{}, ErrOperationUnresolved
+		}
+		if err := req.VerifyEvidence(ctx, binding, assessment.Evidence); err != nil {
+			return OperationResult{}, ErrOperationUnresolved
+		}
+		now = s.clock()
+		if !validOperationAssessment(binding, assessment, now) {
+			return OperationResult{}, ErrOperationUnresolved
+		}
+		if assessment.Repeat != nil {
+			if req.VerifySafeRepeat == nil ||
+				!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) ||
+				req.VerifySafeRepeat(ctx, binding, assessment, now) != nil {
+				return OperationResult{}, ErrOperationUnresolved
+			}
+			now = s.clock()
+			if !repeatCoversAttempt(binding, assessment, now, s.attemptDeadline) {
+				return OperationResult{}, ErrOperationUnresolved
+			}
+		}
 		if s.ctx.Err() != nil || ctx.Err() != nil {
 			return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
 		}
+		result, dispatchErr := dispatch(ctx, binding.Identity)
 		if dispatchErr != nil {
+			if s.ctx.Err() != nil || ctx.Err() != nil {
+				return OperationResult{}, errors.Join(ErrOperationUnresolved, ErrStaleActivityLease)
+			}
 			if req.ClassifyDispatch != nil {
 				nextAssessment, classifyErr := req.ClassifyDispatch(ctx, binding.Identity, dispatchErr)
 				if classifyErr == nil {
@@ -487,13 +556,13 @@ func (s *operationScope) applyAssessmentWithDispatch(
 			return OperationResult{}, ErrOperationUnresolved
 		}
 		if !ValidOperationResult(result, req.ResultCodec) {
-			return OperationResult{}, ErrCompatibility
+			return OperationResult{}, s.recordUnavailableSuccess(ctx, binding)
 		}
 		if result.FailureCode == "" {
 			validated := result
 			validated.Data = slices.Clone(result.Data)
 			if err := req.ValidateResult(ctx, validated); err != nil {
-				return OperationResult{}, fmt.Errorf("%w: operation result is unavailable", ErrCompatibility)
+				return OperationResult{}, s.recordUnavailableSuccess(ctx, binding)
 			}
 		}
 		if err := s.store.CompleteTrackedOperation(ctx, s.lease, s.clock, binding.Identity, result); err != nil {
@@ -543,10 +612,10 @@ func validOperationAssessment(binding OperationBinding, assessment OperationAsse
 	switch assessment.Outcome {
 	case OperationOutcomeSucceeded:
 		return assessment.Repeat == nil && assessment.Result != nil && ValidOperationResult(*assessment.Result, binding.ResultCodec) &&
-			assessment.Result.FailureCode == ""
+			!assessment.Result.Unavailable && assessment.Result.FailureCode == ""
 	case OperationOutcomeFailed:
 		return assessment.Result != nil && ValidOperationResult(*assessment.Result, binding.ResultCodec) &&
-			assessment.Result.FailureCode != ""
+			!assessment.Result.Unavailable && assessment.Result.FailureCode != ""
 	case OperationOutcomeAbsent, OperationOutcomeUnknown:
 		return assessment.Result == nil
 	default:
@@ -582,6 +651,16 @@ func validSafeRepeat(binding OperationBinding, evidence OperationEvidence, repea
 		!repeat.ValidUntil.IsZero() && !repeat.OverlapUntil.IsZero() &&
 		!now.Before(repeat.ValidFrom) && now.Before(repeat.ValidUntil) &&
 		!now.After(repeat.OverlapUntil) && !repeat.ValidUntil.Before(repeat.OverlapUntil)
+}
+
+func repeatCoversAttempt(binding OperationBinding, assessment OperationAssessment, now, attemptDeadline time.Time) bool {
+	if assessment.Repeat == nil || attemptDeadline.IsZero() || !attemptDeadline.After(now) ||
+		!validOperationAssessment(binding, assessment, now) ||
+		!validSafeRepeat(binding, assessment.Evidence, *assessment.Repeat, now) {
+		return false
+	}
+	repeat := assessment.Repeat
+	return !repeat.ValidUntil.Before(attemptDeadline) && !repeat.OverlapUntil.Before(attemptDeadline)
 }
 
 type operationTracker interface {

@@ -28,9 +28,11 @@ type OperationResolutionAuthorization struct {
 	Reason    string
 }
 
-// OperationResolutionStore records a fenced, audited operator decision.
+// OperationResolutionStore replays and records fenced, audited operator
+// decisions after the host has authorized this request.
 type OperationResolutionStore interface {
 	OperationInspector
+	ReplayOperationResolution(context.Context, OperationIdentity, string, string, string, OperationAssessment) (OperationInspection, bool, error)
 	RecordOperationResolution(context.Context, OperationIdentity, string, string, string, OperationAssessment, func() time.Time) (OperationInspection, error)
 }
 
@@ -57,13 +59,31 @@ func NewAuthorizedOperationResolver(
 // Resolve validates the safe evidence and result, authorizes this request, then
 // records it idempotently without dispatching or resuming transition work.
 func (r *AuthorizedOperationResolver) Resolve(ctx context.Context, request OperationResolutionRequest) (OperationInspection, error) {
-	if request.ID == "" || request.Identity.ExecutionID == "" || request.Identity.Key == "" ||
-		request.VerifyEvidence == nil || request.Assessment.Repeat != nil {
+	if request.ID == "" || request.Identity.ExecutionID == "" || request.Identity.Key == "" {
 		return OperationInspection{}, ErrInvalidRequest
+	}
+	authorization, err := r.authorize(ctx, request)
+	if err != nil {
+		return OperationInspection{}, errors.Join(ErrOperationResolutionDenied, err)
+	}
+	if authorization.Principal == "" || authorization.Reason == "" {
+		return OperationInspection{}, ErrOperationResolutionDenied
 	}
 	inspection, err := r.store.InspectTrackedOperation(ctx, request.Identity)
 	if err != nil {
 		return OperationInspection{}, err
+	}
+	replayed, found, err := r.store.ReplayOperationResolution(
+		ctx, request.Identity, request.ID, authorization.Principal, authorization.Reason, request.Assessment,
+	)
+	if err != nil {
+		return OperationInspection{}, err
+	}
+	if found {
+		return replayed, nil
+	}
+	if request.VerifyEvidence == nil || request.Assessment.Repeat != nil {
+		return OperationInspection{}, ErrInvalidRequest
 	}
 	now := r.clock()
 	if !OperationAssessmentValid(inspection.Binding, request.Assessment, now) {
@@ -86,13 +106,6 @@ func (r *AuthorizedOperationResolver) Resolve(ctx context.Context, request Opera
 		return OperationInspection{}, ErrOperationUnresolved
 	default:
 		return OperationInspection{}, ErrInvalidRequest
-	}
-	authorization, err := r.authorize(ctx, request)
-	if err != nil {
-		return OperationInspection{}, errors.Join(ErrOperationResolutionDenied, err)
-	}
-	if authorization.Principal == "" || authorization.Reason == "" {
-		return OperationInspection{}, ErrOperationResolutionDenied
 	}
 	return r.store.RecordOperationResolution(
 		ctx, request.Identity, request.ID, authorization.Principal, authorization.Reason, request.Assessment, r.clock,

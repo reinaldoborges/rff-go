@@ -654,6 +654,13 @@ func RunDriveQueuedDeadline(t *testing.T, store DriveStore) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	progress, err := store.ReadContinuation(ctx, marker.ExecutionID)
+	if err != nil || progress.CycleStarted != now || !progress.Deadline.Equal(now.Add(marker.Policy.OverallTimeout)) {
+		t.Fatalf("origin release did not start the queued cycle: progress=%+v err=%v", progress, err)
+	}
+	if ready, err := store.ContinuationReady(ctx, marker.ExecutionID); err != nil || !ready {
+		t.Fatalf("released origin must be observable before queueing: ready=%v err=%v", ready, err)
+	}
 	now = now.Add(10 * time.Second)
 	lease, err := store.AcquireContinuation(ctx, marker, "worker", clock, time.Minute)
 	if err != nil {
