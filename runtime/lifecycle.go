@@ -68,10 +68,11 @@ type lifecyclePath struct {
 // Lifecycle runs a single local transition coordinator and bounded hook workers.
 // The host must ensure only one logical lifecycle coordinates a store.
 type Lifecycle[EntityID comparable, StateID comparable, Event, Input any] struct {
-	worker   *HookWorker[EntityID, StateID, Event, Input]
-	interval time.Duration
-	classify func(error) PathErrorClass
-	errors   chan struct{}
+	worker     *HookWorker[EntityID, StateID, Event, Input]
+	commitHost CommitHost[EntityID, StateID]
+	interval   time.Duration
+	classify   func(error) PathErrorClass
+	errors     chan struct{}
 
 	mu       sync.Mutex
 	started  bool
@@ -103,7 +104,7 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		return nil, err
 	}
 	l := &Lifecycle[EntityID, StateID, Event, Input]{
-		worker: worker, interval: config.PollInterval,
+		worker: worker, commitHost: host, interval: config.PollInterval,
 		classify: config.ClassifyError, errors: make(chan struct{}, 1),
 	}
 	add := func(name string, worker bool, step func(context.Context, func()) error) {
@@ -352,7 +353,9 @@ func classifyPathError(err error, host func(error) PathErrorClass) PathErrorClas
 	}
 	if errors.Is(err, ErrLeaseHeld) || errors.Is(err, ErrStaleLease) ||
 		errors.Is(err, ErrStaleActivityLease) || errors.Is(err, ErrActivityLeaseHeld) ||
-		errors.Is(err, ErrExecutionNotActive) || errors.Is(err, ErrTransitionDeadline) {
+		errors.Is(err, ErrExecutionNotActive) || errors.Is(err, ErrTransitionDeadline) ||
+		errors.Is(err, ErrContinuationOriginMissing) || errors.Is(err, ErrContinuationIntervention) ||
+		errors.Is(err, ErrSuccessorDenied) {
 		return PathErrorRecoverable
 	}
 	if errors.Is(err, ErrInvalidHook) || errors.Is(err, ErrInvalidLease) ||

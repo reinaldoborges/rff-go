@@ -202,9 +202,10 @@ existing policy and fences; external effects remain at-least-once.
 
 The host remains responsible for authorization, its durable domain commit,
 timing appropriate to its workload, and ensuring one logical lifecycle owns
-the store. This lifecycle does not run Continuation, notification, or
-other optional paths, and does not provide global capacity or multi-node
-coordination. Existing lower-level APIs remain available.
+the store. Continuation, typed input, and timer delivery are optional and
+explicitly enabled as described below; notification and other optional paths
+are not enabled by this lifecycle. It does not provide global capacity or
+multi-node coordination. Existing lower-level APIs remain available.
 
 Timer delivery can be explicitly enabled before `Start` with
 `Lifecycle.EnableTimerDelivery(store, resolver, handler, TimerLifecycleConfig)`.
@@ -315,16 +316,27 @@ outbox handoff. Unknown handoff outcomes are retried; definitive failures requir
 an authorized retry or waiver. The host must schedule this scan and provide the
 outbox. Use the same coordinator owner for all scans.
 `ContinuationDiscovery` and the adapters' durable marker stores retain
-Continuation intents for a host-scheduled `ContinuationDriver`.
+Continuation intents for a `ContinuationDriver`. To have the embedded
+lifecycle schedule these, call `EnableContinuation` before `Start` with the
+durable continuation store, pinned machine registry, complete driver
+configuration (including acceptor, authorized fenced delivery host, origin
+revision lookup, codecs, clock and lease duration), and a nonempty owner. The
+commit host must attest to durable Continuation commits, and the lease duration
+must exceed the lifecycle polling interval. Pass a replayable
+marker source for separate stores, or nil only when commits atomically persist
+intents in the runtime store. The independent `continuation` path scans at
+startup and polls thereafter; evaluation and delivery run asynchronously after
+the initial inventory. Its errors and interventions are supervised like other
+paths. It is not enabled merely because the store supports Continuation.
 Acceptance pins an opted-in target's policy; the shared-store commit writes a
 marker atomically. Separate-store hosts must attest to atomically retaining a
-replayable marker before commit, and schedule discovery. Receipt reconciliation
+replayable marker before commit, and enable or schedule discovery. Receipt reconciliation
 waits for the matching runtime marker. Listing a marker does not establish that
 its origin is ready for evaluation; `ContinuationReady` checks the successful
 receipt and original reservation release. Missing origins return
 `ErrContinuationOriginMissing`; discovery leaves those host markers
 unacknowledged for retry, and readiness diagnoses previously stored orphans.
-The host must keep polling durable markers. The driver evaluates only the
+Without lifecycle supervision the host must keep polling durable markers. The driver evaluates only the
 pinned machine version, persists its first decision, and uses the pinned
 attempt, deadline, and retry policy. Reservation waits pause an already
 started attempt. Exhaustion and definitive denial require an authorized retry;
