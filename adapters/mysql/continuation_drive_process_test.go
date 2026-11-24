@@ -93,6 +93,33 @@ func TestContinuationDriveStartedProcessRestart(t *testing.T) {
 	continuationcontract.CheckDriveStartedRestart(t, store)
 }
 
+func TestContinuationQueuedReadinessProcessRestart(t *testing.T) {
+	dsn := os.Getenv("RFF_MYSQL_QUEUE_READY_RESTART")
+	if dsn != "" {
+		store, err := mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		continuationcontract.PrepareDriveQueuedDeadlineRestart(t, store)
+		os.Exit(87)
+	}
+	_, config := newMySQLDatabase(t)
+	dsn = config.FormatDSN()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestContinuationQueuedReadinessProcessRestart$")
+	cmd.Env = append(os.Environ(), "RFF_MYSQL_QUEUE_READY_RESTART="+dsn)
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatal("expected process loss")
+	} else if exit := new(exec.ExitError); !errors.As(err, &exit) || exit.ExitCode() != 87 {
+		t.Fatalf("unexpected child failure: %v: %s", err, output)
+	}
+	store, err := mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	continuationcontract.CheckDriveQueuedDeadlineRestart(t, store)
+}
+
 func TestContinuationDriverAcceptanceProcessRestart(t *testing.T) {
 	dsn, hostPath := os.Getenv("RFF_DRIVER_MYSQL"), os.Getenv("RFF_DRIVER_HOST")
 	if dsn != "" {

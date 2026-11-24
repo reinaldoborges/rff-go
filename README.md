@@ -178,10 +178,19 @@ results fail explicitly. A dispatch error is unknown unless the host's
 `ClassifyDispatch` callback supplies verifiable provider evidence. The
 `Reconcile` callback may establish success, a definitive failure, or
 authoritative absence. Absence permits redispatch only when evidence also
-proves every earlier call is quiescent. Unknown mutations require a
-`SafeRepeatGuarantee` bound to the exact identity, provider scope, a
-host-verified non-secret input fingerprint, and the overlap horizon; evidence
-and guarantees are revalidated at use.
+proves every earlier call is quiescent. A confirmed success whose required
+result cannot be retained is durably marked unavailable and blocks redispatch,
+dependent compensation, and work completion. Reconciliation or an authorized
+resolution may supply a verified result; a resolution still requires a
+separate authorized retry before work resumes.
+Unknown mutations require a `SafeRepeatGuarantee` bound to the exact identity,
+provider scope, host-verified non-secret input fingerprint, and overlap
+horizon; evidence and guarantees are revalidated immediately before dispatch,
+and a required host verifier must prove that the guarantee's `OverlapUntil`
+covers the latest possible effect of both old and repeated calls. This provider
+effect horizon is independent of the hook deadline; the guarantee must remain
+valid through `OverlapUntil`, and repeats fail closed when that horizon cannot
+be established.
 Hosts must also reject repeats of reads when a new response could change the
 original result. Evidence records should contain only safe provenance and
 validity bounds, never credentials, secrets or raw errors.
@@ -190,12 +199,14 @@ An irreconcilable operation remains unresolved and blocks work success and
 final abort, including after process restart. `AuthorizedOperationResolver`
 provides an authorization, audit and idempotency boundary for evidence-backed
 operator resolutions during intervention. Resolution fences stale reports but
-does not schedule or resume work; a separately authorized retry or abort must
-pass the existing transition phase gates. `OperationInspector` exposes
-retained safe data; the host must authorize access. Compensation-prerequisite
-enforcement remains separate and is not provided here. Fencing cannot stop an
-external call already in flight, and the runtime makes no exactly-once effect
-guarantee.
+does not schedule or resume work. An authorized identical resolution replay
+returns its prior result even after evidence expires or a separate retry leaves
+intervention; changed semantics conflict. A separately authorized retry or
+abort must pass the existing transition phase gates. `OperationInspector`
+exposes retained safe data; the host must authorize access.
+Compensation-prerequisite enforcement remains separate and is not provided
+here. Fencing cannot stop an external call already in flight, and the runtime
+makes no exactly-once effect guarantee.
 
 An execution migration with tracked operations requires the optional operation
 compatibility verifier passed to `NewExecutionMigrator`. It receives the

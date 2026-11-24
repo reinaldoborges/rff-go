@@ -79,6 +79,20 @@ func RunOperation(t *testing.T, newStore func(*testing.T) OperationStore) {
 	if err := store.CompleteTrackedOperation(ctx, lease, clock, binding.Identity, transition.OperationResult{Codec: codec, Data: []byte("receipt")}); err != nil {
 		t.Fatal(err)
 	}
+	unavailable := binding
+	unavailable.Identity.Key = "known-success-unavailable"
+	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, unavailable, equal); err != nil || !started {
+		t.Fatalf("known-success case did not start: started=%v err=%v", started, err)
+	}
+	unavailableResult := transition.OperationResult{Codec: codec, Unavailable: true}
+	if err := store.CompleteTrackedOperation(ctx, lease, clock, unavailable.Identity, unavailableResult); err != nil {
+		t.Fatalf("known success with unavailable result was not retained: %v", err)
+	}
+	replayedUnavailable, started, err := store.BeginTrackedOperation(ctx, lease, clock, unavailable, equal)
+	if err != nil || started || replayedUnavailable == nil || !replayedUnavailable.Unavailable {
+		t.Fatalf("known success with unavailable result permitted another dispatch: result=%+v started=%v err=%v",
+			replayedUnavailable, started, err)
+	}
 	binaryKey := binding
 	binaryKey.Identity.Key = string([]byte{'k', 0xff})
 	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, binaryKey, equal); err != nil || !started {
