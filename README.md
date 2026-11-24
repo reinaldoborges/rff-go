@@ -185,9 +185,22 @@ existing policy and fences; external effects remain at-least-once.
 
 The host remains responsible for authorization, its durable domain commit,
 timing appropriate to its workload, and ensuring one logical lifecycle owns
-the store. This lifecycle does not run Continuation, notification, timer, or
+the store. This lifecycle does not run Continuation, notification, or
 other optional paths, and does not provide global capacity or multi-node
 coordination. Existing lower-level APIs remain available.
+
+Timer delivery can be explicitly enabled before `Start` with
+`Lifecycle.EnableTimerDelivery(store, resolver, handler, TimerLifecycleConfig)`.
+Provide positive capacity, a worker ID, clock and valid lease and renewal
+intervals; the lifecycle poll interval must be shorter than the timer lease.
+Each timer worker is an independently supervised path named `timer-worker-N`.
+It checks immediately and polls thereafter, including after missed wakeups.
+The host handler authorizes any resulting domain request and durably
+deduplicates effects by timer ID. A failed delivery retains its fenced claim
+until expiry; classify recoverable host errors to retry, or explicitly restart
+a stopped path after correcting the cause. Shutdown stops new claims and
+renews active deliveries while draining; deadline expiry cancels unfinished
+deliveries, which can be recovered after their leases expire.
 
 Hooks may explicitly call `runtime.TrackOperation` with the hook's context.
 The worker supplies the capability only when its store implements
@@ -351,8 +364,9 @@ or state value cannot be decoded.
 summaries, including compatibility diagnostics and hook attempt history. The
 host must authorize access and protect application-provided failure details.
 `TimerScheduler` persists typed timer events with stable IDs and original
-deadlines. The host schedules `TimerWorker.RunOne` calls and supplies a durable
-handler that deduplicates by timer ID. Delivery is at least once, and errors
+deadlines. The host can schedule `TimerWorker.RunOne` calls or enable lifecycle
+timer delivery, and supplies a durable handler that deduplicates by timer ID.
+Delivery is at least once, and errors
 leave claims to expire for recovery. Timer scheduling is not atomic with
 application state: hosts must reconcile missing timers from durable workflow
 state after a crash. Unavailable timer event codecs block only the affected

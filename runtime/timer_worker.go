@@ -48,8 +48,8 @@ type TimerWorkerConfig struct {
 }
 
 // TimerWorker submits due typed events to an application-owned durable ingress.
-// The host schedules RunOne. Delivery is at least once: the handler must
-// durably deduplicate by timer ID before returning success.
+// The host schedules RunOne or enables lifecycle delivery. Delivery is at
+// least once: the handler must durably deduplicate by timer ID before success.
 type TimerWorker[Event any] struct {
 	store   TimerDeliveryStore
 	resolve CodecResolver[Event]
@@ -71,6 +71,10 @@ func NewTimerWorker[Event any](
 // RunOne revalidates blocked codecs and processes one due timer. Handler errors
 // leave the claim for expiry and retry; codec failures persist a fenced block.
 func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
+	return w.runOne(ctx, nil, nil)
+}
+
+func (w *TimerWorker[Event]) runOne(ctx context.Context, checked func(), start func() (context.Context, context.CancelFunc, bool)) error {
 	unavailable, err := w.revalidateCompatibility(ctx)
 	if err != nil {
 		return err
@@ -88,6 +92,17 @@ func (w *TimerWorker[Event]) RunOne(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if checked != nil {
+		checked()
+	}
+	if start != nil {
+		work, cancel, ok := start()
+		if !ok {
+			return context.Canceled
+		}
+		defer cancel()
+		ctx = work
 	}
 	workCtx, cancelWork := context.WithCancel(ctx)
 	defer cancelWork()

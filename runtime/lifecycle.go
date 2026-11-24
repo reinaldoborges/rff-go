@@ -50,13 +50,17 @@ type LifecycleStatus struct {
 }
 
 type lifecyclePath struct {
-	name   string
-	wake   chan struct{}
-	done   chan struct{}
-	status PathStatus
-	step   func(context.Context, func()) error
-	worker bool
-	err    error
+	name       string
+	wake       chan struct{}
+	done       chan struct{}
+	status     PathStatus
+	step       func(context.Context, func()) error
+	worker     bool
+	hook       bool
+	empty      error
+	stop       func()
+	cancelWork func()
+	err        error
 }
 
 // Lifecycle runs a single local transition coordinator and bounded hook workers.
@@ -114,6 +118,8 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		add(fmt.Sprintf("hook-worker-%d", i), true, func(_ context.Context, checked func()) error {
 			return worker.runOne(context.Background(), checked)
 		})
+		l.paths[len(l.paths)-1].hook = true
+		l.paths[len(l.paths)-1].empty = ErrNoHookActivity
 	}
 	return l, nil
 }
@@ -221,7 +227,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) runPath(ctx context.Context
 		if ctx.Err() != nil {
 			return
 		}
-		if path.worker && onlyPathSignal(err, ErrNoHookActivity) {
+		if path.worker && path.empty != nil && onlyPathSignal(err, path.empty) {
 			l.recordSuccess(path)
 			wait = true
 			continue
@@ -353,7 +359,7 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Status() LifecycleStatus {
 		if !path.status.Running || !path.status.Checked || path.status.Classification != "" {
 			status.Ready = false
 		}
-		if path.worker && path.status.Running && path.status.Checked && path.status.Classification == "" {
+		if path.hook && path.status.Running && path.status.Checked && path.status.Classification == "" {
 			runningWorkers++
 		}
 	}
@@ -440,8 +446,22 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Shutdown(ctx context.Contex
 	}
 	l.stopping = true
 	l.cancel()
+	for _, path := range l.paths {
+		if path.stop != nil {
+			path.stop()
+		}
+	}
 	startup := l.startup
 	l.mu.Unlock()
+	defer func() {
+		if ctx.Err() != nil {
+			for _, path := range l.paths {
+				if path.cancelWork != nil {
+					path.cancelWork()
+				}
+			}
+		}
+	}()
 	err := l.worker.Shutdown(ctx)
 	select {
 	case <-startup:
