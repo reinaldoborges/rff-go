@@ -472,7 +472,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Wakeup() {
 // Errors signals that Err has changed. Signals may be coalesced.
 func (l *Lifecycle[EntityID, StateID, Event, Input]) Errors() <-chan struct{} { return l.errors }
 
-// Err returns the latest error per path for the host; it may contain sensitive data.
+// Err returns the latest observed error per path, including errors from paths
+// that have since recovered. It may contain sensitive data; use Status for
+// current path health.
 func (l *Lifecycle[EntityID, StateID, Event, Input]) Err() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()

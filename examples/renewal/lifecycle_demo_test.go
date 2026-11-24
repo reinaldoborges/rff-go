@@ -43,8 +43,6 @@ func runLifecycleDemoProcess(t *testing.T, backend []string) {
 		return string(output)
 	}
 	command("enqueue-start-notify")
-	command("enqueue-input")
-	command("enqueue-timer")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	var server *exec.Cmd
@@ -85,7 +83,12 @@ func runLifecycleDemoProcess(t *testing.T, backend []string) {
 		}
 	}
 	stop()
+	if status := command("inspect-lifecycle"); !strings.Contains(status, "input=0") || !strings.Contains(status, "timer=0") {
+		t.Fatalf("input and timer must remain pending until restart: %s", status)
+	}
 	command("approve") // Accepted while no lifecycle is running and without a wakeup.
+	command("enqueue-input")
+	command("enqueue-timer")
 	start()
 	for {
 		if strings.Contains(command("inspect"), "state=Renewed") {

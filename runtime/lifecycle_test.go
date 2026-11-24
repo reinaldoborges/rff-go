@@ -131,6 +131,9 @@ func TestLifecycleRetriesRecoverableInitialScans(t *testing.T) {
 	if !l.Status().Ready {
 		t.Fatalf("recovered scans never became ready: %+v", l.Status())
 	}
+	if !errors.Is(l.Err(), errLifecycleScan) {
+		t.Fatalf("last observed error lost after recovery: %v", l.Err())
+	}
 }
 
 func (s *lifecycleTestStore) ClaimHook(context.Context, string, func() time.Time, time.Duration) (transition.HookLease, error) {

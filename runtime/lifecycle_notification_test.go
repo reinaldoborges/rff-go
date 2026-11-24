@@ -155,6 +155,65 @@ func (*blockingNotificationStore) RetryNotificationDelivery(context.Context, tra
 	return nil
 }
 
+type failedNotificationReportStore struct{ blockingNotificationStore }
+
+func (*failedNotificationReportStore) RetryNotificationDelivery(context.Context, transition.NotificationLease, func() time.Time, time.Time) error {
+	return errors.New("report failed")
+}
+
+func TestLifecycleRestartAtCapacityDoesNotInventSuccessfulCheck(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	store := &failedNotificationReportStore{}
+	l, err := transition.NewLifecycle[string, string, string, int](&lifecycleTestStore{}, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+		Coordinator:  transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+		Worker:       transition.WorkerConfig{ID: "hook", Capacity: 1, LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+		PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	defer close(release)
+	if err := l.EnableNotifications(store, lifecycleNotificationHandoff{}, store, func(context.Context, transition.NotificationDelivery[string, string]) error {
+		<-release
+		return nil
+	}, transition.LifecycleNotificationConfig{Capacity: 1, Worker: transition.NotificationWorkerConfig{
+		ID: "notification", LeaseTTL: time.Second, RenewalInterval: 500 * time.Millisecond,
+		AttemptTimeout: 30 * time.Millisecond, RetryDelay: time.Millisecond, Clock: transition.SystemWorkerClock{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_ = l.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status := l.Status()
+		path := status.Paths[len(status.Paths)-1]
+		if !path.Running && path.Classification == transition.PathErrorUnclassified {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("report failure did not stop path: %+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := l.RestartPath("notification-worker-0"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	status := l.Status()
+	path := status.Paths[len(status.Paths)-1]
+	if status.Ready || !path.Running || path.Checked || store.claims.Load() != 1 {
+		t.Fatalf("capacity was mistaken for a successful restart check: %+v", status)
+	}
+}
+
 func TestLifecycleReportsTimedOutDeliveryWithoutExceedingCapacity(t *testing.T) {
 	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
 	store := &blockingNotificationStore{}

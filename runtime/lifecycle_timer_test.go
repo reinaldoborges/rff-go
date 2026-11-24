@@ -97,6 +97,44 @@ func (lifecycleTimerCodec) Equal(_ context.Context, data []byte, value string) (
 	return string(data) == value, nil
 }
 
+func TestLifecycleConcurrentTimerRegistrationAndShutdown(t *testing.T) {
+	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "registration.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	for i := 0; i < 20; i++ {
+		l, err := transition.NewLifecycle[string, string, string, int](&lifecycleTestStore{}, runner, runner, lifecycleTestHost{}, transition.LifecycleConfig{
+			Coordinator:  transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+			Worker:       transition.WorkerConfig{ID: "hook", Capacity: 1, LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+			PollInterval: 10 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		registered := make(chan error, 1)
+		go func() {
+			registered <- l.EnableTimerDelivery(store,
+				func(transition.CodecVersion) (transition.Codec[string], error) { return lifecycleTimerCodec{}, nil },
+				func(context.Context, transition.TimerDelivery[string]) error { return nil },
+				transition.TimerLifecycleConfig{Capacity: 1, Worker: transition.TimerWorkerConfig{
+					ID: "timer", LeaseTTL: time.Second, RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{},
+				}})
+		}()
+		if err := l.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_ = l.Shutdown(ctx)
+		<-registered // Registration may win or lose the race with Start.
+		if err := l.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestLifecycleTimerConfigurationIsExplicitAndValidated(t *testing.T) {
 	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
 	timerStore, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "config.db"), sqlite.StringCodec{}, sqlite.StringCodec{})

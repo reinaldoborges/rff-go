@@ -203,6 +203,8 @@ poll interval, even if wakeups arrive. These retries do not renew durable
 attempt budgets or deadlines. Correct a stopped path and call `RestartPath`
 with its name from `Status()`; a new lifecycle can also be started after
 shutdown. Monitor `Errors()` and inspect `Err()` for the latest error per path.
+`Err()` retains the last observed error even after recovery; use the current
+`Status()` classification and readiness to determine whether a path is healthy.
 Unlike `Status`, `Err` and `Start` errors may contain sensitive host or store
 details; do not persist or expose them without sanitizing.
 Call `Shutdown(ctx)` to stop scans and claims and drain hooks and deliveries
