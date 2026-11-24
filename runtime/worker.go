@@ -150,14 +150,26 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 	slot := &workerSlot{claimCancel: claimCancel}
 	w.slots[slot] = struct{}{}
 	w.mu.Unlock()
+	var hookExited <-chan struct{}
 	defer func() {
 		claimCancel()
-		w.mu.Lock()
-		delete(w.slots, slot)
-		if w.draining && len(w.slots) == 0 {
-			close(w.drained)
+		release := func() {
+			w.mu.Lock()
+			delete(w.slots, slot)
+			if w.draining && len(w.slots) == 0 {
+				close(w.drained)
+			}
+			w.mu.Unlock()
 		}
-		w.mu.Unlock()
+		if hookExited != nil {
+			select {
+			case <-hookExited:
+			default:
+				go func() { <-hookExited; release() }()
+				return
+			}
+		}
+		release()
 	}()
 
 	lease, err := w.store.ClaimHook(claimCtx, w.config.ID, w.config.Clock.Now, w.config.LeaseTTL)
@@ -284,8 +296,11 @@ func (w *HookWorker[EntityID, StateID, Event, Input]) RunOne(ctx context.Context
 		err     error
 	}
 	hookDone := make(chan hookOutcome, 1)
+	exited := make(chan struct{})
+	hookExited = exited
 	go func() {
 		hookErr, err := prepared.invoke(operationCtx, attempt)
+		close(exited)
 		hookDone <- hookOutcome{hookErr: hookErr, err: err}
 	}()
 	var result HookResult

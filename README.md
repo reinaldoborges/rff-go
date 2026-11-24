@@ -146,7 +146,33 @@ persist hook outcomes.
 renews their leases while working and reporting, and supports draining.
 An attempt timeout is reported without waiting for a hook that ignores context
 cancellation; such a hook may continue external side effects, which the host
-must make idempotent.
+must make idempotent. It retains its local worker slot until it actually exits.
+
+### Embedded transition lifecycle
+
+`runtime.NewLifecycle` optionally runs the existing transition and commit
+coordinators and a bounded pool of hook workers. Supply the durable store,
+versioned hook runner and classifier, fenced host commit, coordinator and
+worker lease settings, capacity, clocks, and a positive polling interval
+shorter than the coordinator lease. Call `Start(ctx)` to synchronously check
+durable work and report startup errors. Thereafter the lifecycle polls without
+further requests; `Wakeup()` is only a hint and may be dropped.
+
+Monitor `Errors()` and inspect `Err()`: a background error is retained and
+stops the affected coordinator or worker loop. Correct the cause and create a
+new lifecycle; automatic supervision and readiness are not provided here.
+Call `Shutdown(ctx)` to stop scans and claims and drain hooks while renewing
+activity leases. If the context expires, unfinished hooks are cancelled and
+renewal stops; the error means external work may still be running. Do not
+close its dependencies until the host has accounted for any work that ignores
+cancellation. Restart reconciliation handles expired attempts under their
+existing policy and fences; external effects remain at-least-once.
+
+The host remains responsible for authorization, its durable domain commit,
+timing appropriate to its workload, and ensuring one logical lifecycle owns
+the store. This lifecycle does not run Continuation, notification, timer, or
+other optional paths, and does not provide global capacity or multi-node
+coordination. Existing lower-level APIs remain available.
 
 Hooks may explicitly call `runtime.TrackOperation` with the hook's context.
 The worker supplies the capability only when its store implements
@@ -221,8 +247,9 @@ coordinator must acquire a fresh transition lease before resuming.
 The shared migration and process-restart contracts run against both adapters
 with a disposable MySQL DSN:
 `go test ./adapters/sqlite ./adapters/mysql -run '^(TestRuntimeMigrationContract|TestRuntimeOperationMigration|TestRuntimeMigrationWithoutProvider|TestContinuationMigrationContract|TestMigrationOperationProcessRestart|TestMigrationWriteProcessCrash)$' -count=1`.
-`Coordinator.Reconcile` scans persisted active executions; the host must call it
-regularly, including without wakeups, and often enough to renew its leases.
+When using the lower-level API, `Coordinator.Reconcile` scans persisted active
+executions; the host must call it regularly, including without wakeups, and
+often enough to renew its leases.
 `RunReconciliation` can schedule these scans using a bounded `WakeupQueue` and
 a polling ticker. Notify the queue after durable work changes; notifications
 are coalesced hints and can be lost. The loop performs an initial scan, owns
