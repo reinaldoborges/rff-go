@@ -69,8 +69,9 @@ type InputStore interface {
 // deduplicate by input ID and atomically record its outcome with domain effects,
 // returning that original outcome on repeat. Handler errors mean unknown or
 // transient outcomes; definitive rejection belongs in InputOutcome.Failure.
-// The host schedules Reconcile and ensures channel names map to the same codecs
-// and handler after restart. Concurrent calls may invoke the handler more than once.
+// The host schedules Reconcile or enables it in a Lifecycle, and ensures channel
+// names map to the same codecs and handler after restart. Concurrent calls may
+// invoke the handler more than once.
 type InputIngress[Value any] struct {
 	store   InputStore
 	channel string
@@ -142,6 +143,9 @@ func (i *InputIngress[Value]) Reconcile(ctx context.Context) error {
 	}
 	var result error
 	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(result, err)
+		}
 		record, err := i.store.ReadInput(ctx, id)
 		if err == nil {
 			_, err = i.process(ctx, record)
@@ -173,6 +177,9 @@ func (i *InputIngress[Value]) process(ctx context.Context, record InputRecord) (
 			return InputOutcome{}, ctx.Err()
 		}
 		return InputOutcome{}, compatibilityError(CompatibilityInputCodec, record.Value.Codec.Name, record.Value.Codec.Version, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return InputOutcome{}, err
 	}
 	outcome, err := i.handle(ctx, InputDelivery[Value]{
 		ID: record.ID, WorkflowID: record.WorkflowID, Kind: record.Kind, Value: value,
