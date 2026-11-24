@@ -29,10 +29,14 @@ var ErrClassifierUnavailable = errors.New("failure classifier is unavailable")
 // ErrInvalidClassification indicates a classifier returned an unsupported disposition.
 var ErrInvalidClassification = errors.New("invalid failure classification")
 
-// Policy is the application-selected policy for one transition execution.
-// MaxAttempts includes the first attempt. OverallTimeout is measured from
-// acceptance; the runtime must persist its resulting absolute deadline.
-// Applications supply all policy values; the package provides no defaults.
+var ErrContinuationBehaviorUnavailable = errors.New("continuation behavior is unavailable")
+var ErrContinuationNotEnabled = errors.New("continuation is not enabled for state")
+
+// Policy is an application-selected execution or Continuation policy.
+// MaxAttempts includes the first attempt. For transition executions,
+// OverallTimeout is measured from acceptance; Continuations instead use active
+// time beginning at readiness. Applications supply all values; there are no
+// defaults.
 type Policy struct {
 	MaxAttempts    uint
 	AttemptTimeout time.Duration
@@ -45,6 +49,14 @@ type Selection[StateID comparable] struct {
 	Target StateID
 	Policy Policy
 	Notify bool
+}
+
+// ContinuationDecision either selects the next event and input or stops the
+// automatic chain. Evaluation may be repeated until the decision is persisted.
+type ContinuationDecision[Event, Input any] struct {
+	Continue bool
+	Event    Event
+	Input    Input
 }
 
 // Failure is application-classified data safe to persist and pass to hooks.
@@ -93,11 +105,14 @@ func (NoopHandler[EntityID, StateID, Event, Input]) Recover(context.Context, Exe
 // return only failure data safe to persist. An absent classifier is reported
 // when classification is requested.
 type Config[EntityID comparable, StateID comparable, Event, Input any] struct {
-	ID               string
-	Version          string
-	InitialStates    []StateID
-	TerminalStates   []StateID
-	Handlers         map[StateID]Handler[EntityID, StateID, Event, Input]
+	ID                   string
+	Version              string
+	InitialStates        []StateID
+	TerminalStates       []StateID
+	Handlers             map[StateID]Handler[EntityID, StateID, Event, Input]
+	ContinuationPolicies map[StateID]Policy
+	// Continue is side-effect-free and may read current durable host data.
+	Continue         func(context.Context, EntityID, StateID) (ContinuationDecision[Event, Input], error)
 	SelectInitial    func(Input) (Selection[StateID], error)
 	SelectTransition func(StateID, Event, Input) (Selection[StateID], error)
 	// Reopens explicitly identifies allowed transitions from terminal states.
@@ -136,10 +151,49 @@ func NewMachine[EntityID comparable, StateID comparable, Event, Input any](confi
 			return nil, fmt.Errorf("%w: terminal state is not registered", ErrInvalidMachine)
 		}
 	}
+	config.ContinuationPolicies = maps.Clone(config.ContinuationPolicies)
+	for state, policy := range config.ContinuationPolicies {
+		if _, ok := config.Handlers[state]; !ok || policy.MaxAttempts == 0 || policy.AttemptTimeout <= 0 || policy.OverallTimeout <= 0 {
+			return nil, fmt.Errorf("%w: invalid continuation state or policy", ErrInvalidMachine)
+		}
+		for _, delay := range policy.RetryDelays {
+			if delay < 0 {
+				return nil, fmt.Errorf("%w: invalid continuation retry delay", ErrInvalidMachine)
+			}
+		}
+		policy.RetryDelays = slices.Clone(policy.RetryDelays)
+		config.ContinuationPolicies[state] = policy
+	}
 	config.InitialStates = slices.Clone(config.InitialStates)
 	config.TerminalStates = slices.Clone(config.TerminalStates)
 	config.Handlers = maps.Clone(config.Handlers)
 	return &Machine[EntityID, StateID, Event, Input]{config: config}, nil
+}
+
+// ContinuationPolicy returns the explicit target-state policy, when enabled.
+func (m *Machine[EntityID, StateID, Event, Input]) ContinuationPolicy(target StateID) (Policy, bool) {
+	policy, enabled := m.config.ContinuationPolicies[target]
+	policy.RetryDelays = slices.Clone(policy.RetryDelays)
+	return policy, enabled
+}
+
+// HasContinuationBehavior reports whether this exact version can evaluate a
+// Continuation decision.
+func (m *Machine[EntityID, StateID, Event, Input]) HasContinuationBehavior() bool {
+	return m.config.Continue != nil
+}
+
+// EvaluateContinuation invokes only this machine version's behavior. It does
+// not enforce readiness, claim fencing, budgets, or decision persistence;
+// callers coordinating durable Continuations must provide those guarantees.
+func (m *Machine[EntityID, StateID, Event, Input]) EvaluateContinuation(ctx context.Context, entity EntityID, state StateID) (ContinuationDecision[Event, Input], error) {
+	if _, enabled := m.config.ContinuationPolicies[state]; !enabled {
+		return ContinuationDecision[Event, Input]{}, ErrContinuationNotEnabled
+	}
+	if m.config.Continue == nil {
+		return ContinuationDecision[Event, Input]{}, ErrContinuationBehaviorUnavailable
+	}
+	return m.config.Continue(ctx, entity, state)
 }
 
 // ID returns the stable application-owned machine identifier.

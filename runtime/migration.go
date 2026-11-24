@@ -52,6 +52,8 @@ type MigrationSource[EntityID comparable] struct {
 	Event          EncodedValue
 	Input          EncodedValue
 	Policy         fsm.Policy
+	Continuation   *ContinuationSnapshot
+	Operations     []OperationInspection
 }
 
 // MigrationSnapshot is the executable behavior after conversion.
@@ -78,23 +80,34 @@ type MigrationStore[EntityID comparable, StateID comparable] interface {
 
 // ExecutionMigrator coordinates authorized conversion and destination validation.
 // The host authorizes and audits requests, coordinates domain changes, and
-// verifies the converted source against authoritative state.
+// verifies the converted source against authoritative state and proves the
+// destination can honor any pinned Continuation behavior and policy.
+// The optional operation verifier is mandatory when any tracked operation
+// exists; it must prove the destination can honor every original binding,
+// provider, result, immutable reference, prerequisite and evidence record.
+// Operations lacking a pinned provider cannot be migrated.
 type ExecutionMigrator[EntityID comparable, StateID comparable, Event, Input any] struct {
-	store   MigrationStore[EntityID, StateID]
-	runner  *HookRunner[EntityID, StateID, Event, Input]
-	convert func(context.Context, MigrationSource[EntityID], MigrationRequest) (MigrationSnapshot[StateID], error)
-	verify  func(context.Context, MigrationSource[EntityID], MigrationSnapshot[StateID]) error
+	store            MigrationStore[EntityID, StateID]
+	runner           *HookRunner[EntityID, StateID, Event, Input]
+	convert          func(context.Context, MigrationSource[EntityID], MigrationRequest) (MigrationSnapshot[StateID], error)
+	verify           func(context.Context, MigrationSource[EntityID], MigrationSnapshot[StateID]) error
+	verifyOperations func(context.Context, MigrationSource[EntityID], MigrationSnapshot[StateID]) error
 }
 
 func NewExecutionMigrator[EntityID comparable, StateID comparable, Event, Input any](
 	store MigrationStore[EntityID, StateID], runner *HookRunner[EntityID, StateID, Event, Input],
 	convert func(context.Context, MigrationSource[EntityID], MigrationRequest) (MigrationSnapshot[StateID], error),
 	verify func(context.Context, MigrationSource[EntityID], MigrationSnapshot[StateID]) error,
+	verifyOperations ...func(context.Context, MigrationSource[EntityID], MigrationSnapshot[StateID]) error,
 ) (*ExecutionMigrator[EntityID, StateID, Event, Input], error) {
-	if nilcheck.IsNil(store) || runner == nil || convert == nil || verify == nil {
+	if nilcheck.IsNil(store) || runner == nil || convert == nil || verify == nil || len(verifyOperations) > 1 || (len(verifyOperations) == 1 && verifyOperations[0] == nil) {
 		return nil, errors.New("migration store, runner, converter, and domain verifier are required")
 	}
-	return &ExecutionMigrator[EntityID, StateID, Event, Input]{store: store, runner: runner, convert: convert, verify: verify}, nil
+	migrator := &ExecutionMigrator[EntityID, StateID, Event, Input]{store: store, runner: runner, convert: convert, verify: verify}
+	if len(verifyOperations) == 1 {
+		migrator.verifyOperations = verifyOperations[0]
+	}
+	return migrator, nil
 }
 
 func cloneMigrationSource[EntityID comparable](source MigrationSource[EntityID]) MigrationSource[EntityID] {
@@ -103,6 +116,35 @@ func cloneMigrationSource[EntityID comparable](source MigrationSource[EntityID])
 	source.Input.Data = slices.Clone(source.Input.Data)
 	source.Event.Data = slices.Clone(source.Event.Data)
 	source.Policy.RetryDelays = slices.Clone(source.Policy.RetryDelays)
+	if source.Continuation != nil {
+		pinned := *source.Continuation
+		pinned.Policy.RetryDelays = slices.Clone(pinned.Policy.RetryDelays)
+		source.Continuation = &pinned
+	}
+	source.Operations = slices.Clone(source.Operations)
+	for i := range source.Operations {
+		operation := &source.Operations[i]
+		operation.Binding.Input = slices.Clone(operation.Binding.Input)
+		operation.Binding.Prerequisites = slices.Clone(operation.Binding.Prerequisites)
+		if operation.Result != nil {
+			result := *operation.Result
+			result.Data = slices.Clone(result.Data)
+			operation.Result = &result
+		}
+		operation.History = slices.Clone(operation.History)
+		for j := range operation.History {
+			assessment := &operation.History[j].Assessment
+			if assessment.Result != nil {
+				result := *assessment.Result
+				result.Data = slices.Clone(result.Data)
+				assessment.Result = &result
+			}
+			if assessment.Repeat != nil {
+				repeat := *assessment.Repeat
+				assessment.Repeat = &repeat
+			}
+		}
+	}
 	return source
 }
 
@@ -137,7 +179,21 @@ func (m *ExecutionMigrator[EntityID, StateID, Event, Input]) Migrate(
 			if _, err := m.runner.prepare(ctx, execution, call); err != nil {
 				return err
 			}
-			return m.verify(ctx, cloneMigrationSource(source), cloneMigrationSnapshot(snapshot))
+			if err := m.verify(ctx, cloneMigrationSource(source), cloneMigrationSnapshot(snapshot)); err != nil {
+				return err
+			}
+			if len(source.Operations) != 0 {
+				for _, operation := range source.Operations {
+					if operation.Binding.Provider == "" {
+						return fmt.Errorf("%w: operation provider identity is unavailable", ErrCompatibility)
+					}
+				}
+				if m.verifyOperations == nil {
+					return fmt.Errorf("%w: operation migration verifier is unavailable", ErrCompatibility)
+				}
+				return m.verifyOperations(ctx, cloneMigrationSource(source), cloneMigrationSnapshot(snapshot))
+			}
+			return nil
 		},
 	)
 }

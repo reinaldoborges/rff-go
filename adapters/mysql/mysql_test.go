@@ -25,6 +25,73 @@ func TestOpenRequiresDSNDatabaseAndCodecs(t *testing.T) {
 	}
 }
 
+type failedOperationResultStore struct {
+	*mysql.Store[string, string]
+}
+
+func (s failedOperationResultStore) CompleteTrackedOperation(context.Context, transition.HookLease, func() time.Time, transition.OperationIdentity, transition.OperationResult) error {
+	return errors.New("injected result persistence failure")
+}
+
+func TestOperationResultPersistenceFailureStaysUnknown(t *testing.T) {
+	store := openMySQL(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	_, _, err := store.Accept(ctx, "entity", "operation-result-failure", func(transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
+		return &transition.Execution[string, string]{
+			SchemaVersion: transition.CurrentSchemaVersion, ID: "result-failure", Entity: "entity", Key: "operation-result-failure",
+			Operation: transition.Initialize, Status: transition.Waiting, Deadline: now.Add(time.Hour),
+			Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Minute, OverallTimeout: time.Hour},
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := store.AcquireTransitionLease(ctx, "entity", "result-failure", "coordinator", clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DispatchHook(ctx, fence, clock, transition.HookDispatch{Kind: transition.HookEnter, DueAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimHook(ctx, "worker", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartHook(ctx, lease, clock); err != nil {
+		t.Fatal(err)
+	}
+	binding := transition.OperationBinding{
+		Identity: transition.OperationIdentity{ExecutionID: "result-failure", Key: "charge"},
+		Kind:     "charge", BehaviorVersion: "1", ComparatorVersion: "bytes-v1",
+		Input: []byte("amount=100"), ResultCodec: transition.CodecVersion{Name: "receipt", Version: "1"},
+	}
+	equal := func(_ context.Context, left, right []byte) (bool, error) { return string(left) == string(right), nil }
+	if _, started, err := store.BeginTrackedOperation(ctx, lease, clock, binding, equal); err != nil || !started {
+		t.Fatalf("operation dispatch marker: started=%v err=%v", started, err)
+	}
+	wrapped := failedOperationResultStore{Store: store}
+	if err := wrapped.CompleteTrackedOperation(ctx, lease, clock, binding.Identity, transition.OperationResult{
+		Codec: binding.ResultCodec, Data: []byte("receipt"),
+	}); err == nil {
+		t.Fatal("injected result persistence failure was ignored")
+	}
+	if result, started, err := store.BeginTrackedOperation(ctx, lease, clock, binding, equal); !errors.Is(err, transition.ErrOperationUnresolved) || started || result != nil {
+		t.Fatalf("failed persistence was treated as safe to repeat: result=%+v started=%v err=%v", result, started, err)
+	}
+	inspection, err := store.InspectTrackedOperation(ctx, binding.Identity)
+	if err != nil || inspection.Result != nil || !inspection.MayHaveDispatched {
+		t.Fatalf("uncertain operation state was not preserved: %+v %v", inspection, err)
+	}
+	if err := store.ReportHook(ctx, lease, transition.HookResult{Success: true}, clock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkWorkSuccess(ctx, fence, clock); !errors.Is(err, transition.ErrOperationUnresolved) {
+		t.Fatalf("uncertain result persistence allowed work success: %v", err)
+	}
+}
+
 func TestOpenRejectsPartialSchemaWithoutCreatingTables(t *testing.T) {
 	adminDB, config := newMySQLDatabase(t)
 	if _, err := adminDB.ExecContext(t.Context(), `CREATE TABLE rff_executions (id INT NOT NULL) ENGINE=MyISAM`); err != nil {
@@ -89,6 +156,36 @@ func TestOpenRejectsMissingVersionedTableWithoutRecreatingIt(t *testing.T) {
 	}
 	if exists != 0 {
 		t.Fatal("Open recreated a missing versioned table")
+	}
+}
+
+func TestOpenRejectsPreOperationSchemaWithoutWriting(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `DROP TABLE rff_operations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE rff_schema_version SET version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{}); !errors.Is(err, mysql.ErrUnsupportedSchema) {
+		t.Fatalf("pre-operation schema was not rejected: %v", err)
+	}
+	var version, count int
+	if err := db.QueryRowContext(t.Context(), `SELECT version FROM rff_schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'rff_operations'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 || count != 0 {
+		t.Fatalf("unsupported store was rewritten: version=%d operation tables=%d", version, count)
 	}
 }
 

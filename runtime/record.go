@@ -9,7 +9,12 @@ import (
 )
 
 // CurrentSchemaVersion is the version of newly accepted execution records.
-const CurrentSchemaVersion uint = 1
+const CurrentSchemaVersion uint = 2
+
+// SupportedExecutionSchema preserves readability of pre-Continuation records.
+func SupportedExecutionSchema(version uint) bool {
+	return version == 1 || version == CurrentSchemaVersion
+}
 
 // Operation distinguishes initialization from an ordinary transition.
 type Operation string
@@ -53,6 +58,24 @@ type CodecVersion struct {
 type EncodedValue struct {
 	Codec CodecVersion
 	Data  []byte
+}
+
+// ContinuationSnapshot pins the originating behavior and target-state policy.
+type ContinuationSnapshot struct {
+	MachineID      string
+	MachineVersion string
+	Policy         fsm.Policy
+}
+
+// ValidateContinuationSnapshot validates the pinned policy and behavior.
+func ValidateContinuationSnapshot(snapshot *ContinuationSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	if snapshot.MachineID == "" || snapshot.MachineVersion == "" {
+		return ErrInvalidRequest
+	}
+	return validatePolicy(snapshot.Policy)
 }
 
 // Codec persists values or durable immutable references and compares semantics.
@@ -101,6 +124,7 @@ type Execution[EntityID comparable, StateID comparable] struct {
 	NotificationOverride      NotificationOverride
 	Notify                    bool
 	Policy                    fsm.Policy
+	Continuation              *ContinuationSnapshot
 	AcceptedAt                time.Time
 	Deadline                  time.Time
 	CycleDeadline             time.Time

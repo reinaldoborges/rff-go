@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"time"
 
+	"github.com/reinaldoborges/rff-go/internal/continuationrecord"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -46,6 +47,21 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 		if execution.Status != transition.Running || execution.RecoveryStarted {
 			return transition.ErrInvalidHook
 		}
+		if receipt.Outcome == transition.CommitSucceeded && execution.Continuation != nil {
+			if err := s.requireContinuationMarker(ctx, tx, execution); err != nil {
+				return err
+			}
+		}
+		if receipt.Outcome == transition.CommitDenied && execution.Continuation != nil {
+			digest := continuationrecord.Digest(execution.ID)
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_continuations WHERE digest = ?)`, digest[:]).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return transition.ErrConflict
+			}
+		}
 		execution.CommitReceipt = &receipt
 		switch receipt.Outcome {
 		case transition.CommitDenied:
@@ -63,7 +79,7 @@ func (s *Store[EntityID, StateID]) RecordCommitReceipt(
 			return err
 		}
 		if execution.Status == transition.Complete {
-			return releaseReservation(ctx, tx, lease.ExecutionID)
+			return releaseReservation(ctx, tx, lease.ExecutionID, clock())
 		}
 		return nil
 	})

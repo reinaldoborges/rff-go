@@ -155,7 +155,7 @@ func applyNotificationControl(
 		return err
 	}
 	if execution.Status == transition.Complete {
-		return releaseReservation(ctx, tx, executionID)
+		return releaseReservation(ctx, tx, executionID, acceptedAt)
 	}
 	return nil
 }

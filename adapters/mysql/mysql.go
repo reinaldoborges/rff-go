@@ -209,7 +209,7 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		}
 	}
 	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_active WHERE entity = ?)`, encodedEntity).Scan(&active); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_active WHERE entity = ? UNION ALL SELECT 1 FROM rff_successors WHERE entity = ? AND phase IN ('prepared', 'denied'))`, encodedEntity, encodedEntity).Scan(&active); err != nil {
 		return result, false, fmt.Errorf("read reservation: %w", err)
 	}
 	var viewExisting *transition.Execution[EntityID, StateID]
@@ -272,8 +272,12 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		!next.CycleDeadline.IsZero() || !next.RejectionRecoveryDeadline.IsZero() || len(next.Controls) != 0 {
 		return result, false, transition.ErrInvalidDecision
 	}
+	if err := transition.ValidateContinuationSnapshot(next.Continuation); err != nil ||
+		next.Continuation != nil && (next.Continuation.MachineID != next.MachineID || next.Continuation.MachineVersion != next.MachineVersion) {
+		return result, false, transition.ErrInvalidDecision
+	}
 	var idExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_executions WHERE id = ?)`, next.ID).Scan(&idExists); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_executions WHERE id = ? UNION ALL SELECT 1 FROM rff_successors WHERE execution_id = ?)`, next.ID, []byte(next.ID)).Scan(&idExists); err != nil {
 		return result, false, fmt.Errorf("check execution ID: %w", err)
 	}
 	if idExists {

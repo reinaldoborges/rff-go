@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/reinaldoborges/rff-go/internal/continuationrecord"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -76,14 +77,34 @@ func (s *Store[EntityID, StateID]) CommitAtomic(
 				return fmt.Errorf("rollback rejected domain commit: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `RELEASE rff_domain_commit`); err != nil {
+		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT rff_domain_commit`); err != nil {
 			return fmt.Errorf("release domain commit savepoint: %w", err)
 		}
 		stored.CommitReceipt = &receipt
 		if receipt.Outcome == transition.CommitDenied {
+			if stored.Continuation != nil {
+				digest := continuationrecord.Digest(stored.ID)
+				var exists bool
+				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_continuations WHERE digest = ?)`, digest[:]).Scan(&exists); err != nil {
+					return err
+				}
+				if exists {
+					return transition.ErrConflict
+				}
+			}
 			stored.Status = transition.CommitRejected
 		} else {
 			stored.Status = transition.Complete
+			if stored.Continuation != nil {
+				marker := transition.ContinuationMarker[EntityID, StateID]{
+					SchemaVersion: 1, ExecutionID: stored.ID, OperationID: stored.CommitOperationID,
+					Entity: execution.Entity, Target: execution.Target, MachineID: stored.Continuation.MachineID,
+					MachineVersion: stored.Continuation.MachineVersion, Policy: stored.Continuation.Policy,
+				}
+				if err := s.recordContinuationMarker(ctx, tx, marker); err != nil {
+					return err
+				}
+			}
 			if stored.Notify {
 				stored.NotificationIntentID = notificationID(stored.ID)
 				work := notificationWork{Version: 1, IntentID: stored.NotificationIntentID, DueAt: decisionTime.UTC()}
@@ -100,7 +121,7 @@ func (s *Store[EntityID, StateID]) CommitAtomic(
 			return err
 		}
 		if stored.Status == transition.Complete {
-			return releaseReservation(ctx, tx, stored.ID)
+			return releaseReservation(ctx, tx, stored.ID, decisionTime)
 		}
 		return nil
 	})

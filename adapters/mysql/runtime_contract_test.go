@@ -16,6 +16,110 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+func TestRuntimeOperationContract(t *testing.T) {
+	runtimecontract.RunOperation(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationReconciliationContract(t *testing.T) {
+	runtimecontract.RunOperationReconciliation(t, func(t *testing.T) runtimecontract.OperationReconciliationStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationDispatchClassificationContract(t *testing.T) {
+	runtimecontract.RunOperationDispatchClassification(t, func(t *testing.T) runtimecontract.OperationStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationPrerequisitesContract(t *testing.T) {
+	runtimecontract.RunOperationPrerequisites(t, func(t *testing.T) runtimecontract.OperationPrerequisiteStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationSafeRepeatContract(t *testing.T) {
+	runtimecontract.RunOperationSafeRepeat(t, func(t *testing.T) runtimecontract.OperationRepeatStore {
+		return openMySQL(t)
+	})
+}
+
+func TestRuntimeOperationSuccessRace(t *testing.T) {
+	runtimecontract.RunOperationSuccessRace(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationAbort(t *testing.T) {
+	runtimecontract.RunOperationAbort(t, func(t *testing.T) runtimecontract.OperationControlStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationAbortRace(t *testing.T) {
+	runtimecontract.RunOperationAbortRace(t, func(t *testing.T) runtimecontract.OperationControlStore { return openMySQL(t) })
+}
+
+func TestRuntimeConcurrentOperations(t *testing.T) {
+	runtimecontract.RunConcurrentOperations(t, func(t *testing.T) runtimecontract.OperationStore { return openMySQL(t) })
+}
+
+func TestRuntimeOperationMigration(t *testing.T) {
+	runtimecontract.RunOperationMigration(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
+}
+
+func TestRuntimeMigrationWithoutProvider(t *testing.T) {
+	runtimecontract.RunMigrationWithoutProvider(t, func(t *testing.T) runtimecontract.OperationMigrationStore { return openMySQL(t) })
+}
+
+func TestOperationProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.OperationRestartPhase) != "" {
+		runtimecontract.OperationRestartChild(t, open)
+		return
+	}
+	for _, phase := range []string{"intent", "dispatch", "result"} {
+		t.Run(phase, func(t *testing.T) {
+			_, config := newMySQLDatabase(t)
+			runtimecontract.RunOperationRestart(t, config.FormatDSN(), phase, open)
+		})
+	}
+	t.Run("late-provider-call", func(t *testing.T) {
+		_, config := newMySQLDatabase(t)
+		runtimecontract.RunOperationLateCallRestart(t, config.FormatDSN(), open)
+	})
+}
+
+func TestMigrationOperationProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.MigrationRestartStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.MigrationRestartAddress) != "" {
+		runtimecontract.MigrationRestartChild(t, open)
+		return
+	}
+	_, config := newMySQLDatabase(t)
+	runtimecontract.RunMigrationRestart(t, config.FormatDSN(), open)
+}
+
+func TestOperationRecoveryProcessRestart(t *testing.T) {
+	open := func(dsn string) (runtimecontract.RecoveryOperationRestartStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	if os.Getenv(runtimecontract.OperationRecoveryRestartAddress) != "" {
+		runtimecontract.OperationRecoveryRestartChild(t, open)
+		return
+	}
+	_, config := newMySQLDatabase(t)
+	runtimecontract.RunOperationRecoveryRestart(t, config.FormatDSN(), open)
+}
+
+func TestOperationRecordIsolation(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	open := func(dsn string) (runtimecontract.RestartOperationStore, error) {
+		return mysql.Open[string, string](dsn, mysql.StringCodec{}, mysql.StringCodec{})
+	}
+	runtimecontract.RunOperationIsolation(t, config.FormatDSN(), db, open, mysql.ErrUnsupportedSchema)
+}
+
 func openMySQL(t *testing.T) *mysql.Store[string, string] {
 	t.Helper()
 	_, config := newMySQLDatabase(t)
