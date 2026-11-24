@@ -435,6 +435,15 @@ func (s *Store[EntityID, StateID]) ReconcileTrackedOperation(
 				result = transition.OperationReconciliation{Result: cloneOperationResult(record.Result), Resolved: true}
 				return operationClaim(ctx, tx, lease, clock())
 			}
+			if record.Result.Unavailable && assessment.Outcome == transition.OperationOutcomeSucceeded {
+				record.Result = cloneOperationResult(assessment.Result)
+				record.History = append(record.History, transition.OperationHistoryEntry{Assessment: assessment, RecordedAt: now})
+				if err := saveOperationRecord(ctx, tx, binding.Identity, record); err != nil {
+					return err
+				}
+				result = transition.OperationReconciliation{Result: cloneOperationResult(record.Result), Resolved: true}
+				return operationClaim(ctx, tx, lease, clock())
+			}
 			if assessment.Outcome != transition.OperationOutcomeSucceeded || !sameOperationResult(record.Result, assessment.Result) {
 				record.EvidenceConflict = true
 				record.History = append(record.History, transition.OperationHistoryEntry{Assessment: assessment, RecordedAt: now})
@@ -688,6 +697,7 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 				record.EvidenceConflict = true
 				record.History = append(record.History, transition.OperationHistoryEntry{
 					Assessment: assessment, RequestID: requestID, Principal: principal, Reason: reason, RecordedAt: now,
+					Conflicting: true,
 				})
 				if err := saveOperationRecord(ctx, tx, identity, record); err != nil {
 					return err
@@ -703,11 +713,16 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 			if record.Result.FailureCode != "" {
 				currentOutcome = transition.OperationOutcomeFailed
 			}
+			recoveringUnavailableResult := record.Result.Unavailable &&
+				currentOutcome == transition.OperationOutcomeSucceeded &&
+				assessment.Outcome == transition.OperationOutcomeSucceeded &&
+				assessment.Result != nil && !assessment.Result.Unavailable
 			if currentOutcome != assessment.Outcome ||
-				(assessment.Result != nil && !sameOperationResult(record.Result, assessment.Result)) {
+				(!recoveringUnavailableResult && assessment.Result != nil && !sameOperationResult(record.Result, assessment.Result)) {
 				record.EvidenceConflict = true
 				record.History = append(record.History, transition.OperationHistoryEntry{
 					Assessment: assessment, RequestID: requestID, Principal: principal, Reason: reason, RecordedAt: now,
+					Conflicting: true,
 				})
 				if err := saveOperationRecord(ctx, tx, identity, record); err != nil {
 					return err
@@ -749,12 +764,14 @@ func operationResolutionReplay(
 	requestID, principal, reason string,
 	assessment transition.OperationAssessment,
 ) (bool, error) {
-	for _, entry := range record.History {
+	for index, entry := range record.History {
 		if entry.RequestID != requestID {
 			continue
 		}
 		if entry.Principal == principal && entry.Reason == reason && sameOperationAssessment(entry.Assessment, assessment) {
-			if record.EvidenceConflict {
+			legacyConflictingEntry := record.EvidenceConflict &&
+				index == len(record.History)-1 && entry.RequestID != ""
+			if entry.Conflicting || legacyConflictingEntry {
 				return true, transition.ErrOperationEvidenceConflict
 			}
 			return true, nil
@@ -896,7 +913,7 @@ func operationSettled(record operationRecord) bool {
 		return false
 	}
 	if record.Result != nil {
-		return true
+		return !record.Result.Unavailable
 	}
 	for i := len(record.History) - 1; i >= 0; i-- {
 		evidence := record.History[i].Assessment.Evidence

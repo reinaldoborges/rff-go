@@ -179,7 +179,10 @@ results fail explicitly. A dispatch error is unknown unless the host's
 `Reconcile` callback may establish success, a definitive failure, or
 authoritative absence. Absence permits redispatch only when evidence also
 proves every earlier call is quiescent. A confirmed success whose required
-result cannot be retained is durably marked unavailable and blocks redispatch.
+result cannot be retained is durably marked unavailable and blocks redispatch,
+dependent compensation, and work completion. Reconciliation or an authorized
+resolution may supply a verified result; a resolution still requires a
+separate authorized retry before work resumes.
 Unknown mutations require a `SafeRepeatGuarantee` bound to the exact identity,
 provider scope, host-verified non-secret input fingerprint, and overlap
 horizon; evidence and guarantees are revalidated immediately before dispatch,

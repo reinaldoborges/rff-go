@@ -16,6 +16,9 @@ import (
 type AtomicStore interface {
 	Store
 	transition.OperationStore
+	ReadContinuation(context.Context, string) (transition.ContinuationProgress, error)
+	AcquireContinuation(context.Context, transition.ContinuationMarker[string, string], string, func() time.Time, time.Duration) (transition.ContinuationLease, error)
+	StartContinuation(context.Context, transition.ContinuationLease, func() time.Time) error
 	CommitAtomic(context.Context, transition.TransitionLease[string], func() time.Time,
 		func(context.Context, *sql.Tx, transition.Execution[string, string]) (transition.CommitReceipt, error)) (transition.CommitReceipt, error)
 	ContinuationMarkers(context.Context) ([]transition.ContinuationMarker[string, string], error)
@@ -202,7 +205,26 @@ func CheckAtomicAfterRestart(t *testing.T, store AtomicStore, db *sql.DB) {
 	if err != nil || len(markers) != 1 || markers[0].ExecutionID != "origin" {
 		t.Fatalf("continuation missing after process loss: %+v err=%v", markers, err)
 	}
+	readyAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	progress, err := store.ReadContinuation(ctx, markers[0].ExecutionID)
+	if err != nil || !progress.CycleStarted.Equal(readyAt) ||
+		!progress.Deadline.Equal(readyAt.Add(markers[0].Policy.OverallTimeout)) {
+		t.Fatalf("atomic commit did not start the queued cycle durably: progress=%+v err=%v", progress, err)
+	}
+	now := readyAt.Add(markers[0].Policy.OverallTimeout)
+	clock := func() time.Time { return now }
 	if ready, err := store.ContinuationReady(ctx, "origin"); err != nil || !ready {
-		t.Fatalf("reconciled origin not ready after process loss: ready=%v err=%v", ready, err)
+		t.Fatalf("delayed discovery must still observe the committed origin: ready=%v err=%v", ready, err)
+	}
+	lease, err := store.AcquireContinuation(ctx, markers[0], "worker-after-restart", clock, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartContinuation(ctx, lease, clock); !errors.Is(err, transition.ErrContinuationIntervention) {
+		t.Fatalf("queueing after shared atomic commit must consume the deadline: %v", err)
+	}
+	progress, err = store.ReadContinuation(ctx, markers[0].ExecutionID)
+	if err != nil || !progress.CycleStarted.Equal(readyAt) || progress.Phase != transition.ContinuationIntervention {
+		t.Fatalf("acquisition reset the shared atomic deadline: progress=%+v err=%v", progress, err)
 	}
 }

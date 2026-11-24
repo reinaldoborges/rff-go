@@ -70,7 +70,8 @@ type OperationRequest struct {
 // OperationResult is the safe result retained for replay. Typed success has
 // non-nil Data, including for an empty encoding. NoResult is explicit and has
 // nil Data. The runtime sets Unavailable when confirmed success lacks a valid
-// required result; that outcome is settled and cannot be redispatched. A
+// required result; progression remains blocked until its result is recovered.
+// The known effect cannot be redispatched. A
 // nonempty safe FailureCode represents a definitive failure; raw errors must
 // not be put in this field.
 type OperationResult struct {
@@ -248,6 +249,8 @@ type OperationHistoryEntry struct {
 	Principal  string
 	Reason     string
 	RecordedAt time.Time
+	// Conflicting marks a resolution request whose outcome was rejected.
+	Conflicting bool
 }
 
 // OperationInspection exposes only the host-approved persisted binding and outcome.
@@ -340,6 +343,9 @@ func (s *operationScope) track(ctx context.Context, req OperationRequest, dispat
 		return s.reconcile(ctx, req, binding, dispatch)
 	}
 	if !started && result != nil && result.Unavailable {
+		if req.Reconcile != nil {
+			return s.reconcile(ctx, req, binding, dispatch)
+		}
 		return OperationResult{}, fmt.Errorf("%w: confirmed operation result is unavailable", ErrCompatibility)
 	}
 	if started {

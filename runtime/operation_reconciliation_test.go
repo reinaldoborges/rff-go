@@ -498,6 +498,47 @@ func TestReconciledSuccessWithoutRequiredResultIsDurablySettled(t *testing.T) {
 	}
 }
 
+func TestUnavailableSuccessCanReconcileItsRequiredResult(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	store := &reconciliationTestStore{}
+	lease := HookLease{ExecutionID: "execution", ActivityID: "activity-1", Generation: 1}
+	scope := &operationScope{ctx: context.Background(), store: store, lease: lease, clock: clock}
+	ctx := context.WithValue(context.Background(), operationTrackerKey{}, scope)
+	req := reconciliationRequest()
+	dispatches := 0
+	dispatch := func(context.Context, OperationIdentity) (OperationResult, error) {
+		dispatches++
+		return OperationResult{}, errors.New("provider response lost")
+	}
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrOperationUnresolved) {
+		t.Fatalf("lost response was not retained as unknown: %v", err)
+	}
+	identity := OperationIdentity{ExecutionID: "execution", Key: "charge"}
+	req.VerifyEvidence = func(context.Context, OperationBinding, OperationEvidence) error { return nil }
+	req.Reconcile = func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error) {
+		return OperationAssessment{Outcome: OperationOutcomeSucceeded, Evidence: reconciliationEvidence(identity, now)}, nil
+	}
+	lease.ActivityID, lease.Generation = "activity-2", 2
+	scope.lease = lease
+	if _, err := TrackOperation(ctx, req, dispatch); !errors.Is(err, ErrCompatibility) || store.result == nil || !store.result.Unavailable {
+		t.Fatalf("missing required result was not retained: result=%+v err=%v", store.result, err)
+	}
+
+	req.Reconcile = func(context.Context, OperationIdentity, OperationBinding, OperationInspection) (OperationAssessment, error) {
+		return OperationAssessment{
+			Outcome: OperationOutcomeSucceeded, Evidence: reconciliationEvidence(identity, now),
+			Result: &OperationResult{Codec: req.ResultCodec, Data: []byte("receipt")},
+		}, nil
+	}
+	lease.ActivityID, lease.Generation = "activity-3", 3
+	scope.lease = lease
+	result, err := TrackOperation(ctx, req, dispatch)
+	if err != nil || string(result.Data) != "receipt" || result.Unavailable || dispatches != 1 {
+		t.Fatalf("known success could not recover its required result: result=%+v dispatches=%d err=%v", result, dispatches, err)
+	}
+}
+
 func TestTrackedUnknownOperationReconcilesConfirmedSuccess(t *testing.T) {
 	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
