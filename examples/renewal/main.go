@@ -21,6 +21,7 @@ func run() error {
 		period     = flag.String("period", "2026-11", "renewal period ID")
 		mode       = flag.String("provider-mode", "normal", "normal, lost-response, late-call, or fail-after-charge")
 		principal  = flag.String("principal", "operator", "host principal")
+		requestID  = flag.String("request-id", "", "stable request identity for retry or abort")
 	)
 	flag.Parse()
 
@@ -103,11 +104,11 @@ func run() error {
 			return err
 		}
 	case "retry":
-		if err := host.Retry(ctx, *plan, *principal); err != nil {
+		if err := host.Retry(ctx, *plan, *principal, *requestID); err != nil {
 			return err
 		}
 	case "abort":
-		if err := host.Abort(ctx, *plan, *principal); err != nil {
+		if err := host.Abort(ctx, *plan, *principal, *requestID); err != nil {
 			return err
 		}
 	case "reattempt":

@@ -29,6 +29,25 @@ type providerReceipt struct {
 	Amount      int64  `json:"amount_cents"`
 }
 
+type providerGuaranteeMode string
+
+const (
+	providerGuaranteeValid    providerGuaranteeMode = "valid"
+	providerGuaranteeShort    providerGuaranteeMode = "short"
+	providerGuaranteeExpired  providerGuaranteeMode = "expired"
+	providerGuaranteeMismatch providerGuaranteeMode = "mismatch"
+)
+
+func (h *Host) SetProviderGuarantee(ctx context.Context, plan string, mode providerGuaranteeMode) error {
+	switch mode {
+	case providerGuaranteeValid, providerGuaranteeShort, providerGuaranteeExpired, providerGuaranteeMismatch:
+	default:
+		return transition.ErrInvalidRequest
+	}
+	_, err := h.db.ExecContext(ctx, `INSERT INTO renewal_provider_guarantees (plan_id, guarantee_mode) VALUES (?, ?)`, plan, mode)
+	return err
+}
+
 func (h *Host) charge(ctx context.Context, execution fsm.ExecutionContext[string, State, Event, Input]) error {
 	input := execution.Input()
 	if handled, err := h.chargeBatch(ctx, input.PlanID, execution); handled || err != nil {
@@ -135,10 +154,67 @@ func (h *Host) operationRequest(key string, input providerInput, encoded []byte,
 			return h.unknownAssessment(identity, inspection.Binding), nil
 		},
 		Reconcile: func(ctx context.Context, identity transition.OperationIdentity, binding transition.OperationBinding, _ transition.OperationInspection) (transition.OperationAssessment, error) {
-			return h.lookupAssessment(ctx, identity, binding)
+			assessment, err := h.lookupAssessment(ctx, identity, binding)
+			if err != nil || assessment.Outcome != transition.OperationOutcomeUnknown {
+				return assessment, err
+			}
+			return h.attachProviderGuarantee(ctx, input.PlanID, assessment)
 		},
-		VerifyEvidence: h.verifyEvidence,
+		VerifyEvidence:   h.verifyEvidence,
+		VerifySafeRepeat: h.verifyProviderGuarantee,
 	}
+}
+
+func (h *Host) attachProviderGuarantee(ctx context.Context, plan string, assessment transition.OperationAssessment) (transition.OperationAssessment, error) {
+	var mode providerGuaranteeMode
+	err := h.db.QueryRowContext(ctx, `SELECT guarantee_mode FROM renewal_provider_guarantees WHERE plan_id = ?`, plan).Scan(&mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return assessment, nil
+	}
+	if err != nil {
+		return assessment, err
+	}
+	evidence := assessment.Evidence
+	now := h.clock()
+	guarantee := &transition.SafeRepeatGuarantee{
+		Identity: evidence.Identity, Provider: evidence.Provider, Scope: evidence.Scope,
+		Reference: evidence.Reference, InputFingerprint: evidence.InputFingerprint,
+		Version: "durable-fake-idempotency-v1", BehaviorVersion: evidence.BehaviorVersion,
+		ComparatorVersion: evidence.ComparatorVersion, ValidFrom: now.Add(-time.Minute),
+		ValidUntil: now.Add(2 * time.Minute), OverlapUntil: now.Add(time.Minute),
+	}
+	switch mode {
+	case providerGuaranteeShort:
+		guarantee.ValidUntil = now.Add(30 * time.Second)
+	case providerGuaranteeExpired:
+		guarantee.ValidUntil = now.Add(-time.Second)
+	case providerGuaranteeMismatch:
+		guarantee.InputFingerprint = "different-operation"
+	case providerGuaranteeValid:
+	default:
+		return assessment, transition.ErrCompatibility
+	}
+	if _, err := h.db.ExecContext(ctx, `UPDATE renewal_provider_guarantees SET offers = offers + 1 WHERE plan_id = ?`, plan); err != nil {
+		return assessment, err
+	}
+	assessment.Repeat = guarantee
+	return assessment, nil
+}
+
+func (h *Host) verifyProviderGuarantee(ctx context.Context, binding transition.OperationBinding, assessment transition.OperationAssessment, _ time.Time) error {
+	var input providerInput
+	if err := json.Unmarshal(binding.Input, &input); err != nil {
+		return transition.ErrCompatibility
+	}
+	var mode providerGuaranteeMode
+	if err := h.db.QueryRowContext(ctx, `SELECT guarantee_mode FROM renewal_provider_guarantees WHERE plan_id = ?`, input.PlanID).Scan(&mode); err != nil {
+		return err
+	}
+	if (mode != providerGuaranteeValid && mode != providerGuaranteeShort && mode != providerGuaranteeExpired && mode != providerGuaranteeMismatch) ||
+		assessment.Repeat == nil || assessment.Repeat.Version != "durable-fake-idempotency-v1" {
+		return transition.ErrCompatibility
+	}
+	return nil
 }
 
 func validateReceipt(result transition.OperationResult, input providerInput, kind string) error {
@@ -164,6 +240,13 @@ func (h *Host) dispatchProvider(ctx context.Context, identity transition.Operati
 	var input providerInput
 	if err := json.Unmarshal(inspection.Binding.Input, &input); err != nil {
 		return transition.OperationResult{}, transition.ErrCompatibility
+	}
+	dispatchID, err := randomID()
+	if err != nil {
+		return transition.OperationResult{}, err
+	}
+	if _, err := h.db.ExecContext(ctx, `INSERT INTO renewal_provider_dispatches (dispatch_id, plan_id, period_id) VALUES (?, ?, ?)`, dispatchID, input.PlanID, input.PeriodID); err != nil {
+		return transition.OperationResult{}, err
 	}
 	key := providerKey(identity)
 	fingerprint := hashHex(inspection.Binding.Input)
@@ -473,33 +556,87 @@ func (h *Host) activePayment(ctx context.Context, plan string) (transition.Execu
 	return transition.Execution[string, State]{}, transition.ErrExecutionNotActive
 }
 
-func (h *Host) Retry(ctx context.Context, plan, actor string) error {
-	return h.control(ctx, plan, actor, transition.RetryIntervention)
+func (h *Host) Retry(ctx context.Context, plan, actor, requestID string) error {
+	return h.control(ctx, plan, actor, requestID, transition.RetryIntervention)
 }
 
-func (h *Host) Abort(ctx context.Context, plan, actor string) error {
-	return h.control(ctx, plan, actor, transition.AbortIntervention)
+func (h *Host) Abort(ctx context.Context, plan, actor, requestID string) error {
+	return h.control(ctx, plan, actor, requestID, transition.AbortIntervention)
 }
 
-func (h *Host) control(ctx context.Context, plan, actor string, action transition.HookControlAction) error {
-	if actor != "operator" {
+func (h *Host) control(ctx context.Context, plan, actor, requestID string, action transition.HookControlAction) error {
+	if actor != "operator" || plan == "" || requestID == "" {
 		return transition.ErrInvalidRequest
 	}
-	execution, err := h.activePayment(ctx, plan)
+	var storedPlan, storedActor, storedAction, executionID string
+	readRequest := func() error {
+		return h.db.QueryRowContext(ctx, `SELECT plan_id, principal, action, execution_id FROM renewal_control_requests WHERE request_id = ?`, requestID).
+			Scan(&storedPlan, &storedActor, &storedAction, &executionID)
+	}
+	err := readRequest()
+	if errors.Is(err, sql.ErrNoRows) {
+		execution, activeErr := h.activePayment(ctx, plan)
+		if activeErr != nil {
+			if err := readRequest(); err != nil {
+				return activeErr
+			}
+		} else {
+			_, insertErr := h.db.ExecContext(ctx, `INSERT INTO renewal_control_requests (request_id, plan_id, principal, action, execution_id) VALUES (?, ?, ?, ?, ?)`,
+				requestID, plan, actor, action, execution.ID)
+			if insertErr != nil && !isDuplicate(insertErr) {
+				return insertErr
+			}
+		}
+		err = readRequest()
+	}
 	if err != nil {
 		return err
 	}
-	lease, err := h.store.AcquireTransitionLease(ctx, plan, execution.ID, "renewal-host", h.clock, 5*time.Second)
+	if storedPlan != plan || storedActor != actor || storedAction != string(action) {
+		return transition.ErrConflict
+	}
+	inspection, err := h.store.InspectExecution(ctx, executionID)
 	if err != nil {
 		return err
 	}
-	id, err := randomID()
+	for _, receipt := range inspection.Controls {
+		if receipt.Control.ID == requestID {
+			if receipt.Control.Action != action {
+				return transition.ErrConflict
+			}
+			return nil
+		}
+	}
+	lease, err := h.store.AcquireTransitionLease(ctx, plan, executionID, "renewal-host", h.clock, 5*time.Second)
 	if err != nil {
 		return err
 	}
-	id = "operator-" + string(action) + "-" + id
-	_, err = h.controls.Hook(ctx, lease, h.clock, transition.HookControl{ID: id, Action: action})
+	_, err = h.controls.Hook(ctx, lease, h.clock, transition.HookControl{ID: requestID, Action: action})
 	return err
+}
+
+func (h *Host) InspectControl(ctx context.Context, plan, actor, requestID string) (transition.HookControlReceipt, error) {
+	if actor != "operator" || plan == "" || requestID == "" {
+		return transition.HookControlReceipt{}, transition.ErrInvalidRequest
+	}
+	var storedPlan, storedActor, executionID string
+	if err := h.db.QueryRowContext(ctx, `SELECT plan_id, principal, execution_id FROM renewal_control_requests WHERE request_id = ?`, requestID).
+		Scan(&storedPlan, &storedActor, &executionID); err != nil {
+		return transition.HookControlReceipt{}, err
+	}
+	if storedPlan != plan || storedActor != actor {
+		return transition.HookControlReceipt{}, transition.ErrConflict
+	}
+	inspection, err := h.store.InspectExecution(ctx, executionID)
+	if err != nil {
+		return transition.HookControlReceipt{}, err
+	}
+	for _, receipt := range inspection.Controls {
+		if receipt.Control.ID == requestID {
+			return receipt, nil
+		}
+	}
+	return transition.HookControlReceipt{}, transition.ErrInvalidHook
 }
 
 func (h *Host) Reattempt(ctx context.Context, plan, period, actor string) (string, error) {
@@ -529,16 +666,18 @@ func (h *Host) Reattempt(ctx context.Context, plan, period, actor string) (strin
 }
 
 type Summary struct {
-	PlanID        string
-	PeriodID      string
-	State         State
-	History       []State
-	Revision      int64
-	Charges       int
-	Refunds       int
-	ActiveStatus  transition.Status
-	FailureCode   string
-	Continuations []transition.ContinuationPhase
+	PlanID          string
+	PeriodID        string
+	State           State
+	History         []State
+	Revision        int64
+	Charges         int
+	Refunds         int
+	ProviderCalls   int
+	GuaranteeOffers int
+	ActiveStatus    transition.Status
+	FailureCode     string
+	Continuations   []transition.ContinuationPhase
 }
 
 func (h *Host) Inspect(ctx context.Context, plan, period, actor string) (Summary, error) {
@@ -547,6 +686,12 @@ func (h *Host) Inspect(ctx context.Context, plan, period, actor string) (Summary
 	}
 	var summary Summary
 	summary.PlanID, summary.PeriodID = plan, period
+	if err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM renewal_provider_dispatches WHERE plan_id = ? AND period_id = ?`, plan, period).Scan(&summary.ProviderCalls); err != nil {
+		return summary, err
+	}
+	if err := h.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT offers FROM renewal_provider_guarantees WHERE plan_id = ?), 0)`, plan).Scan(&summary.GuaranteeOffers); err != nil {
+		return summary, err
+	}
 	var current string
 	if err := h.db.QueryRowContext(ctx, `SELECT state, revision FROM renewal_plans WHERE plan_id = ? AND period_id = ?`, plan, period).Scan(&current, &summary.Revision); err != nil {
 		return summary, err

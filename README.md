@@ -58,6 +58,8 @@ go run ./examples/renewal -db ./lost.db -plan lost-plan -action drive
 For a possible late call, `drive` stops at intervention while lookup remains
 inconclusive. The fake late call is released only by the explicit command;
 evidence resolution and retry are separate authorized actions:
+Retry and abort require a caller-chosen request ID. Reuse it after a lost
+response; choose a new ID only for a new control decision.
 
 ```sh
 go run ./examples/renewal -db ./late.db -plan late-plan -action start
@@ -66,7 +68,7 @@ go run ./examples/renewal -db ./late.db -plan late-plan -action charge-once -pro
 go run ./examples/renewal -db ./late.db -plan late-plan -action drive
 go run ./examples/renewal -db ./late.db -plan late-plan -action late-call
 go run ./examples/renewal -db ./late.db -plan late-plan -action resolve
-go run ./examples/renewal -db ./late.db -plan late-plan -action retry
+go run ./examples/renewal -db ./late.db -plan late-plan -action retry -request-id late-retry-1
 go run ./examples/renewal -db ./late.db -plan late-plan -action drive
 ```
 
@@ -81,7 +83,7 @@ go run ./examples/renewal -db ./refund.db -plan refund-plan -action start
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action drive
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action approve
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action charge-once -provider-mode fail-after-charge
-go run ./examples/renewal -db ./refund.db -plan refund-plan -action abort
+go run ./examples/renewal -db ./refund.db -plan refund-plan -action abort -request-id refund-abort-1
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action drive
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action configure -provider-mode normal
 go run ./examples/renewal -db ./refund.db -plan refund-plan -action reattempt

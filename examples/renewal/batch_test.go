@@ -88,7 +88,7 @@ func runBatchProcessRestart(t *testing.T, host *Host, batchID string, childEnv [
 	if err := restarted.Drive(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.Retry(ctx, batchID, "operator"); err != nil {
+	if err := restarted.Retry(ctx, batchID, "operator", batchID+"-retry"); err != nil {
 		t.Fatal(err)
 	}
 	if err := restarted.Drive(ctx); err != nil {
@@ -405,7 +405,7 @@ func runUnknownBatchScenario(t *testing.T, host *Host, name string) {
 	if err := host.ResolveCharge(ctx, batchID, "operator"); err != nil {
 		t.Fatalf("resolve batch member charge: %v", err)
 	}
-	if err := host.Retry(ctx, batchID, "operator"); err != nil {
+	if err := host.Retry(ctx, batchID, "operator", batchID+"-retry"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.Drive(ctx); err != nil {
@@ -465,7 +465,7 @@ func runBatchAbortRefundsEveryChargedRecord(t *testing.T, host *Host) {
 	if err := host.Drive(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := host.Abort(ctx, "refund-batch", "operator"); err != nil {
+	if err := host.Abort(ctx, "refund-batch", "operator", "refund-batch-abort"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.Drive(ctx); err != nil {
@@ -506,7 +506,7 @@ func runBatchAbortWaitsForUnknownBeforeRefund(t *testing.T, host *Host) {
 	if err := host.Drive(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := host.Abort(ctx, batch, "operator"); err != nil {
+	if err := host.Abort(ctx, batch, "operator", batch+"-abort"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.Drive(ctx); err != nil {
@@ -522,7 +522,7 @@ func runBatchAbortWaitsForUnknownBeforeRefund(t *testing.T, host *Host) {
 	if err := host.ResolveCharge(ctx, batch, "operator"); err != nil {
 		t.Fatal(err)
 	}
-	if err := host.Retry(ctx, batch, "operator"); err != nil {
+	if err := host.Retry(ctx, batch, "operator", batch+"-retry-recovery"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.Drive(ctx); err != nil {
@@ -566,7 +566,7 @@ func TestBatchResolvesUnknownMembersIndividually(t *testing.T) {
 		if err := host.ResolveCharge(ctx, batch, "operator"); err != nil {
 			t.Fatal(err)
 		}
-		if err := host.Retry(ctx, batch, "operator"); err != nil {
+		if err := host.Retry(ctx, batch, "operator", batch+"-retry-"+member); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -610,7 +610,7 @@ func runFanoutCursorDoesNotSkipIncompleteRecord(t *testing.T, host *Host) {
 	if err := host.ResolveCharge(ctx, "partial-a", "operator"); err != nil {
 		t.Fatal(err)
 	}
-	if err := host.Retry(ctx, "partial-a", "operator"); err != nil {
+	if err := host.Retry(ctx, "partial-a", "operator", "partial-a-retry"); err != nil {
 		t.Fatal(err)
 	}
 	if err := host.DriveFanout(ctx, "partial-fanout"); err != nil {

@@ -51,4 +51,6 @@ passing gate.
 The standard Go baseline also runs the SQLite host and batch scenarios,
 including shared and separate stores. The adapter suites contain the
 cross-feature compatibility, migration, control, acceptance, and durable
-process-restart contracts for both adapters.
+process-restart contracts for both adapters. The public-host matrix additionally
+tests replayed retry/abort identities and short, expired, mismatched and valid
+provider idempotency guarantees against both adapters and store layouts.
