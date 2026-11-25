@@ -1,5 +1,8 @@
 # Implementation guidance
 
+Follow [Effective Go](https://go.dev/doc/effective_go) for idiomatic Go
+style and implementation guidance.
+
 For Go validation, container checks, and optional MySQL verification, see
 [`docs/testing-runtime-conformance.md`](docs/testing-runtime-conformance.md).
 
