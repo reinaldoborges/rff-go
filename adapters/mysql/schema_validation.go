@@ -60,7 +60,8 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 	if invalidReservation {
 		return fmt.Errorf("%w: inconsistent reservation", ErrUnsupportedSchema)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.entity, e.request_key, e.record, a.execution_id
+	rows, err := tx.QueryContext(ctx, `SELECT e.row_id, e.revision, e.id, e.entity, e.request_key, e.record,
+		e.selection_status, e.selection_compatibility, a.execution_id
 		FROM rff_executions AS e LEFT JOIN rff_active AS a ON a.execution_id = e.id`)
 	if err != nil {
 		return fmt.Errorf("%w: read executions: %w", ErrUnsupportedSchema, err)
@@ -71,19 +72,25 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		}
 	}()
 	for rows.Next() {
-		var id, key string
+		var id, key, status string
 		var entity, data []byte
 		var reservation sql.NullString
-		if err := rows.Scan(&id, &entity, &key, &data, &reservation); err != nil {
+		var locator, revision int64
+		var compatibility int
+		if err := rows.Scan(&locator, &revision, &id, &entity, &key, &data, &status, &compatibility, &reservation); err != nil {
 			return fmt.Errorf("%w: read execution: %w", ErrUnsupportedSchema, err)
 		}
 		var record diskRecord
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("%w: decode execution: %w", ErrUnsupportedSchema, err)
 		}
-		if !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
+		if locator <= 0 || revision <= 0 || transition.ValidateDurableID(id) != nil ||
+			!transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
 			transition.ValidateContinuationSnapshot(record.Continuation) != nil || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
+		}
+		if status != string(record.Status) || (compatibility == 1) != (record.Compatibility != nil) || compatibility < 0 || compatibility > 1 {
+			return fmt.Errorf("%w: inconsistent execution selection projection", ErrUnsupportedSchema)
 		}
 		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
 			return fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)

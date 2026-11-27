@@ -155,6 +155,13 @@ verified. `CodecRegistry` provides concurrency-safe exact-version lookup and
 rejects duplicate codec registrations; applications may also supply their own
 resolver.
 
+Execution IDs (including generated IDs), timer IDs, and input IDs must be
+nonempty valid UTF-8 of at most 256 bytes. This also applies with custom
+persistence adapters. Invalid IDs return `runtime.ErrInvalidDurableID` before
+durable writes. Accepted IDs retain their exact bytes, including embedded NULs,
+and are case-sensitive and not Unicode-normalized. Entity IDs, channels,
+operation keys, and other identifiers are not subject to this limit.
+
 The hook runner rehydrates pinned machine and codec versions and invokes state
 hooks without rerunning selection. It does not schedule work, fence attempts, or
 persist hook outcomes.
@@ -481,6 +488,105 @@ revalidates blocked timers before each scan and resumes them when their pinned
 codec can decode the original event. When no other timer can be claimed, it
 reports the remaining incompatibility rather than an empty queue.
 
+### Timer integrity maintenance
+
+SQLite and MySQL detect unreadable or identity-inconsistent timer records when
+timer operations encounter them. Indexed timer claims also compare each SQL
+candidate's deadline, completion, compatibility, and lease projection with its
+serialized `TimerRecord` in the same transaction. Detection fails visibly with
+`runtime.ErrIntegrity` and atomically records a safe finding. A finding
+quarantines that timer, including its claims, renewals, completions and
+compatibility mutations; independently validated timers remain eligible.
+Repeated detection is deduplicated; a recurring condition creates a new
+history entry for the same protected locator. Already-running external effects
+are not stopped or undone.
+
+Timer projections are workload-specific indexes, not authority. Claims order
+by deadline seconds, nanoseconds, then the full ID; instants retain signed Unix
+seconds and nanoseconds. A corrupt projection can make a timer disappear from
+the candidate query or disturb which timer appears globally earliest. Claims
+validate only selected candidates, so this path does not guarantee discovery
+of hidden projection corruption and does not run a mandatory full integrity
+sweep. Authorized resolution rebuilds projection fields from the current
+readable serialized timer; it cannot discover rows hidden by incorrect
+metadata. No latency improvement is claimed.
+
+### Notification selection integrity
+
+SQLite and MySQL select due, uncompleted notifications in full execution-ID
+byte order and compare each selected candidate's due, completion, and lease
+projection with its serialized work before claiming it. Due-time and lease
+expiry equality remain eligible. A prior compatibility diagnostic does not
+remove work from selection: incompatible candidates are rechecked in order,
+their diagnostics are persisted, and a later successful claim still succeeds.
+
+Notification projections are also only selection aids. Corrupt metadata can
+hide otherwise eligible work or change which notification appears globally
+first; validating selected candidates cannot detect rows filtered out by that
+metadata. This path does not promise global completeness under hidden
+projection corruption or run a mandatory full sweep. A detected mismatch
+quarantines that notification; execution and reservation findings also block
+dependent notification operations while independent work remains eligible.
+Authorized maintenance can rebuild a detected notification projection from
+its readable serialized work and record the repair in the audit history.
+
+Use `sqlite.OpenIntegrityMaintenance` or `mysql.OpenIntegrityMaintenance`
+with a host authorization callback to inspect and resolve findings without
+starting workers or initializing the normal store. Every inspection, audit
+read and resolution invokes that callback. The host must supply a safe acting
+identity and reason, protect the maintenance handle and locators, and avoid
+putting user IDs, secrets or raw errors in audit context. Inspection
+authorization covers the store-wide list; audit and resolution authorization
+include the finding ID, and resolution also includes the locator. `FindingsPage` and
+`AuditPage` use exclusive numeric cursors and bounded pages; `Findings` and
+`Audit` return `runtime.ErrIntegrityPageRequired` when their bounded first
+page would omit history. Findings expose no timer ID or record payload.
+
+Unreadable authority is never automatically rewritten or deleted. For an
+unreadable execution, `IntegrityMaintenance.RestoreExecution` is the
+worker-free, authorized path for a trusted host to supply a replacement
+authoritative record. It revalidates the inspected revision, execution and
+reservation projections, dependency snapshot, and current leases/fences. The
+exact unreadable bytes are retained in an immutable adapter archive with a
+locator and digest; archiving, restoration, audit, and finding resolution are
+committed together. Archived bytes are available only through the authorized
+maintenance API, not normal runtime reads, and there is no purge operation.
+Unknown dependencies or stale observations conflict without partial changes.
+Restoration does not retry started hooks or downstream calls, undo external
+effects, or choose a domain recovery outcome; the host must apply its existing
+recovery rules to the restored execution.
+
+Timer and input findings retain their existing authorized `Resolve` paths;
+hook and notification projection findings use their projection-rebuild paths.
+An identical authorized resolution replay returns its original outcome
+without another audit entry; a different decision conflicts. A missing record
+does not clear a finding, and unavailable schema, finding, or audit storage
+fails closed. Normal initialization still rejects malformed records without
+writing. Timer and selection integrity checks do not run a mandatory global
+sweep or guarantee discovery of records or projection mismatches not
+encountered by their ordinary operations.
+
+### Pending input selection integrity
+
+SQLite and MySQL select pending inputs using transactionally maintained
+channel and outcome-presence projections. A listing is exact-channel,
+case-sensitive, ordered by full input-ID bytes, and unbounded. MySQL's
+channel-prefix index is only a candidate lookup; the full channel value is
+rechecked. Returned records and projections are checked in the same
+transaction. A detected mismatch fails with `runtime.ErrIncompleteInputList`
+(wrapping `runtime.ErrIntegrity`) and
+quarantines the input. A known finding blocks the affected exact channel; an
+unreadable record with unknown channel blocks listings for every channel until
+authorized resolution. A `Submit` targeting a quarantined input does not invoke
+its handler.
+
+An authorized `Resolve` rebuilds only the derived projection from a readable,
+valid authoritative input record and atomically records an audit. Unreadable
+authority must be restored by a trusted host first. Projection corruption that
+has not yet been encountered can hide a matching input and allow an incomplete
+successful list. Optional checks or sweeps do not establish a current global
+snapshot and are not part of ordinary selection readiness.
+
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
 in-memory test fake exercises that contract without claiming durability:
@@ -491,7 +597,8 @@ go test ./runtime -run TestAcceptanceStoreContract
 
 `internal/runtimecontract` provides reusable execution, wakeup, worker-loss,
 commit-rejection, notification-handoff, delivery and repair,
-timer-delivery and compatibility, typed-ingress, authorized-control, migration, capacity,
+timer-delivery, compatibility, indexed-selection, typed-ingress,
+authorized-control, migration, capacity,
 retry-budget, pinned versions, and execution-compatibility contracts over the
 runtime ports.
 Run them against the SQLite adapter with:
@@ -511,11 +618,8 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables and rejects unsupported schemas without
-rewriting them. Fresh stores include the operation tables; pre-operation
-stores without them are incompatible and are not migrated or backfilled.
-Operation-only version 10 stores are upgraded transactionally with the
-Continuation table; continuation-only version 10 stores are incompatible.
-Stores without the successor table are incompatible and are not backfilled.
+rewriting or migrating them. Old disposable stores must be explicitly
+discarded and recreated by an operator.
 Unreadable operation records are isolated to the affected identity or scan.
 Older adapter versions cannot open the new schema.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
@@ -583,9 +687,12 @@ The host owns application-domain tables.
 Adapter transactions acquire an InnoDB serialization row lock, including
 fenced leases and same-transaction host callbacks. The serialized transaction
 boundary deliberately mirrors SQLite's immediate transaction semantics and
-coordinates multiple adapter instances/processes. Identifier bytes are stored
-without prefix truncation; bounded prefix indexes only accelerate lookups, with
-exact-value checks and the serialization lock preserving full-key semantics.
+coordinates multiple adapter instances/processes. Execution, timer and input
+IDs use full binary keys and full-value uniqueness; unrelated identifiers use
+prefix lookup indexes with exact-value checks. Every pooled connection must
+use `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`; `mysql.Open` rejects non-strict
+connections without changing server SQL mode. Host transaction callbacks must
+not change the connection's SQL mode.
 An incomplete, incompatible, or unsupported MySQL adapter schema is rejected;
 MySQL does not automatically migrate older adapter schemas, including
 version 2 stores from either feature branch.

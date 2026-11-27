@@ -39,10 +39,11 @@ func Open[EntityID comparable, StateID comparable](dsn string, entityCodec Codec
 	if config.DBName == "" {
 		return nil, errors.New("MySQL DSN must select a database")
 	}
-	db, err := sql.Open("mysql", config.FormatDSN())
+	connector, err := driver.NewConnector(config)
 	if err != nil {
 		return nil, fmt.Errorf("open MySQL: %w", err)
 	}
+	db := sql.OpenDB(strictConnector{Connector: connector})
 	db.SetMaxOpenConns(32)
 	db.SetMaxIdleConns(16)
 	store := &Store[EntityID, StateID]{db: db, entityCodec: entityCodec, stateCodec: stateCodec}
@@ -138,6 +139,9 @@ func (s *Store[EntityID, StateID]) AcceptInputAtomic(
 	decide func(context.Context, *sql.Tx, transition.AcceptanceView[EntityID, StateID]) (*transition.Execution[EntityID, StateID], error),
 	classify func(error) *fsm.Failure,
 ) (transition.Execution[EntityID, StateID], bool, *transition.InputOutcome, error) {
+	if err := transition.ValidateDurableID(inputID); err != nil {
+		return transition.Execution[EntityID, StateID]{}, false, nil, err
+	}
 	if classify == nil {
 		return transition.Execution[EntityID, StateID]{}, false, nil, transition.ErrInvalidRequest
 	}
@@ -183,12 +187,14 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		return result, false, fmt.Errorf("read execution: %w", rowErr)
 	}
 	if input != nil {
-		var inputData []byte
-		if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_inputs WHERE id = ?`, key).Scan(&inputData); err != nil {
-			return result, false, fmt.Errorf("read accepted input: %w", err)
-		}
-		input.record, err = decodeInput(key, inputData)
+		input.record, _, _, err = loadInputByID(ctx, tx, key)
 		if err != nil {
+			var detected inputFindingError
+			if errors.As(err, &detected) {
+				if commitErr := tx.Commit(); commitErr != nil {
+					return result, false, errors.Join(err, fmt.Errorf("commit input finding: %w", commitErr))
+				}
+			}
 			return result, false, err
 		}
 		if input.record.Outcome != nil {
@@ -222,6 +228,9 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 	}
 	next, err := decide(ctx, tx, transition.AcceptanceView[EntityID, StateID]{Existing: viewExisting, Active: active})
 	if err != nil {
+		if errors.Is(err, transition.ErrInvalidDurableID) {
+			return result, false, err
+		}
 		if input != nil {
 			failure := input.classify(err)
 			if failure != nil {
@@ -263,7 +272,12 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		}
 		return *existing, false, nil
 	}
-	if next == nil || active || next.Entity != entity || next.Key != key || next.ID == "" ||
+	if next != nil {
+		if err := transition.ValidateDurableID(next.ID); err != nil {
+			return result, false, err
+		}
+	}
+	if next == nil || active || next.Entity != entity || next.Key != key ||
 		next.SchemaVersion != transition.CurrentSchemaVersion || next.Status != transition.Waiting ||
 		next.CommitOperationID != "" || next.CommitReceipt != nil || next.NotificationIntentID != "" || next.NotificationFailure != nil ||
 		next.NotificationWaived || len(next.NotificationControls) != 0 ||

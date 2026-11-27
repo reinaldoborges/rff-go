@@ -148,25 +148,45 @@ func operationClaim(ctx context.Context, tx *sql.Tx, lease transition.HookLease,
 	return ensureCompatibleExecution(ctx, tx, lease.ExecutionID)
 }
 
+func validateOperationDependencies(ctx context.Context, tx *sql.Tx, id string) error {
+	if _, err := loadHookExecution(ctx, tx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: tracked operation execution is missing", ErrUnsupportedSchema)
+		}
+		return err
+	}
+	if _, err := loadHook(ctx, tx, id); err != nil && !errors.Is(err, transition.ErrNoHookActivity) {
+		return err
+	}
+	return nil
+}
+
 // InspectTrackedOperation reads a durable operation without requiring an active hook.
 func (s *Store[EntityID, StateID]) InspectTrackedOperation(ctx context.Context, identity transition.OperationIdentity) (transition.OperationInspection, error) {
 	var inspection transition.OperationInspection
 	if identity.ExecutionID == "" || identity.Key == "" {
 		return inspection, transition.ErrInvalidRequest
 	}
-	var data []byte
-	err := s.db.QueryRowContext(ctx, `SELECT record FROM rff_operations WHERE execution_id = ? AND operation_key = ?`, identity.ExecutionID, []byte(identity.Key)).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return inspection, transition.ErrOperationNotFound
-	}
-	if err != nil {
-		return inspection, err
-	}
-	record, err := decodeOperation(identity.ExecutionID, []byte(identity.Key), data)
-	if err != nil {
-		return inspection, err
-	}
-	return operationInspection(record), nil
+	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		var data []byte
+		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_operations WHERE execution_id = ? AND operation_key = ?`, identity.ExecutionID, []byte(identity.Key)).Scan(&data)
+		if errors.Is(err, sql.ErrNoRows) {
+			return transition.ErrOperationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if err := validateOperationDependencies(ctx, tx, identity.ExecutionID); err != nil {
+			return err
+		}
+		record, err := decodeOperation(identity.ExecutionID, []byte(identity.Key), data)
+		if err != nil {
+			return err
+		}
+		inspection = operationInspection(record)
+		return nil
+	})
+	return inspection, err
 }
 
 func operationInspection(record operationRecord) transition.OperationInspection {
@@ -589,12 +609,18 @@ func (s *Store[EntityID, StateID]) ReplayOperationResolution(
 	requestID, principal, reason string,
 	assessment transition.OperationAssessment,
 ) (transition.OperationInspection, bool, error) {
+	if err := transition.ValidateDurableID(identity.ExecutionID); err != nil {
+		return transition.OperationInspection{}, false, err
+	}
 	if identity.ExecutionID == "" || identity.Key == "" || requestID == "" || principal == "" || reason == "" {
 		return transition.OperationInspection{}, false, transition.ErrInvalidRequest
 	}
 	var inspection transition.OperationInspection
 	var found bool
 	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		if err := validateOperationDependencies(ctx, tx, identity.ExecutionID); err != nil {
+			return err
+		}
 		var data []byte
 		if err := tx.QueryRowContext(ctx,
 			`SELECT record FROM rff_operations WHERE execution_id = ? AND operation_key = ?`,
@@ -630,12 +656,18 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 	assessment transition.OperationAssessment,
 	clock func() time.Time,
 ) (transition.OperationInspection, error) {
+	if err := transition.ValidateDurableID(identity.ExecutionID); err != nil {
+		return transition.OperationInspection{}, err
+	}
 	if identity.ExecutionID == "" || identity.Key == "" || requestID == "" || principal == "" || reason == "" || clock == nil {
 		return transition.OperationInspection{}, transition.ErrInvalidRequest
 	}
 	var inspection transition.OperationInspection
 	var deferredErr error
 	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		if err := validateOperationDependencies(ctx, tx, identity.ExecutionID); err != nil {
+			return err
+		}
 		var executionData []byte
 		if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, identity.ExecutionID).Scan(&executionData); err != nil {
 			return fmt.Errorf("read operation execution: %w", err)

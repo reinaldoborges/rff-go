@@ -18,6 +18,9 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 	}{
 		{"future adapter version", `UPDATE rff_schema_version SET version = 99`},
 		{"incomplete tables", `DROP TABLE rff_active`},
+		{"malformed input projection schema", `ALTER TABLE rff_inputs ADD COLUMN extra_projection TEXT`},
+		{"missing selection index", `DROP INDEX rff_timer_deadline_lookup`},
+		{"malformed selection index", `DROP INDEX rff_timer_deadline_lookup; CREATE INDEX rff_timer_deadline_lookup ON rff_timers(id)`},
 		{"pre-operation store", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 9`},
 		{"continuation-only version ten", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 10`},
 		{"missing continuation table", `DROP TABLE rff_continuations`},
@@ -27,13 +30,19 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"dangling reservation", `INSERT INTO rff_active (entity, execution_id) VALUES (X'65', 'missing')`},
 		{"missing reservation", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":1,"ID":"id","Entity":"ZQ==","Key":"key","Status":"Waiting"}')`},
 		{"unreadable lease", `INSERT INTO rff_transition_leases (entity, execution_id, owner, generation, expires_at) VALUES (X'65', 'missing', 'owner', 0, 'not-a-time')`},
-		{"unreadable hook work", `INSERT INTO rff_hook_work (execution_id, work) VALUES ('missing', X'ff')`},
-		{"unreadable notification work", `INSERT INTO rff_notification_work (execution_id, work) VALUES ('missing', X'ff')`},
-		{"unreadable timer", `INSERT INTO rff_timers (id, record) VALUES ('timer', X'ff')`},
+		{"unreadable hook work", `INSERT INTO rff_hook_work (
+			execution_id, work, dispatch_kind, started, completed, available_at_seconds, available_at_nanoseconds, lease_owner_present
+		) VALUES ('missing', X'ff', 'enter', 0, 0, 0, 0, 0)`},
+		{"unreadable notification work", `INSERT INTO rff_notification_work
+			(execution_id, work, completed, due_at_seconds, due_at_nanoseconds, lease_owner_present)
+			VALUES ('missing', X'ff', 0, 0, 0, 0)`},
+		{"unreadable timer", `INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record)
+			VALUES ('timer', 0, 0, 0, 0, X'ff')`},
 		{"new timer record in old adapter schema", `UPDATE rff_schema_version SET version = 8;
-			INSERT INTO rff_timers (id, record) VALUES ('timer',
+			INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record)
+			VALUES ('timer', 1767225600, 0, 0, 0,
 			'{"SchemaVersion":2,"ID":"timer","WorkflowID":"workflow","Deadline":"2026-01-01T00:00:00Z","Event":{"Codec":{"Name":"event","Version":"1"}}}')`},
-		{"unreadable input", `INSERT INTO rff_inputs (id, record) VALUES ('input', X'ff')`},
+		{"unreadable input", `INSERT INTO rff_inputs (id, record, channel, outcome_present) VALUES ('input', X'ff', CAST('channel' AS BLOB), 0)`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

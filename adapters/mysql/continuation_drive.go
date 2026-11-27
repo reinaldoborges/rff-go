@@ -18,6 +18,9 @@ func (s *Store[E, S]) continuationDriveTransaction(
 	ctx context.Context, id string,
 	fn func(*sql.Tx, transition.ContinuationMarker[E, S], *transition.ContinuationProgress) error,
 ) error {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return err
+	}
 	if id == "" || fn == nil {
 		return transition.ErrInvalidRequest
 	}

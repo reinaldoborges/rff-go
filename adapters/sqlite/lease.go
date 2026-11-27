@@ -23,6 +23,9 @@ func leaseExpiry(now time.Time, ttl time.Duration) (time.Time, error) {
 func (s *Store[EntityID, StateID]) AcquireTransitionLease(
 	ctx context.Context, entity EntityID, executionID, owner string, clock func() time.Time, ttl time.Duration,
 ) (result transition.TransitionLease[EntityID], err error) {
+	if err := transition.ValidateDurableID(executionID); err != nil {
+		return result, errors.Join(err, transition.ErrInvalidLease)
+	}
 	if clock == nil || ttl <= 0 || executionID == "" || owner == "" {
 		return result, transition.ErrInvalidLease
 	}
@@ -42,6 +45,19 @@ func (s *Store[EntityID, StateID]) AcquireTransitionLease(
 	now := clock()
 	expiry, err := leaseExpiry(now, ttl)
 	if err != nil {
+		return result, err
+	}
+	if _, err := loadHookExecution(ctx, tx, executionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, transition.ErrStaleLease
+		}
+		var detected hookFindingError
+		if !errors.As(err, &detected) {
+			return result, err
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return result, errors.Join(err, fmt.Errorf("commit execution integrity finding: %w", commitErr))
+		}
 		return result, err
 	}
 	var active string
@@ -94,6 +110,9 @@ func (s *Store[EntityID, StateID]) AcquireTransitionLease(
 func (s *Store[EntityID, StateID]) RenewTransitionLease(
 	ctx context.Context, lease transition.TransitionLease[EntityID], clock func() time.Time, ttl time.Duration,
 ) (result transition.TransitionLease[EntityID], err error) {
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return result, errors.Join(err, transition.ErrInvalidLease)
+	}
 	if clock == nil || ttl <= 0 || lease.ExecutionID == "" || lease.Owner == "" || lease.Generation == 0 || lease.Generation > math.MaxInt64 {
 		return result, transition.ErrInvalidLease
 	}
@@ -113,6 +132,19 @@ func (s *Store[EntityID, StateID]) RenewTransitionLease(
 	now := clock()
 	expiry, err := leaseExpiry(now, ttl)
 	if err != nil {
+		return result, err
+	}
+	if _, err := loadHookExecution(ctx, tx, lease.ExecutionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, transition.ErrStaleLease
+		}
+		var detected hookFindingError
+		if !errors.As(err, &detected) {
+			return result, err
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return result, errors.Join(err, fmt.Errorf("commit execution integrity finding: %w", commitErr))
+		}
 		return result, err
 	}
 	var oldExpiry string

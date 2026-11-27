@@ -108,7 +108,13 @@ func saveExecution(ctx context.Context, tx *sql.Tx, id string, execution diskRec
 	if err != nil {
 		return fmt.Errorf("encode execution: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE rff_executions SET record = ? WHERE id = ?`, data, id); err != nil {
+	compatibility := 0
+	if execution.Compatibility != nil {
+		compatibility = 1
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE rff_executions
+		SET record = ?, selection_status = ?, selection_compatibility = ? WHERE id = ?`,
+		data, execution.Status, compatibility, id); err != nil {
 		return fmt.Errorf("save execution: %w", err)
 	}
 	return nil

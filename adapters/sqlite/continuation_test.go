@@ -61,7 +61,7 @@ func TestContinuationMarkersPreserveBinaryIdentities(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	marker := transition.ContinuationMarker[string, string]{
-		SchemaVersion: 1, ExecutionID: string([]byte{0xff, 0, 'a'}), OperationID: string([]byte{0xfe}),
+		SchemaVersion: 1, ExecutionID: "é\x00a", OperationID: string([]byte{0xfe}),
 		Entity: "entity", Target: "state", MachineID: string([]byte{0xfd}), MachineVersion: string([]byte{0xfc}),
 		Policy: fsm.Policy{MaxAttempts: 1, AttemptTimeout: time.Second, OverallTimeout: time.Minute},
 	}

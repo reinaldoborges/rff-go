@@ -163,6 +163,33 @@ func TestRuntimeTimerCompatibilityContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeIndexedTimerSelectionContract(t *testing.T) {
+	runtimecontract.RunIndexedTimerSelection(t, func(t *testing.T) runtimecontract.TimerStore {
+		t.Helper()
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "selection.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return store
+	})
+}
+
+func TestRuntimeIndexedHookSelectionContract(t *testing.T) {
+	runtimecontract.RunIndexedHookSelection(t, func(t *testing.T) runtimecontract.IndexedHookStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "hook-selection.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
 func TestRuntimeInputIngressContract(t *testing.T) {
 	runtimecontract.RunInputIngress(t, func(t *testing.T) transition.InputStore {
 		t.Helper()

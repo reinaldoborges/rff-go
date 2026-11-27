@@ -62,7 +62,10 @@ func NewTimerScheduler[Event any](store TimerScheduleStore, resolve CodecResolve
 
 // Schedule returns the first receipt for semantically identical requests.
 func (s *TimerScheduler[Event]) Schedule(ctx context.Context, request TimerRequest[Event]) (TimerReceipt, bool, error) {
-	if request.ID == "" || request.WorkflowID == "" || request.Deadline.IsZero() ||
+	if err := ValidateDurableID(request.ID); err != nil {
+		return TimerReceipt{}, false, err
+	}
+	if request.WorkflowID == "" || request.Deadline.IsZero() ||
 		request.EventCodec.Name == "" || request.EventCodec.Version == "" {
 		return TimerReceipt{}, false, ErrInvalidRequest
 	}

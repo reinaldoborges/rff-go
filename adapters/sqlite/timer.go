@@ -12,11 +12,84 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
+type timerProjection struct {
+	deadlineSeconds         int64
+	deadlineNanoseconds     int64
+	completed               int64
+	compatibilityBlocked    int64
+	leaseExpiresSeconds     sql.NullInt64
+	leaseExpiresNanoseconds sql.NullInt64
+}
+
+func timerProjectionFor(record transition.TimerRecord) (timerProjection, error) {
+	if record.Deadline.IsZero() {
+		return timerProjection{}, ErrUnsupportedSchema
+	}
+	projection := timerProjection{
+		deadlineSeconds:      record.Deadline.Unix(),
+		deadlineNanoseconds:  int64(record.Deadline.Nanosecond()),
+		completed:            boolInt(record.Completed),
+		compatibilityBlocked: boolInt(record.Compatibility != nil),
+	}
+	if record.Generation > 0 {
+		if record.LeaseExpiresAt.IsZero() {
+			return timerProjection{}, ErrUnsupportedSchema
+		}
+		projection.leaseExpiresSeconds = sql.NullInt64{Int64: record.LeaseExpiresAt.Unix(), Valid: true}
+		projection.leaseExpiresNanoseconds = sql.NullInt64{Int64: int64(record.LeaseExpiresAt.Nanosecond()), Valid: true}
+	}
+	return projection, nil
+}
+
+func boolInt(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func timerProjectionMatches(record transition.TimerRecord, actual timerProjection) bool {
+	expected, err := timerProjectionFor(record)
+	if err != nil {
+		return false
+	}
+	return expected.deadlineSeconds == actual.deadlineSeconds &&
+		expected.deadlineNanoseconds == actual.deadlineNanoseconds &&
+		expected.completed == actual.completed &&
+		expected.compatibilityBlocked == actual.compatibilityBlocked &&
+		expected.leaseExpiresSeconds == actual.leaseExpiresSeconds &&
+		expected.leaseExpiresNanoseconds == actual.leaseExpiresNanoseconds
+}
+
+func timerProjectionArgs(projection timerProjection) []any {
+	return []any{
+		projection.deadlineSeconds, projection.deadlineNanoseconds, projection.completed,
+		projection.compatibilityBlocked, projection.leaseExpiresSeconds, projection.leaseExpiresNanoseconds,
+	}
+}
+
+func updateTimerRecord(ctx context.Context, tx *sql.Tx, record transition.TimerRecord) error {
+	projection, err := timerProjectionFor(record)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	args := timerProjectionArgs(projection)
+	args = append(args, data, record.ID)
+	_, err = tx.ExecContext(ctx, `UPDATE rff_timers SET deadline_seconds = ?, deadline_nanoseconds = ?,
+		completed = ?, compatibility_blocked = ?, lease_expires_seconds = ?, lease_expires_nanoseconds = ?, record = ?
+		WHERE id = ?`, args...)
+	return err
+}
+
 func decodeTimer(id string, data []byte) (transition.TimerRecord, error) {
 	var record transition.TimerRecord
 	if err := json.Unmarshal(data, &record); err != nil ||
 		(record.SchemaVersion != 1 && record.SchemaVersion != transition.CurrentTimerSchemaVersion) || record.ID != id ||
-		record.ID == "" || record.WorkflowID == "" || record.Deadline.IsZero() ||
+		transition.ValidateDurableID(record.ID) != nil || record.WorkflowID == "" || record.Deadline.IsZero() ||
 		record.Event.Codec.Name == "" || record.Event.Codec.Version == "" ||
 		(record.Generation == 0 && (record.Owner != "" || !record.LeaseExpiresAt.IsZero() || record.Completed)) ||
 		(record.Generation > 0 && (record.Generation > math.MaxInt64 || record.Owner == "" || record.LeaseExpiresAt.IsZero())) {
@@ -36,17 +109,36 @@ func decodeTimer(id string, data []byte) (transition.TimerRecord, error) {
 func (s *Store[EntityID, StateID]) ScheduleTimer(ctx context.Context, id string,
 	decide func(*transition.TimerRecord) (*transition.TimerRecord, error),
 ) (record transition.TimerRecord, created bool, err error) {
-	if id == "" || decide == nil {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return record, false, err
+	}
+	if decide == nil {
 		return record, false, transition.ErrInvalidRequest
 	}
-	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	err = s.timerTransaction(ctx, func(tx *sql.Tx) error {
 		var data []byte
-		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_timers WHERE id = ?`, id).Scan(&data)
+		var locator, revision int64
+		var actual timerProjection
+		err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision, deadline_seconds, deadline_nanoseconds,
+			completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds
+			FROM rff_timers WHERE id = ?`, id).Scan(&locator, &data, &revision, &actual.deadlineSeconds,
+			&actual.deadlineNanoseconds, &actual.completed, &actual.compatibilityBlocked,
+			&actual.leaseExpiresSeconds, &actual.leaseExpiresNanoseconds)
 		var existing *transition.TimerRecord
 		if err == nil {
-			decoded, err := decodeTimer(id, data)
+			if locator <= 0 || revision <= 0 {
+				return ErrUnsupportedSchema
+			}
+			quarantined, err := timerQuarantined(ctx, tx, locator)
 			if err != nil {
 				return err
+			}
+			if quarantined {
+				return transition.ErrIntegrity
+			}
+			decoded, err := decodeTimer(id, data)
+			if err != nil || !timerProjectionMatches(decoded, actual) {
+				return recordTimerFinding(ctx, tx, locator)
 			}
 			existing = &decoded
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -75,8 +167,23 @@ func (s *Store[EntityID, StateID]) ScheduleTimer(ctx context.Context, id string,
 		if err != nil {
 			return fmt.Errorf("%w: invalid timer decision", transition.ErrInvalidDecision)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_timers (id, record) VALUES (?, ?)`, id, data); err != nil {
+		projection, err := timerProjectionFor(record)
+		if err != nil {
+			return fmt.Errorf("%w: invalid timer projection", transition.ErrInvalidDecision)
+		}
+		args := append([]any{id}, timerProjectionArgs(projection)...)
+		args = append(args, data)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_timers
+			(id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds, record)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
 			return fmt.Errorf("persist timer: %w", err)
+		}
+		var collision bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = last_insert_rowid())`).Scan(&collision); err != nil {
+			return fmt.Errorf("check timer locator: %w", err)
+		}
+		if collision {
+			return fmt.Errorf("%w: reused timer locator", ErrUnsupportedSchema)
 		}
 		created = true
 		return nil
@@ -95,39 +202,47 @@ func (s *Store[EntityID, StateID]) ClaimDueTimer(ctx context.Context, owner stri
 	if owner == "" || clock == nil || ttl <= 0 {
 		return record, lease, transition.ErrInvalidLease
 	}
-	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	err = s.timerTransaction(ctx, func(tx *sql.Tx) error {
 		now := clock().UTC()
 		if now.IsZero() || !now.Add(ttl).After(now) {
 			return transition.ErrInvalidLease
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT id, record FROM rff_timers ORDER BY id`)
-		if err != nil {
-			return fmt.Errorf("read due timers: %w", err)
-		}
-		var found bool
-		for rows.Next() {
-			var id string
-			var data []byte
-			if err := rows.Scan(&id, &data); err != nil {
-				return errors.Join(fmt.Errorf("read timer: %w", err), rows.Close())
-			}
-			current, err := decodeTimer(id, data)
-			if err != nil {
-				return errors.Join(err, rows.Close())
-			}
-			if current.Completed || current.Compatibility != nil || current.Deadline.After(now) ||
-				current.Generation > 0 && current.LeaseExpiresAt.After(now) {
-				continue
-			}
-			if !found || current.Deadline.Before(record.Deadline) {
-				record, found = current, true
-			}
-		}
-		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-			return fmt.Errorf("read due timers: %w", err)
-		}
-		if !found {
+		var id string
+		var locator, revision int64
+		var data []byte
+		var actual timerProjection
+		// The seconds bound lets SQLite stop its ordered index walk; the
+		// following predicate retains the inclusive nanosecond boundary.
+		err := tx.QueryRowContext(ctx, `SELECT t.row_id, t.id, t.record, t.revision, t.deadline_seconds,
+			t.deadline_nanoseconds, t.completed, t.compatibility_blocked, t.lease_expires_seconds, t.lease_expires_nanoseconds
+			FROM rff_timers t
+			WHERE t.completed = 0 AND t.compatibility_blocked = 0
+				AND t.deadline_seconds <= ?
+				AND (t.deadline_seconds < ? OR (t.deadline_seconds = ? AND t.deadline_nanoseconds <= ?))
+				AND (t.lease_expires_seconds IS NULL OR t.lease_expires_seconds < ?
+					OR (t.lease_expires_seconds = ? AND t.lease_expires_nanoseconds <= ?))
+				AND NOT EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
+					WHERE kind = 'timer' AND locator = t.row_id AND resolved_at IS NULL)
+			ORDER BY t.deadline_seconds, t.deadline_nanoseconds, t.id LIMIT 1`,
+			now.Unix(), now.Unix(), now.Unix(), now.Nanosecond(), now.Unix(), now.Unix(), now.Nanosecond(),
+		).Scan(&locator, &id, &data, &revision, &actual.deadlineSeconds, &actual.deadlineNanoseconds,
+			&actual.completed, &actual.compatibilityBlocked, &actual.leaseExpiresSeconds, &actual.leaseExpiresNanoseconds)
+		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrNoDueTimer
+		}
+		if err != nil {
+			return fmt.Errorf("read due timer candidate: %w", err)
+		}
+		if locator <= 0 || revision <= 0 {
+			return ErrUnsupportedSchema
+		}
+		record, err = decodeTimer(id, data)
+		if err != nil || !timerProjectionMatches(record, actual) {
+			return recordTimerFinding(ctx, tx, locator)
+		}
+		if record.Completed || record.Compatibility != nil || record.Deadline.After(now) ||
+			record.Generation > 0 && record.LeaseExpiresAt.After(now) {
+			return recordTimerFinding(ctx, tx, locator)
 		}
 		if record.Generation == math.MaxInt64 {
 			return fmt.Errorf("%w: timer generation exhausted", ErrUnsupportedSchema)
@@ -135,11 +250,7 @@ func (s *Store[EntityID, StateID]) ClaimDueTimer(ctx context.Context, owner stri
 		record.Generation++
 		record.Owner = owner
 		record.LeaseExpiresAt = now.Add(ttl)
-		data, err := json.Marshal(record)
-		if err != nil {
-			return fmt.Errorf("encode claimed timer: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET record = ? WHERE id = ?`, data, record.ID); err != nil {
+		if err := updateTimerRecord(ctx, tx, record); err != nil {
 			return fmt.Errorf("claim timer: %w", err)
 		}
 		lease = transition.TimerLease{ID: record.ID, Owner: owner, Generation: record.Generation, ExpiresAt: record.LeaseExpiresAt}
@@ -155,23 +266,21 @@ func (s *Store[EntityID, StateID]) ClaimDueTimer(ctx context.Context, owner stri
 func (s *Store[EntityID, StateID]) BlockTimerCompatibility(
 	ctx context.Context, lease transition.TimerLease, clock func() time.Time, diagnostic transition.CompatibilityDiagnostic,
 ) error {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || clock == nil {
 		return transition.ErrInvalidLease
 	}
-	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	return s.timerTransaction(ctx, func(tx *sql.Tx) error {
 		now := clock().UTC()
 		if now.IsZero() {
 			return transition.ErrInvalidLease
 		}
-		var data []byte
-		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_timers WHERE id = ?`, lease.ID).Scan(&data)
+		record, err := loadIntegrityTimer(ctx, tx, lease.ID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrStaleLease
 		}
-		if err != nil {
-			return fmt.Errorf("read timer claim: %w", err)
-		}
-		record, err := decodeTimer(lease.ID, data)
 		if err != nil {
 			return err
 		}
@@ -190,11 +299,7 @@ func (s *Store[EntityID, StateID]) BlockTimerCompatibility(
 		record.LeaseExpiresAt = now
 		record.SchemaVersion = transition.CurrentTimerSchemaVersion
 		record.Compatibility = &diagnostic
-		data, err = json.Marshal(record)
-		if err != nil {
-			return fmt.Errorf("encode incompatible timer: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET record = ? WHERE id = ?`, data, lease.ID); err != nil {
+		if err := updateTimerRecord(ctx, tx, record); err != nil {
 			return fmt.Errorf("block incompatible timer: %w", err)
 		}
 		return nil
@@ -203,31 +308,38 @@ func (s *Store[EntityID, StateID]) BlockTimerCompatibility(
 
 // BlockedTimers lists retained timer diagnostics for revalidation.
 func (s *Store[EntityID, StateID]) BlockedTimers(ctx context.Context) (records []transition.TimerRecord, err error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, record FROM rff_timers ORDER BY id`)
-	if err != nil {
-		return nil, fmt.Errorf("list blocked timers: %w", err)
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close blocked timers: %w", closeErr))
-		}
-	}()
-	for rows.Next() {
-		var id string
-		var data []byte
-		if err := rows.Scan(&id, &data); err != nil {
-			return nil, fmt.Errorf("read blocked timer: %w", err)
-		}
-		record, err := decodeTimer(id, data)
+	err = s.timerTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT t.row_id, t.id, t.record, t.revision FROM rff_timers t
+			WHERE NOT EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
+			WHERE kind = 'timer' AND locator = t.row_id AND resolved_at IS NULL) ORDER BY t.id`)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("list blocked timers: %w", err)
 		}
-		if record.Compatibility != nil {
-			records = append(records, record)
+		for rows.Next() {
+			var locator, revision int64
+			var id string
+			var data []byte
+			if err := rows.Scan(&locator, &id, &data, &revision); err != nil {
+				return errors.Join(err, rows.Close())
+			}
+			if locator <= 0 || revision <= 0 {
+				return errors.Join(ErrUnsupportedSchema, rows.Close())
+			}
+			record, err := decodeTimer(id, data)
+			if err != nil {
+				if err := rows.Close(); err != nil {
+					return err
+				}
+				return recordTimerFinding(ctx, tx, locator)
+			}
+			if record.Compatibility != nil {
+				records = append(records, record)
+			}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list blocked timers: %w", err)
+		return errors.Join(rows.Err(), rows.Close())
+	})
+	if err != nil {
+		return nil, err
 	}
 	return records, nil
 }
@@ -236,19 +348,17 @@ func (s *Store[EntityID, StateID]) BlockedTimers(ctx context.Context) (records [
 func (s *Store[EntityID, StateID]) ClearTimerCompatibility(
 	ctx context.Context, id string, generation uint64, expected transition.CompatibilityDiagnostic,
 ) error {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return err
+	}
 	if id == "" || generation == 0 {
 		return transition.ErrInvalidRequest
 	}
-	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		var data []byte
-		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_timers WHERE id = ?`, id).Scan(&data)
+	return s.timerTransaction(ctx, func(tx *sql.Tx) error {
+		record, err := loadIntegrityTimer(ctx, tx, id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrInvalidRequest
 		}
-		if err != nil {
-			return fmt.Errorf("read blocked timer: %w", err)
-		}
-		record, err := decodeTimer(id, data)
 		if err != nil {
 			return err
 		}
@@ -259,11 +369,7 @@ func (s *Store[EntityID, StateID]) ClearTimerCompatibility(
 			return transition.ErrConflict
 		}
 		record.Compatibility = nil
-		data, err = json.Marshal(record)
-		if err != nil {
-			return fmt.Errorf("encode revalidated timer: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET record = ? WHERE id = ?`, data, id); err != nil {
+		if err := updateTimerRecord(ctx, tx, record); err != nil {
 			return fmt.Errorf("clear timer compatibility: %w", err)
 		}
 		return nil
@@ -272,19 +378,17 @@ func (s *Store[EntityID, StateID]) ClearTimerCompatibility(
 
 // CompleteTimer fences late reports and retains the original scheduling record.
 func (s *Store[EntityID, StateID]) CompleteTimer(ctx context.Context, lease transition.TimerLease, clock func() time.Time) error {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || lease.ExpiresAt.IsZero() || clock == nil {
 		return transition.ErrInvalidLease
 	}
-	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
-		var data []byte
-		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_timers WHERE id = ?`, lease.ID).Scan(&data)
+	return s.timerTransaction(ctx, func(tx *sql.Tx) error {
+		record, err := loadIntegrityTimer(ctx, tx, lease.ID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrStaleLease
 		}
-		if err != nil {
-			return fmt.Errorf("read timer claim: %w", err)
-		}
-		record, err := decodeTimer(lease.ID, data)
 		if err != nil {
 			return err
 		}
@@ -299,11 +403,7 @@ func (s *Store[EntityID, StateID]) CompleteTimer(ctx context.Context, lease tran
 			return transition.ErrStaleLease
 		}
 		record.Completed = true
-		data, err = json.Marshal(record)
-		if err != nil {
-			return fmt.Errorf("encode completed timer: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET record = ? WHERE id = ?`, data, lease.ID); err != nil {
+		if err := updateTimerRecord(ctx, tx, record); err != nil {
 			return fmt.Errorf("complete timer: %w", err)
 		}
 		return nil
@@ -312,24 +412,22 @@ func (s *Store[EntityID, StateID]) CompleteTimer(ctx context.Context, lease tran
 
 // RenewTimer extends a current, unexpired delivery claim.
 func (s *Store[EntityID, StateID]) RenewTimer(ctx context.Context, lease transition.TimerLease, clock func() time.Time, ttl time.Duration) (transition.TimerLease, error) {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return transition.TimerLease{}, errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || clock == nil || ttl <= 0 {
 		return transition.TimerLease{}, transition.ErrInvalidLease
 	}
-	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+	err := s.timerTransaction(ctx, func(tx *sql.Tx) error {
 		now := clock()
 		expiry, err := leaseExpiry(now, ttl)
 		if err != nil {
 			return err
 		}
-		var data []byte
-		err = tx.QueryRowContext(ctx, `SELECT record FROM rff_timers WHERE id = ?`, lease.ID).Scan(&data)
+		record, err := loadIntegrityTimer(ctx, tx, lease.ID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrStaleLease
 		}
-		if err != nil {
-			return fmt.Errorf("read timer claim: %w", err)
-		}
-		record, err := decodeTimer(lease.ID, data)
 		if err != nil {
 			return err
 		}
@@ -338,11 +436,7 @@ func (s *Store[EntityID, StateID]) RenewTimer(ctx context.Context, lease transit
 			return transition.ErrStaleLease
 		}
 		record.LeaseExpiresAt = expiry
-		data, err = json.Marshal(record)
-		if err != nil {
-			return fmt.Errorf("encode renewed timer: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET record = ? WHERE id = ?`, data, lease.ID); err != nil {
+		if err := updateTimerRecord(ctx, tx, record); err != nil {
 			return fmt.Errorf("renew timer: %w", err)
 		}
 		lease.ExpiresAt = expiry
@@ -355,7 +449,7 @@ func (s *Store[EntityID, StateID]) RenewTimer(ctx context.Context, lease transit
 }
 
 func validateTimers(ctx context.Context, tx *sql.Tx, adapterVersion int) (err error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id, record FROM rff_timers`)
+	rows, err := tx.QueryContext(ctx, `SELECT row_id, id, record, revision FROM rff_timers`)
 	if err != nil {
 		return fmt.Errorf("%w: read timers: %w", ErrUnsupportedSchema, err)
 	}
@@ -366,9 +460,13 @@ func validateTimers(ctx context.Context, tx *sql.Tx, adapterVersion int) (err er
 	}()
 	for rows.Next() {
 		var id string
+		var locator, revision int64
 		var data []byte
-		if err := rows.Scan(&id, &data); err != nil {
+		if err := rows.Scan(&locator, &id, &data, &revision); err != nil {
 			return fmt.Errorf("%w: read timer: %w", ErrUnsupportedSchema, err)
+		}
+		if locator <= 0 || revision <= 0 {
+			return fmt.Errorf("%w: invalid timer locator or revision", ErrUnsupportedSchema)
 		}
 		record, err := decodeTimer(id, data)
 		if err != nil {

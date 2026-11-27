@@ -33,9 +33,21 @@ type LifecycleConfig struct {
 	PollInterval time.Duration
 	// Inputs explicitly enables independently supervised typed input channels.
 	Inputs []LifecycleInput
+	// IntegritySweep enables optional, bounded integrity checks. Each invocation
+	// must perform at most one bounded batch; it is not required for readiness.
+	IntegritySweep *IntegritySweepConfig
 	// ClassifyError classifies errors not recognized by the framework. It may
 	// be called concurrently and must not expose error text in diagnostics.
 	ClassifyError func(error) PathErrorClass
+}
+
+// IntegritySweepConfig enables an optional lifecycle path that repeatedly runs
+// one bounded maintenance batch. Hosts can instead schedule adapter maintenance
+// directly and monitor it independently.
+type IntegritySweepConfig struct {
+	RunBatch     func(context.Context) (IntegritySweepProgress, error)
+	Interval     time.Duration
+	OverdueAfter time.Duration
 }
 
 // PathStatus contains only safe, non-persisted diagnostics.
@@ -46,11 +58,21 @@ type PathStatus struct {
 	Classification PathErrorClass
 }
 
+// IntegritySweepStatus exposes the latest durable progress and local path
+// health without making the optional sweep a readiness dependency.
+type IntegritySweepStatus struct {
+	HasProgress bool
+	Progress    IntegritySweepProgress
+	Path        PathStatus
+	Overdue     bool
+}
+
 // LifecycleStatus separates durable progress readiness from local capacity.
 type LifecycleStatus struct {
-	Ready    bool
-	Capacity ExecutionCapacity
-	Paths    []PathStatus
+	Ready          bool
+	Capacity       ExecutionCapacity
+	Paths          []PathStatus
+	IntegritySweep *IntegritySweepStatus
 }
 
 type lifecyclePath struct {
@@ -61,6 +83,8 @@ type lifecyclePath struct {
 	step       func(context.Context, func()) error
 	check      func(context.Context) error
 	worker     bool
+	optional   bool
+	interval   time.Duration
 	hook       bool
 	empty      error
 	stop       func()
@@ -87,6 +111,11 @@ type Lifecycle[EntityID comparable, StateID comparable, Event, Input any] struct
 	startup       chan struct{}
 	paths         []*lifecyclePath
 	notifications *lifecycleNotifications[EntityID, StateID]
+
+	integritySweepConfig      *IntegritySweepConfig
+	integritySweepStarted     time.Time
+	integritySweepProgress    IntegritySweepProgress
+	hasIntegritySweepProgress bool
 }
 
 // NewLifecycle validates all dependencies and timing before any work starts.
@@ -96,6 +125,10 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 ) (*Lifecycle[EntityID, StateID, Event, Input], error) {
 	if config.PollInterval <= 0 || config.PollInterval >= config.Coordinator.LeaseTTL {
 		return nil, errors.New("poll interval must be positive and shorter than the coordinator lease")
+	}
+	if config.IntegritySweep != nil && (config.IntegritySweep.RunBatch == nil ||
+		config.IntegritySweep.Interval <= 0 || config.IntegritySweep.OverdueAfter <= 0) {
+		return nil, errors.New("integrity sweep requires a batch function and positive interval and overdue duration")
 	}
 	coordinator, err := NewCoordinator(store, classifier, config.Coordinator)
 	if err != nil {
@@ -113,9 +146,13 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 		worker: worker, commitHost: host, coordinator: config.Coordinator, interval: config.PollInterval,
 		classify: config.ClassifyError, errors: make(chan struct{}, 1),
 	}
+	if config.IntegritySweep != nil {
+		sweepConfig := *config.IntegritySweep
+		l.integritySweepConfig = &sweepConfig
+	}
 	add := func(name string, worker bool, step func(context.Context, func()) error) {
 		l.paths = append(l.paths, &lifecyclePath{name: name, wake: make(chan struct{}, 1),
-			status: PathStatus{Name: name}, step: step, worker: worker})
+			status: PathStatus{Name: name}, step: step, worker: worker, optional: false})
 	}
 	add("transition", false, func(ctx context.Context, _ func()) error {
 		if err := coordinator.Reconcile(ctx); err != nil {
@@ -134,6 +171,16 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 	if err := l.addInputs(config.Inputs, add); err != nil {
 		return nil, err
 	}
+	if l.integritySweepConfig != nil {
+		add("integrity-sweep", false, func(ctx context.Context, _ func()) error {
+			progress, err := l.integritySweepConfig.RunBatch(ctx)
+			l.recordIntegritySweepProgress(progress)
+			return err
+		})
+		path := l.paths[len(l.paths)-1]
+		path.optional = true
+		path.interval = l.integritySweepConfig.Interval
+	}
 	return l, nil
 }
 
@@ -149,6 +196,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Start(ctx context.Context) 
 	l.started = true
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 	l.startup = make(chan struct{})
+	if l.integritySweepConfig != nil {
+		l.integritySweepStarted = time.Now()
+	}
 	startup := l.startup
 	runCtx := l.ctx
 	l.mu.Unlock()
@@ -176,6 +226,14 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Start(ctx context.Context) 
 			l.mu.Unlock()
 			continue
 		}
+		if path.optional {
+			l.mu.Lock()
+			if !l.stopping && checkCtx.Err() == nil {
+				l.launchLocked(path, false)
+			}
+			l.mu.Unlock()
+			continue
+		}
 		checks.Add(1)
 		go func(path *lifecyclePath) {
 			defer checks.Done()
@@ -185,7 +243,9 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Start(ctx context.Context) 
 			}
 			err := path.step(checkCtx, nil)
 			if err != nil {
-				results <- fmt.Errorf("initial %s scan: %w", path.name, err)
+				if !path.optional {
+					results <- fmt.Errorf("initial %s scan: %w", path.name, err)
+				}
 				if checkCtx.Err() == nil {
 					l.recordFailure(path, err, false)
 				}
@@ -240,7 +300,11 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) runPath(ctx context.Context
 	}()
 	for {
 		if wait {
-			timer := time.NewTimer(l.interval)
+			interval := path.interval
+			if interval <= 0 {
+				interval = l.interval
+			}
+			timer := time.NewTimer(interval)
 			if l.pathRecovering(path) {
 				select {
 				case <-ctx.Done():
@@ -352,6 +416,14 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) recordSuccess(path *lifecyc
 	l.mu.Unlock()
 }
 
+func (l *Lifecycle[EntityID, StateID, Event, Input]) recordIntegritySweepProgress(progress IntegritySweepProgress) {
+	progress.Coverage = append([]IntegritySweepCoverage(nil), progress.Coverage...)
+	l.mu.Lock()
+	l.integritySweepProgress = progress
+	l.hasIntegritySweepProgress = true
+	l.mu.Unlock()
+}
+
 func (l *Lifecycle[EntityID, StateID, Event, Input]) recordFailure(path *lifecyclePath, err error, checkError bool) PathErrorClass {
 	class := classifyPathError(err, l.classify)
 	l.mu.Lock()
@@ -424,14 +496,37 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Status() LifecycleStatus {
 	defer l.mu.Unlock()
 	status := LifecycleStatus{Ready: l.started && !l.stopping}
 	runningWorkers := 0
+	var sweepPath *lifecyclePath
 	for _, path := range l.paths {
 		status.Paths = append(status.Paths, path.status)
-		if !path.status.Running || !path.status.Checked || path.status.Classification != "" {
+		if !path.optional && (!path.status.Running || !path.status.Checked || path.status.Classification != "") {
 			status.Ready = false
 		}
 		if path.hook && path.status.Running && path.status.Checked && path.status.Classification == "" {
 			runningWorkers++
 		}
+		if path.name == "integrity-sweep" {
+			sweepPath = path
+		}
+	}
+	if sweepPath != nil {
+		sweepStatus := &IntegritySweepStatus{Path: sweepPath.status}
+		if l.hasIntegritySweepProgress {
+			sweepStatus.HasProgress = true
+			sweepStatus.Progress = l.integritySweepProgress
+			sweepStatus.Progress.Coverage = append([]IntegritySweepCoverage(nil), l.integritySweepProgress.Coverage...)
+		}
+		if l.integritySweepConfig != nil && l.started && !l.stopping {
+			lastProgress := sweepStatus.Progress.UpdatedAt
+			if lastProgress.IsZero() {
+				lastProgress = l.integritySweepStarted
+			}
+			if !lastProgress.IsZero() && time.Since(lastProgress) >= l.integritySweepConfig.OverdueAfter &&
+				(sweepPath.status.Running || !sweepStatus.Progress.Complete) {
+				sweepStatus.Overdue = true
+			}
+		}
+		status.IntegritySweep = sweepStatus
 	}
 	worker := l.worker.Status()
 	available := runningWorkers - worker.Active

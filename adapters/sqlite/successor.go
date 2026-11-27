@@ -295,8 +295,11 @@ func (s *Store[EntityID, StateID]) prepareSuccessor(
 		if err != nil {
 			return err
 		}
-		if next == nil || validateSuccessorBinding(*next) != nil {
+		if next == nil {
 			return transition.ErrInvalidDecision
+		}
+		if err := validateSuccessorBinding(*next); err != nil {
+			return err
 		}
 		if err := transition.MatchContinuationMarkers(marker, next.Origin); err != nil {
 			return err
@@ -406,7 +409,14 @@ func (s *Store[EntityID, StateID]) finalizeSuccessor(
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_executions (id, entity, request_key, record) VALUES (?, ?, ?, ?)`, stored.Execution.ID, entity, stored.Execution.Key, acceptedData); err != nil {
+		compatibility := 0
+		if stored.Execution.Compatibility != nil {
+			compatibility = 1
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_executions
+			(id, entity, request_key, record, selection_status, selection_compatibility)
+			VALUES (?, ?, ?, ?, ?, ?)`, stored.Execution.ID, entity, stored.Execution.Key, acceptedData,
+			stored.Execution.Status, compatibility); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_active (entity, execution_id) VALUES (?, ?)`, entity, stored.Execution.ID); err != nil {

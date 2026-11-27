@@ -190,8 +190,8 @@ func (a *Acceptor[EntityID, StateID, Event, Input]) prepare(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("allocate execution ID: %w", err)
 	}
-	if id == "" {
-		return nil, fmt.Errorf("%w: execution ID is empty", ErrInvalidRequest)
+	if err := ValidateDurableID(id); err != nil {
+		return nil, err
 	}
 	now := a.now()
 	notify := selected.Notify

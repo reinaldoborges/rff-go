@@ -31,7 +31,7 @@ func RunIdentitySafety(t *testing.T, store Store) {
 	tests := []struct {
 		name, id, machine string
 	}{
-		{name: "binary execution ID", id: string([]byte{0xff, 'a'}), machine: "plan"},
+		{name: "UTF-8 execution ID", id: "é\x00a", machine: "plan"},
 		{name: "binary machine ID", id: "valid", machine: string([]byte{0xfe, 'a'})},
 	}
 	for _, tt := range tests {
