@@ -542,17 +542,29 @@ include the finding ID, and resolution also includes the locator. `FindingsPage`
 `Audit` return `runtime.ErrIntegrityPageRequired` when their bounded first
 page would omit history. Findings expose no timer ID or record payload.
 
-Unreadable authority is never automatically rewritten or deleted. A trusted
-host-controlled restoration must restore the original authoritative record;
-then inspect again and pass the fresh finding to `Resolve`. Resolution checks
-the current record, locator and revision and commits its audit with the
-quarantine change. An identical authorized resolution replay returns its
-original outcome without another audit entry; a different decision conflicts.
-A stale observation conflicts, a missing record cannot
-resolve, and unavailable schema, finding or audit storage fails closed.
-Normal initialization still rejects malformed records without writing.
-This timer path does not run an integrity sweep or guarantee discovery of
-records or projection mismatches not encountered by a timer operation.
+Unreadable authority is never automatically rewritten or deleted. For an
+unreadable execution, `IntegrityMaintenance.RestoreExecution` is the
+worker-free, authorized path for a trusted host to supply a replacement
+authoritative record. It revalidates the inspected revision, execution and
+reservation projections, dependency snapshot, and current leases/fences. The
+exact unreadable bytes are retained in an immutable adapter archive with a
+locator and digest; archiving, restoration, audit, and finding resolution are
+committed together. Archived bytes are available only through the authorized
+maintenance API, not normal runtime reads, and there is no purge operation.
+Unknown dependencies or stale observations conflict without partial changes.
+Restoration does not retry started hooks or downstream calls, undo external
+effects, or choose a domain recovery outcome; the host must apply its existing
+recovery rules to the restored execution.
+
+Timer and input findings retain their existing authorized `Resolve` paths;
+hook and notification projection findings use their projection-rebuild paths.
+An identical authorized resolution replay returns its original outcome
+without another audit entry; a different decision conflicts. A missing record
+does not clear a finding, and unavailable schema, finding, or audit storage
+fails closed. Normal initialization still rejects malformed records without
+writing. Timer and selection integrity checks do not run a mandatory global
+sweep or guarantee discovery of records or projection mismatches not
+encountered by their ordinary operations.
 
 ### Pending input selection integrity
 

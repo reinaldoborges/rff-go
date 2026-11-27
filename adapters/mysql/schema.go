@@ -169,7 +169,20 @@ const (
 		inspected_through BIGINT UNSIGNED NOT NULL,
 		inspected BIGINT UNSIGNED NOT NULL
 	) ENGINE=InnoDB`
-	inputsDDL = `CREATE TABLE rff_inputs (
+	integrityExecutionArchiveDDL = `CREATE TABLE rff_integrity_execution_archive (
+		finding_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+		locator BIGINT UNSIGNED NOT NULL,
+		revision BIGINT NOT NULL,
+		record_digest BINARY(32) NOT NULL,
+		dependency_digest BINARY(32) NOT NULL,
+		record LONGBLOB NOT NULL,
+		CONSTRAINT rff_integrity_execution_archive_finding_fk FOREIGN KEY (finding_id) REFERENCES rff_integrity_findings(row_id)
+	) ENGINE=InnoDB`
+	integrityExecutionArchiveUpdateAction = `BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'integrity evidence is immutable'; END`
+	integrityExecutionArchiveDeleteAction = `BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'integrity evidence is immutable'; END`
+	integrityExecutionArchiveUpdateDDL    = `CREATE TRIGGER rff_integrity_execution_archive_update_guard BEFORE UPDATE ON rff_integrity_execution_archive FOR EACH ROW ` + integrityExecutionArchiveUpdateAction
+	integrityExecutionArchiveDeleteDDL    = `CREATE TRIGGER rff_integrity_execution_archive_delete_guard BEFORE DELETE ON rff_integrity_execution_archive FOR EACH ROW ` + integrityExecutionArchiveDeleteAction
+	inputsDDL                             = `CREATE TABLE rff_inputs (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		id VARBINARY(256) NOT NULL,
 		record LONGBLOB NOT NULL,
@@ -576,6 +589,88 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'revision'`, table).Scan(&revisionDefault); err != nil ||
 			!revisionDefault.Valid || revisionDefault.String != "1" {
 			return fmt.Errorf("%w: incompatible revision default on %s", ErrUnsupportedSchema, table)
+		}
+	}
+	if err := validateMySQLExecutionArchiveStructure(ctx, db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateMySQLExecutionArchiveStructure(ctx context.Context, db schemaReader) error {
+	var exists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'rff_integrity_execution_archive'`).Scan(&exists); err != nil {
+		return fmt.Errorf("%w: inspect execution evidence archive: %w", ErrUnsupportedSchema, err)
+	}
+	if exists == 0 {
+		return nil
+	}
+	var engine string
+	if err := db.QueryRowContext(ctx, `SELECT engine FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'rff_integrity_execution_archive'`).Scan(&engine); err != nil || engine != "InnoDB" {
+		return fmt.Errorf("%w: incompatible execution evidence archive engine", ErrUnsupportedSchema)
+	}
+	type columnDefinition struct {
+		name, columnType, nullable, extra string
+	}
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, is_nullable, extra
+		FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'rff_integrity_execution_archive'
+		ORDER BY ordinal_position`)
+	if err != nil {
+		return fmt.Errorf("%w: inspect execution evidence archive columns: %w", ErrUnsupportedSchema, err)
+	}
+	var columns []columnDefinition
+	for rows.Next() {
+		var definition columnDefinition
+		if err := rows.Scan(&definition.name, &definition.columnType, &definition.nullable, &definition.extra); err != nil {
+			return errors.Join(ErrUnsupportedSchema, rows.Close())
+		}
+		columns = append(columns, definition)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("%w: inspect execution evidence archive columns: %w", ErrUnsupportedSchema, err)
+	}
+	expected := []columnDefinition{
+		{name: "finding_id", columnType: "bigint unsigned", nullable: "NO"},
+		{name: "locator", columnType: "bigint unsigned", nullable: "NO"},
+		{name: "revision", columnType: "bigint", nullable: "NO"},
+		{name: "record_digest", columnType: "binary(32)", nullable: "NO"},
+		{name: "dependency_digest", columnType: "binary(32)", nullable: "NO"},
+		{name: "record", columnType: "longblob", nullable: "NO"},
+	}
+	if len(columns) != len(expected) {
+		return fmt.Errorf("%w: incompatible execution evidence archive columns", ErrUnsupportedSchema)
+	}
+	for i := range expected {
+		if columns[i] != expected[i] {
+			return fmt.Errorf("%w: incompatible execution evidence archive column %s", ErrUnsupportedSchema, columns[i].name)
+		}
+	}
+	var primaryCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = 'rff_integrity_execution_archive'
+		AND index_name = 'PRIMARY' AND seq_in_index = 1 AND column_name = 'finding_id' AND non_unique = 0`).Scan(&primaryCount); err != nil || primaryCount != 1 {
+		return fmt.Errorf("%w: incompatible execution evidence archive key", ErrUnsupportedSchema)
+	}
+	var foreignKeyCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.key_column_usage
+		WHERE constraint_schema = DATABASE() AND table_name = 'rff_integrity_execution_archive'
+		AND constraint_name = 'rff_integrity_execution_archive_finding_fk' AND column_name = 'finding_id'
+		AND referenced_table_name = 'rff_integrity_findings' AND referenced_column_name = 'row_id'`).Scan(&foreignKeyCount); err != nil || foreignKeyCount != 1 {
+		return fmt.Errorf("%w: incompatible execution evidence archive reference", ErrUnsupportedSchema)
+	}
+	for _, trigger := range []struct {
+		name, action, timing, event string
+	}{
+		{"rff_integrity_execution_archive_update_guard", integrityExecutionArchiveUpdateAction, "BEFORE", "UPDATE"},
+		{"rff_integrity_execution_archive_delete_guard", integrityExecutionArchiveDeleteAction, "BEFORE", "DELETE"},
+	} {
+		var statement, timing, event string
+		if err := db.QueryRowContext(ctx, `SELECT action_statement, action_timing, event_manipulation
+			FROM information_schema.triggers WHERE trigger_schema = DATABASE() AND trigger_name = ?`, trigger.name).
+			Scan(&statement, &timing, &event); err != nil || statement != trigger.action || timing != trigger.timing || event != trigger.event {
+			return fmt.Errorf("%w: incompatible execution evidence archive trigger", ErrUnsupportedSchema)
 		}
 	}
 	return nil

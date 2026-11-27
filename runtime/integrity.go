@@ -20,14 +20,16 @@ const MaxIntegrityPageSize = 256
 
 // IntegrityFinding contains only safe operator-visible metadata.
 type IntegrityFinding struct {
-	ID         int64
-	Locator    int64
-	Revision   int64
-	Kind       string
-	Category   string
-	Field      string
-	DetectedAt time.Time
-	ResolvedAt *time.Time
+	ID                int64
+	Locator           int64
+	Revision          int64
+	Kind              string
+	Category          string
+	Field             string
+	DetectedAt        time.Time
+	ResolvedAt        *time.Time
+	DependencyDigest  [32]byte
+	DependenciesKnown bool
 }
 
 // IntegrityAuthorizer must authorize every maintenance action. Actor and reason
@@ -67,4 +69,16 @@ type IntegritySweepProgress struct {
 	Healthy    bool
 	Incomplete bool
 	Coverage   []IntegritySweepCoverage
+}
+
+// ArchivedExecutionEvidence contains the original unreadable bytes preserved
+// during an authorized execution restoration. Read it only through the
+// worker-free integrity-maintenance API.
+type ArchivedExecutionEvidence struct {
+	FindingID        int64
+	Locator          int64
+	Revision         int64
+	RecordDigest     [32]byte
+	DependencyDigest [32]byte
+	Record           []byte
 }
