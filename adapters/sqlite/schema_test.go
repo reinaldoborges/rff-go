@@ -27,7 +27,9 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"dangling reservation", `INSERT INTO rff_active (entity, execution_id) VALUES (X'65', 'missing')`},
 		{"missing reservation", `INSERT INTO rff_executions (id, entity, request_key, record) VALUES ('id', X'65', 'key', '{"SchemaVersion":1,"ID":"id","Entity":"ZQ==","Key":"key","Status":"Waiting"}')`},
 		{"unreadable lease", `INSERT INTO rff_transition_leases (entity, execution_id, owner, generation, expires_at) VALUES (X'65', 'missing', 'owner', 0, 'not-a-time')`},
-		{"unreadable hook work", `INSERT INTO rff_hook_work (execution_id, work) VALUES ('missing', X'ff')`},
+		{"unreadable hook work", `INSERT INTO rff_hook_work (
+			execution_id, work, dispatch_kind, started, completed, available_at_seconds, available_at_nanoseconds, lease_owner_present
+		) VALUES ('missing', X'ff', 'enter', 0, 0, 0, 0, 0)`},
 		{"unreadable notification work", `INSERT INTO rff_notification_work (execution_id, work) VALUES ('missing', X'ff')`},
 		{"unreadable timer", `INSERT INTO rff_timers (id, record) VALUES ('timer', X'ff')`},
 		{"new timer record in old adapter schema", `UPDATE rff_schema_version SET version = 8;

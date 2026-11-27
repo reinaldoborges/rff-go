@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -15,10 +16,33 @@ import (
 
 // CheckHookActivities validates the durable inventory without a claim.
 func (s *Store[EntityID, StateID]) CheckHookActivities(ctx context.Context) error {
-	return s.hookTransaction(ctx, func(tx *sql.Tx) error { return validateHookWork(ctx, tx) })
+	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT execution_id FROM rff_hook_work ORDER BY execution_id`)
+		if err != nil {
+			return fmt.Errorf("list hook work for integrity check: %w", err)
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return errors.Join(fmt.Errorf("read hook work for integrity check: %w", err), rows.Close())
+			}
+			ids = append(ids, id)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("list hook work for integrity check: %w", err)
+		}
+		for _, id := range ids {
+			if _, err := loadHook(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
-// ClaimHook claims a due, unstarted hook without consuming an attempt.
+// ClaimHook claims a due, unstarted hook without consuming an attempt. A corrupt
+// projection can hide earlier work until a later candidate check or integrity scan observes it.
 func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, clock func() time.Time, ttl time.Duration) (transition.HookLease, error) {
 	var lease transition.HookLease
 	if owner == "" || clock == nil || ttl <= 0 {
@@ -30,47 +54,43 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 		if err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.record FROM rff_hook_work AS w
-			JOIN rff_active AS a ON a.execution_id = w.execution_id
-			JOIN rff_executions AS e ON e.id = w.execution_id ORDER BY w.execution_id`)
-		if err != nil {
-			return fmt.Errorf("list hook work: %w", err)
-		}
 		var id string
-		var work hookWork
-		for rows.Next() {
-			var candidateID string
-			var data, executionData []byte
-			if err := rows.Scan(&candidateID, &data, &executionData); err != nil {
-				return errors.Join(fmt.Errorf("read hook work: %w", err), rows.Close())
-			}
-			var candidate hookWork
-			if err := json.Unmarshal(data, &candidate); err != nil {
-				return errors.Join(fmt.Errorf("%w: decode hook work: %w", ErrUnsupportedSchema, err), rows.Close())
-			}
-			if err := validateWork(candidateID, candidate); err != nil {
-				return errors.Join(err, rows.Close())
-			}
-			var execution diskRecord
-			if err := json.Unmarshal(executionData, &execution); err != nil || !transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != candidateID {
-				return errors.Join(fmt.Errorf("%w: invalid hook execution", ErrUnsupportedSchema), err, rows.Close())
-			}
-			if (candidate.Progress.Dispatch.Kind == transition.HookRecover && execution.Status != transition.Aborting) ||
-				(candidate.Progress.Dispatch.Kind != transition.HookRecover && execution.Status != transition.Waiting && execution.Status != transition.Running) {
-				continue
-			}
-			if execution.Compatibility != nil || candidate.Progress.Completed || candidate.Started || now.Before(candidate.Progress.AvailableAt) ||
-				(candidate.Owner != "" && now.Before(candidate.ExpiresAt)) {
-				continue
-			}
-			id, work = candidateID, candidate
-			break
-		}
-		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-			return fmt.Errorf("list hook work: %w", err)
-		}
-		if id == "" {
+		err = tx.QueryRowContext(ctx, `SELECT w.execution_id FROM rff_hook_work AS w
+			JOIN rff_active AS a ON a.execution_id = w.execution_id
+			JOIN rff_executions AS e ON e.id = w.execution_id
+			WHERE w.completed = 0 AND w.started = 0
+				AND (w.available_at_seconds < ? OR (w.available_at_seconds = ? AND w.available_at_nanoseconds <= ?))
+				AND (w.lease_owner_present = 0 OR w.lease_expires_at_seconds < ? OR
+					(w.lease_expires_at_seconds = ? AND w.lease_expires_at_nanoseconds <= ?))
+				AND ((w.dispatch_kind = 'recover' AND e.selection_status = 'Aborting') OR
+					(w.dispatch_kind != 'recover' AND e.selection_status IN ('Waiting', 'Running')))
+				AND e.selection_compatibility = 0
+				AND NOT EXISTS (SELECT 1 FROM rff_integrity_findings f INDEXED BY rff_integrity_open_lookup
+					WHERE f.kind = 'hook' AND f.locator = w.row_id AND f.resolved_at IS NULL)
+				AND NOT EXISTS (SELECT 1 FROM rff_integrity_findings f INDEXED BY rff_integrity_open_lookup
+					WHERE f.kind = 'execution' AND f.locator = e.row_id AND f.resolved_at IS NULL)
+				AND NOT EXISTS (SELECT 1 FROM rff_integrity_findings f INDEXED BY rff_integrity_open_lookup
+					WHERE f.kind = 'reservation' AND f.locator = a.row_id AND f.resolved_at IS NULL)
+			ORDER BY w.execution_id LIMIT 1`,
+			now.Unix(), now.Unix(), now.Nanosecond(), now.Unix(), now.Unix(), now.Nanosecond()).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
 			return transition.ErrNoHookActivity
+		}
+		if err != nil {
+			return fmt.Errorf("select eligible hook work: %w", err)
+		}
+		work, err := loadHook(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		execution, err := loadHookExecution(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if (work.Progress.Dispatch.Kind == transition.HookRecover && execution.Status != transition.Aborting) ||
+			(work.Progress.Dispatch.Kind != transition.HookRecover && execution.Status != transition.Waiting && execution.Status != transition.Running) ||
+			execution.Compatibility != nil {
+			return recordExecutionFinding(ctx, tx, id, "projection_mismatch", "selection")
 		}
 		if work.Generation == math.MaxInt64 {
 			return fmt.Errorf("hook lease generation exhausted for execution %q", id)
@@ -91,6 +111,60 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 		return transition.HookLease{}, err
 	}
 	return lease, nil
+}
+
+func loadHookExecution(ctx context.Context, tx *sql.Tx, id string) (diskRecord, error) {
+	var execution diskRecord
+	var rowID, revision int64
+	var reservationID sql.NullInt64
+	var data, entity, reservationEntity []byte
+	var status string
+	var compatibility int
+	err := tx.QueryRowContext(ctx, `SELECT e.row_id, e.revision, e.record, e.selection_status, e.selection_compatibility,
+		e.entity, a.row_id, a.entity FROM rff_executions e
+		LEFT JOIN rff_active a ON a.execution_id = e.id WHERE e.id = ?`, id).Scan(
+		&rowID, &revision, &data, &status, &compatibility, &entity, &reservationID, &reservationEntity,
+	)
+	if err != nil {
+		return execution, fmt.Errorf("read hook execution: %w", err)
+	}
+	if rowID <= 0 || revision <= 0 {
+		return execution, fmt.Errorf("%w: invalid hook execution locator or revision", ErrUnsupportedSchema)
+	}
+	quarantined, err := executionQuarantined(ctx, tx, rowID)
+	if err != nil {
+		return execution, fmt.Errorf("check execution quarantine: %w", err)
+	}
+	if quarantined {
+		return execution, transition.ErrIntegrity
+	}
+	if err := json.Unmarshal(data, &execution); err != nil ||
+		!transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != id {
+		findingErr := recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+		return execution, errors.Join(err, findingErr)
+	}
+	if !bytes.Equal(entity, execution.Entity) {
+		return execution, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+	}
+	if status != string(execution.Status) || (compatibility == 1) != (execution.Compatibility != nil) ||
+		compatibility < 0 || compatibility > 1 {
+		return execution, recordExecutionFinding(ctx, tx, id, "projection_mismatch", "selection")
+	}
+	if reservationID.Valid {
+		quarantined, err := reservationQuarantined(ctx, tx, reservationID.Int64)
+		if err != nil {
+			return execution, fmt.Errorf("check reservation quarantine: %w", err)
+		}
+		if quarantined {
+			return execution, transition.ErrIntegrity
+		}
+		if !bytes.Equal(entity, reservationEntity) {
+			return execution, recordReservationFinding(ctx, tx, reservationID.Int64)
+		}
+	} else if execution.Status != transition.Complete && execution.Status != transition.Aborted {
+		return execution, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+	}
+	return execution, nil
 }
 
 func loadClaim(ctx context.Context, tx *sql.Tx, lease transition.HookLease, now time.Time) (hookWork, error) {
@@ -207,11 +281,7 @@ func (s *Store[EntityID, StateID]) StartHook(ctx context.Context, lease transiti
 		if execution.Status != transition.Aborting {
 			execution.Status = transition.Running
 		}
-		data, err = json.Marshal(execution)
-		if err != nil {
-			return fmt.Errorf("encode hook execution: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_executions SET record = ? WHERE id = ?`, data, lease.ExecutionID); err != nil {
+		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return fmt.Errorf("start hook execution: %w", err)
 		}
 		return saveHook(ctx, tx, lease.ExecutionID, work)

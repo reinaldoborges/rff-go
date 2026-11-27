@@ -13,27 +13,56 @@ import (
 )
 
 const (
-	adapterSchemaVersion     = 14
-	schemaVersionDDL         = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
-	executionsDDL            = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
-	activeDDL                = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
-	leasesDDL                = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
-	hookWorkDDL              = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	notificationWorkDDL      = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	timersDDL                = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
-	timerRevisionDDL         = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
-	timerRevisionGuardDDL    = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
-	timerLocatorDDL          = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
-	timerAllocationDDL       = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
-	integrityFindingsDDL     = `CREATE TABLE rff_integrity_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind = 'timer'), locator INTEGER NOT NULL CHECK(locator > 0), category TEXT NOT NULL CHECK(category = 'invalid_timer'), field TEXT NOT NULL CHECK(field = 'record'), detected_at TEXT NOT NULL, resolved_at TEXT)`
-	integrityIndexDDL        = `CREATE UNIQUE INDEX rff_integrity_open_lookup ON rff_integrity_findings(kind, locator) WHERE resolved_at IS NULL`
-	integrityHistoryIndexDDL = `CREATE INDEX rff_integrity_history_lookup ON rff_integrity_findings(kind, locator, finding_id)`
-	integrityAuditDDL        = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
-	integrityAuditIndexDDL   = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
-	inputsDDL                = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
-	continuationsDDL         = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
-	successorsDDL            = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
-	operationsDDL            = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
+	adapterSchemaVersion = 15
+	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
+	executionsDDL        = `CREATE TABLE rff_executions (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, selection_status TEXT NOT NULL DEFAULT 'Waiting', selection_compatibility INTEGER NOT NULL DEFAULT 0 CHECK(selection_compatibility IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0), UNIQUE(entity, request_key))`
+	activeDDL            = `CREATE TABLE rff_active (row_id INTEGER PRIMARY KEY AUTOINCREMENT, entity BLOB NOT NULL UNIQUE, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
+	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
+	hookWorkDDL          = `CREATE TABLE rff_hook_work (
+		row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256),
+		work BLOB NOT NULL,
+		dispatch_kind TEXT NOT NULL CHECK(dispatch_kind IN ('enter', 'transition', 'retry', 'recover')),
+		started INTEGER NOT NULL CHECK(started IN (0, 1)),
+		completed INTEGER NOT NULL CHECK(completed IN (0, 1)),
+		available_at_seconds INTEGER NOT NULL,
+		available_at_nanoseconds INTEGER NOT NULL CHECK(available_at_nanoseconds BETWEEN 0 AND 999999999),
+		lease_owner_present INTEGER NOT NULL CHECK(lease_owner_present IN (0, 1)),
+		lease_expires_at_seconds INTEGER,
+		lease_expires_at_nanoseconds INTEGER,
+		revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+		CHECK((lease_owner_present = 0 AND lease_expires_at_seconds IS NULL AND lease_expires_at_nanoseconds IS NULL) OR
+			(lease_owner_present = 1 AND lease_expires_at_seconds IS NOT NULL AND lease_expires_at_nanoseconds IS NOT NULL AND lease_expires_at_nanoseconds BETWEEN 0 AND 999999999))
+	)`
+	executionHookIndexDDL     = `CREATE INDEX rff_execution_hook_state_lookup ON rff_executions(selection_status, selection_compatibility, id)`
+	hookReadyIndexDDL         = `CREATE INDEX rff_hook_ready_lookup ON rff_hook_work(available_at_seconds, available_at_nanoseconds, execution_id) WHERE completed = 0 AND started = 0`
+	executionRevisionDDL      = `CREATE TRIGGER rff_execution_revision AFTER UPDATE OF record, selection_status, selection_compatibility ON rff_executions BEGIN UPDATE rff_executions SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	executionRevisionGuardDDL = `CREATE TRIGGER rff_execution_revision_guard BEFORE UPDATE OF revision ON rff_executions WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'execution revision is monotonic'); END`
+	executionLocatorDDL       = `CREATE TRIGGER rff_execution_locator BEFORE UPDATE OF row_id ON rff_executions WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'execution locator is immutable'); END`
+	executionAllocationDDL    = `CREATE TRIGGER rff_execution_allocation AFTER INSERT ON rff_executions WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'execution' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'execution locator was previously used'); END`
+	activeRevisionDDL         = `CREATE TRIGGER rff_active_revision AFTER UPDATE OF entity, execution_id ON rff_active BEGIN UPDATE rff_active SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	activeRevisionGuardDDL    = `CREATE TRIGGER rff_active_revision_guard BEFORE UPDATE OF revision ON rff_active WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'reservation revision is monotonic'); END`
+	activeLocatorDDL          = `CREATE TRIGGER rff_active_locator BEFORE UPDATE OF row_id ON rff_active WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'reservation locator is immutable'); END`
+	activeAllocationDDL       = `CREATE TRIGGER rff_active_allocation AFTER INSERT ON rff_active WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'reservation' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'reservation locator was previously used'); END`
+	hookRevisionDDL           = `CREATE TRIGGER rff_hook_revision AFTER UPDATE OF work, dispatch_kind, started, completed, available_at_seconds, available_at_nanoseconds, lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds ON rff_hook_work BEGIN UPDATE rff_hook_work SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	hookRevisionGuardDDL      = `CREATE TRIGGER rff_hook_revision_guard BEFORE UPDATE OF revision ON rff_hook_work WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'hook revision is monotonic'); END`
+	hookLocatorDDL            = `CREATE TRIGGER rff_hook_locator BEFORE UPDATE OF row_id ON rff_hook_work WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'hook locator is immutable'); END`
+	hookAllocationDDL         = `CREATE TRIGGER rff_hook_allocation AFTER INSERT ON rff_hook_work WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'hook' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'hook locator was previously used'); END`
+	notificationWorkDDL       = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
+	timersDDL                 = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
+	timerRevisionDDL          = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	timerRevisionGuardDDL     = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
+	timerLocatorDDL           = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
+	timerAllocationDDL        = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
+	integrityFindingsDDL      = `CREATE TABLE rff_integrity_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('timer', 'hook', 'execution', 'reservation')), locator INTEGER NOT NULL CHECK(locator > 0), category TEXT NOT NULL CHECK(category IN ('invalid_timer', 'projection_mismatch', 'invalid_execution', 'invalid_reservation', 'invalid_hook')), field TEXT NOT NULL CHECK(field IN ('record', 'selection', 'active')), detected_at TEXT NOT NULL, resolved_at TEXT)`
+	integrityIndexDDL         = `CREATE UNIQUE INDEX rff_integrity_open_lookup ON rff_integrity_findings(kind, locator) WHERE resolved_at IS NULL`
+	integrityHistoryIndexDDL  = `CREATE INDEX rff_integrity_history_lookup ON rff_integrity_findings(kind, locator, finding_id)`
+	integrityAuditDDL         = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
+	integrityAuditIndexDDL    = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
+	inputsDDL                 = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
+	continuationsDDL          = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	successorsDDL             = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
+	operationsDDL             = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -73,11 +102,20 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (14)`,
+			`INSERT INTO rff_schema_version (version) VALUES (15)`,
 			executionsDDL,
+			executionRevisionDDL,
+			executionRevisionGuardDDL,
+			executionLocatorDDL,
 			activeDDL,
+			activeRevisionDDL,
+			activeRevisionGuardDDL,
+			activeLocatorDDL,
 			leasesDDL,
 			hookWorkDDL,
+			hookRevisionDDL,
+			hookRevisionGuardDDL,
+			hookLocatorDDL,
 			notificationWorkDDL,
 			timersDDL,
 			timerRevisionDDL,
@@ -85,6 +123,11 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			integrityFindingsDDL,
 			integrityIndexDDL,
 			integrityHistoryIndexDDL,
+			executionAllocationDDL,
+			activeAllocationDDL,
+			hookAllocationDDL,
+			executionHookIndexDDL,
+			hookReadyIndexDDL,
 			integrityAuditDDL,
 			integrityAuditIndexDDL,
 			timerLocatorDDL,
@@ -329,7 +372,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			}
 		}
 	}
-	if err := validateIntegrityStructure(ctx, tx, false); err != nil {
+	if err := validateIntegrityStructure(ctx, tx, true); err != nil {
 		return err
 	}
 	if err := validateIdentityIndexes(ctx, tx); err != nil {
@@ -408,7 +451,8 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 	if invalidReservation {
 		return fmt.Errorf("%w: inconsistent reservation", ErrUnsupportedSchema)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.entity, e.request_key, e.record, a.execution_id
+	rows, err := tx.QueryContext(ctx, `SELECT e.row_id, e.revision, e.selection_status, e.selection_compatibility,
+		e.id, e.entity, e.request_key, e.record, a.execution_id
 		FROM rff_executions AS e LEFT JOIN rff_active AS a ON a.execution_id = e.id`)
 	if err != nil {
 		return fmt.Errorf("%w: read executions: %w", ErrUnsupportedSchema, err)
@@ -419,17 +463,21 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		}
 	}()
 	for rows.Next() {
-		var id, key string
+		var id, key, status string
 		var entity, data []byte
 		var reservation sql.NullString
-		if err := rows.Scan(&id, &entity, &key, &data, &reservation); err != nil {
+		var rowID, revision int64
+		var compatibility int
+		if err := rows.Scan(&rowID, &revision, &status, &compatibility, &id, &entity, &key, &data, &reservation); err != nil {
 			return fmt.Errorf("%w: read execution: %w", ErrUnsupportedSchema, err)
 		}
 		var record diskRecord
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("%w: decode execution: %w", ErrUnsupportedSchema, err)
 		}
-		if transition.ValidateDurableID(id) != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
+		if rowID <= 0 || revision <= 0 || status != string(record.Status) || compatibility < 0 || compatibility > 1 ||
+			(compatibility == 1) != (record.Compatibility != nil) ||
+			transition.ValidateDurableID(id) != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
 			transition.ValidateContinuationSnapshot(record.Continuation) != nil || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
 		}
