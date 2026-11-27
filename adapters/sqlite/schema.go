@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion     = 14
+	adapterSchemaVersion     = 15
 	schemaVersionDDL         = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL            = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL                = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
@@ -25,12 +25,18 @@ const (
 	timerRevisionGuardDDL    = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
 	timerLocatorDDL          = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
 	timerAllocationDDL       = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
-	integrityFindingsDDL     = `CREATE TABLE rff_integrity_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind = 'timer'), locator INTEGER NOT NULL CHECK(locator > 0), category TEXT NOT NULL CHECK(category = 'invalid_timer'), field TEXT NOT NULL CHECK(field = 'record'), detected_at TEXT NOT NULL, resolved_at TEXT)`
+	inputRevisionDDL         = `CREATE TRIGGER rff_input_revision AFTER UPDATE OF id, record, channel, outcome_present ON rff_inputs BEGIN UPDATE rff_inputs SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	inputRevisionGuardDDL    = `CREATE TRIGGER rff_input_revision_guard BEFORE UPDATE OF revision ON rff_inputs WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'input revision is monotonic'); END`
+	inputLocatorDDL          = `CREATE TRIGGER rff_input_locator BEFORE UPDATE OF row_id ON rff_inputs WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'input locator is immutable'); END`
+	inputAllocationDDL       = `CREATE TRIGGER rff_input_allocation AFTER INSERT ON rff_inputs WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'input' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'input locator was previously used'); END`
+	inputSelectionIndexDDL   = `CREATE INDEX rff_input_selection_lookup ON rff_inputs(channel, outcome_present, id)`
+	integrityFindingsDDL     = `CREATE TABLE rff_integrity_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('timer', 'input')), locator INTEGER NOT NULL CHECK(locator > 0), finding_revision INTEGER NOT NULL CHECK(finding_revision >= 0), category TEXT NOT NULL CHECK((kind = 'timer' AND category = 'invalid_timer') OR (kind = 'input' AND category = 'invalid_input')), field TEXT NOT NULL CHECK((kind = 'timer' AND field = 'record') OR (kind = 'input' AND field IN ('record', 'projection'))), scope_channel BLOB NOT NULL, detected_at TEXT NOT NULL, resolved_at TEXT, CHECK(kind = 'input' OR (scope_channel = X'' AND finding_revision = 0)))`
 	integrityIndexDDL        = `CREATE UNIQUE INDEX rff_integrity_open_lookup ON rff_integrity_findings(kind, locator) WHERE resolved_at IS NULL`
 	integrityHistoryIndexDDL = `CREATE INDEX rff_integrity_history_lookup ON rff_integrity_findings(kind, locator, finding_id)`
+	integrityChannelIndexDDL = `CREATE INDEX rff_integrity_input_channel_lookup ON rff_integrity_findings(kind, scope_channel, resolved_at)`
 	integrityAuditDDL        = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
 	integrityAuditIndexDDL   = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
-	inputsDDL                = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
+	inputsDDL                = `CREATE TABLE rff_inputs (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, channel BLOB NOT NULL, outcome_present INTEGER NOT NULL CHECK(outcome_present IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
 	continuationsDDL         = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	successorsDDL            = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
 	operationsDDL            = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
@@ -73,7 +79,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (14)`,
+			`INSERT INTO rff_schema_version (version) VALUES (15)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -85,11 +91,17 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			integrityFindingsDDL,
 			integrityIndexDDL,
 			integrityHistoryIndexDDL,
+			integrityChannelIndexDDL,
 			integrityAuditDDL,
 			integrityAuditIndexDDL,
 			timerLocatorDDL,
 			timerAllocationDDL,
 			inputsDDL,
+			inputSelectionIndexDDL,
+			inputRevisionDDL,
+			inputRevisionGuardDDL,
+			inputLocatorDDL,
+			inputAllocationDDL,
 			continuationsDDL,
 			successorsDDL,
 			operationsDDL,
@@ -280,6 +292,9 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			if definition != inputsDDL {
 				return fmt.Errorf("%w: incompatible inputs table", ErrUnsupportedSchema)
 			}
+			if err := validateInputSelectionSchema(ctx, tx); err != nil {
+				return err
+			}
 			if err := validateInputs(ctx, tx); err != nil {
 				return err
 			}
@@ -335,6 +350,9 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 	if err := validateIdentityIndexes(ctx, tx); err != nil {
 		return err
 	}
+	if err := validateInputSelectionSchema(ctx, tx); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema initialization: %w", err)
 	}
@@ -356,6 +374,28 @@ func validateIdentityIndexes(ctx context.Context, tx *sql.Tx) error {
 		if err != nil || count == 0 {
 			return fmt.Errorf("%w: missing full-value unique identity index on %s: %v", ErrUnsupportedSchema, table, err)
 		}
+	}
+	return nil
+}
+
+func validateInputSelectionSchema(ctx context.Context, tx *sql.Tx) error {
+	definitions := map[string]string{
+		"rff_input_selection_lookup": inputSelectionIndexDDL,
+		"rff_input_revision":         inputRevisionDDL,
+		"rff_input_revision_guard":   inputRevisionGuardDDL,
+		"rff_input_locator":          inputLocatorDDL,
+		"rff_input_allocation":       inputAllocationDDL,
+	}
+	for name, expected := range definitions {
+		var actual string
+		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name = ?`, name).Scan(&actual); err != nil || actual != expected {
+			return fmt.Errorf("%w: incompatible input selection structure", ErrUnsupportedSchema)
+		}
+	}
+	var indexColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_info('rff_input_selection_lookup')
+		WHERE (seqno = 0 AND name = 'channel') OR (seqno = 1 AND name = 'outcome_present') OR (seqno = 2 AND name = 'id')`).Scan(&indexColumns); err != nil || indexColumns != 3 {
+		return fmt.Errorf("%w: incompatible input selection index", ErrUnsupportedSchema)
 	}
 	return nil
 }

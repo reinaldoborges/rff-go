@@ -187,12 +187,14 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 		return result, false, fmt.Errorf("read execution: %w", rowErr)
 	}
 	if input != nil {
-		var inputData []byte
-		if err := tx.QueryRowContext(ctx, `SELECT record FROM rff_inputs WHERE id = ?`, key).Scan(&inputData); err != nil {
-			return result, false, fmt.Errorf("read accepted input: %w", err)
-		}
-		input.record, err = decodeInput(key, inputData)
+		input.record, _, _, err = loadInputByID(ctx, tx, key)
 		if err != nil {
+			var detected inputFindingError
+			if errors.As(err, &detected) {
+				if commitErr := tx.Commit(); commitErr != nil {
+					return result, false, errors.Join(err, fmt.Errorf("commit input finding: %w", commitErr))
+				}
+			}
 			return result, false, err
 		}
 		if input.record.Outcome != nil {

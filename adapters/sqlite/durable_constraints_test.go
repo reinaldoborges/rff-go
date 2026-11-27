@@ -24,13 +24,18 @@ func TestDurableIdentityByteConstraints(t *testing.T) {
 	defer db.Close()
 	for _, table := range []string{"rff_timers", "rff_inputs"} {
 		query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
+		args := func(id string) []any { return []any{id, []byte("{}")} }
+		if table == "rff_inputs" {
+			query = "INSERT INTO rff_inputs (id, record, channel, outcome_present) VALUES (?, ?, ?, 0)"
+			args = func(id string) []any { return []any{id, []byte("{}"), []byte("channel")} }
+		}
 		for _, id := range []string{"a\x00b", "a\x00c", strings.Repeat("x", 256)} {
-			if _, err := db.ExecContext(context.Background(), query, id, []byte("{}")); err != nil {
+			if _, err := db.ExecContext(context.Background(), query, args(id)...); err != nil {
 				t.Fatalf("%s insert %q: %v", table, id, err)
 			}
 		}
 		for _, id := range []string{"", "a\x00b", "a\x00" + strings.Repeat("x", 255)} {
-			if _, err := db.ExecContext(context.Background(), query, id, []byte("{}")); err == nil {
+			if _, err := db.ExecContext(context.Background(), query, args(id)...); err == nil {
 				t.Fatalf("%s accepted duplicate or invalid ID %q", table, id)
 			}
 		}

@@ -33,7 +33,7 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"new timer record in old adapter schema", `UPDATE rff_schema_version SET version = 8;
 			INSERT INTO rff_timers (id, record) VALUES ('timer',
 			'{"SchemaVersion":2,"ID":"timer","WorkflowID":"workflow","Deadline":"2026-01-01T00:00:00Z","Event":{"Codec":{"Name":"event","Version":"1"}}}')`},
-		{"unreadable input", `INSERT INTO rff_inputs (id, record) VALUES ('input', X'ff')`},
+		{"unreadable input", `INSERT INTO rff_inputs (id, record, channel, outcome_present) VALUES ('input', X'ff', CAST('channel' AS BLOB), 0)`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
