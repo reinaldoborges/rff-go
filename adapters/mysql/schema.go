@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const adapterSchemaVersion = 7
+const adapterSchemaVersion = 9
 
 const (
 	schemaVersionDDL = `CREATE TABLE rff_schema_version (
@@ -19,13 +19,18 @@ const (
 		entity LONGBLOB NOT NULL,
 		request_key LONGBLOB NOT NULL,
 		record LONGBLOB NOT NULL,
+		selection_status VARBINARY(32) NOT NULL DEFAULT 'Waiting',
+		selection_compatibility TINYINT UNSIGNED NOT NULL DEFAULT 0,
+		revision BIGINT NOT NULL DEFAULT 1,
 		UNIQUE KEY rff_execution_id_lookup (id),
-		KEY rff_execution_identity_lookup (entity(256), request_key(256))
+		KEY rff_execution_identity_lookup (entity(256), request_key(256)),
+		KEY rff_execution_hook_state_lookup (selection_status, selection_compatibility, id)
 	) ENGINE=InnoDB`
 	activeDDL = `CREATE TABLE rff_active (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		entity LONGBLOB NOT NULL,
 		execution_id VARBINARY(256) NOT NULL,
+		revision BIGINT NOT NULL DEFAULT 1,
 		KEY rff_active_entity_lookup (entity(256)),
 		UNIQUE KEY rff_active_execution_lookup (execution_id)
 	) ENGINE=InnoDB`
@@ -41,7 +46,22 @@ const (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		execution_id VARBINARY(256) NOT NULL,
 		work LONGBLOB NOT NULL,
-		UNIQUE KEY rff_hook_execution_lookup (execution_id)
+		dispatch_kind VARBINARY(16) NOT NULL,
+		started TINYINT UNSIGNED NOT NULL,
+		completed TINYINT UNSIGNED NOT NULL,
+		available_at_seconds BIGINT NOT NULL,
+		available_at_nanoseconds INT UNSIGNED NOT NULL,
+		lease_owner_present TINYINT UNSIGNED NOT NULL,
+		lease_expires_at_seconds BIGINT,
+		lease_expires_at_nanoseconds INT UNSIGNED,
+		revision BIGINT NOT NULL DEFAULT 1,
+		CONSTRAINT rff_hook_flags CHECK (started IN (0, 1) AND completed IN (0, 1) AND lease_owner_present IN (0, 1)),
+		CONSTRAINT rff_hook_dispatch CHECK (dispatch_kind IN (_binary'enter', _binary'transition', _binary'retry', _binary'recover')),
+		CONSTRAINT rff_hook_time CHECK (available_at_nanoseconds <= 999999999),
+		CONSTRAINT rff_hook_lease CHECK ((lease_owner_present = 0 AND lease_expires_at_seconds IS NULL AND lease_expires_at_nanoseconds IS NULL) OR
+			(lease_owner_present = 1 AND lease_expires_at_seconds IS NOT NULL AND lease_expires_at_nanoseconds IS NOT NULL AND lease_expires_at_nanoseconds <= 999999999)),
+		UNIQUE KEY rff_hook_execution_lookup (execution_id),
+		KEY rff_hook_ready_lookup (completed, started, available_at_seconds, available_at_nanoseconds, execution_id)
 	) ENGINE=InnoDB`
 	notificationWorkDDL = `CREATE TABLE rff_notification_work (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -52,15 +72,41 @@ const (
 	timersDDL = `CREATE TABLE rff_timers (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		id VARBINARY(256) NOT NULL,
+		deadline_seconds BIGINT NOT NULL,
+		deadline_nanoseconds INT NOT NULL,
+		completed TINYINT NOT NULL,
+		compatibility_blocked TINYINT NOT NULL,
+		lease_expires_seconds BIGINT NULL,
+		lease_expires_nanoseconds INT NULL,
 		record LONGBLOB NOT NULL,
 		revision BIGINT NOT NULL DEFAULT 1,
-		UNIQUE KEY rff_timer_id_lookup (id)
+		CONSTRAINT rff_timer_deadline_nanoseconds CHECK (deadline_nanoseconds BETWEEN 0 AND 999999999),
+		CONSTRAINT rff_timer_completion CHECK (completed IN (0, 1)),
+		CONSTRAINT rff_timer_compatibility CHECK (compatibility_blocked IN (0, 1)),
+		CONSTRAINT rff_timer_lease_pair CHECK (
+			(lease_expires_seconds IS NULL AND lease_expires_nanoseconds IS NULL) OR
+			(lease_expires_seconds IS NOT NULL AND lease_expires_nanoseconds IS NOT NULL AND lease_expires_nanoseconds BETWEEN 0 AND 999999999)
+		),
+		UNIQUE KEY rff_timer_id_lookup (id),
+		KEY rff_timer_deadline_lookup (completed, compatibility_blocked, deadline_seconds, deadline_nanoseconds, id)
 	) ENGINE=InnoDB`
-	timerRevisionAction   = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
-	timerRevisionDDL      = `CREATE TRIGGER rff_timer_revision BEFORE UPDATE ON rff_timers FOR EACH ROW ` + timerRevisionAction
-	timerAllocationAction = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'timer' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'timer locator was previously used'; END IF; END`
-	timerAllocationDDL    = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers FOR EACH ROW ` + timerAllocationAction
-	integrityFindingsDDL  = `CREATE TABLE rff_integrity_findings (
+	timerRevisionAction       = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	timerRevisionDDL          = `CREATE TRIGGER rff_timer_revision BEFORE UPDATE ON rff_timers FOR EACH ROW ` + timerRevisionAction
+	timerAllocationAction     = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'timer' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'timer locator was previously used'; END IF; END`
+	timerAllocationDDL        = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers FOR EACH ROW ` + timerAllocationAction
+	executionRevisionAction   = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	executionRevisionDDL      = `CREATE TRIGGER rff_execution_revision BEFORE UPDATE ON rff_executions FOR EACH ROW ` + executionRevisionAction
+	executionAllocationAction = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'execution' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'execution locator was previously used'; END IF; END`
+	executionAllocationDDL    = `CREATE TRIGGER rff_execution_allocation AFTER INSERT ON rff_executions FOR EACH ROW ` + executionAllocationAction
+	activeRevisionAction      = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	activeRevisionDDL         = `CREATE TRIGGER rff_active_revision BEFORE UPDATE ON rff_active FOR EACH ROW ` + activeRevisionAction
+	activeAllocationAction    = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'reservation' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'reservation locator was previously used'; END IF; END`
+	activeAllocationDDL       = `CREATE TRIGGER rff_active_allocation AFTER INSERT ON rff_active FOR EACH ROW ` + activeAllocationAction
+	hookRevisionAction        = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	hookRevisionDDL           = `CREATE TRIGGER rff_hook_revision BEFORE UPDATE ON rff_hook_work FOR EACH ROW ` + hookRevisionAction
+	hookAllocationAction      = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'hook' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hook locator was previously used'; END IF; END`
+	hookAllocationDDL         = `CREATE TRIGGER rff_hook_allocation AFTER INSERT ON rff_hook_work FOR EACH ROW ` + hookAllocationAction
+	integrityFindingsDDL      = `CREATE TABLE rff_integrity_findings (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		kind VARBINARY(16) NOT NULL,
 		locator BIGINT UNSIGNED NOT NULL,
@@ -71,11 +117,11 @@ const (
 		detected_at VARBINARY(64) NOT NULL,
 		resolved_at VARBINARY(64) NOT NULL,
 		open_marker BIGINT UNSIGNED NOT NULL,
-		CONSTRAINT rff_finding_kind CHECK (kind IN (_binary'timer', _binary'input')),
+		CONSTRAINT rff_finding_kind CHECK (kind IN (_binary'timer', _binary'hook', _binary'execution', _binary'reservation', _binary'input')),
 		CONSTRAINT rff_finding_locator CHECK (locator > 0),
 		CONSTRAINT rff_finding_revision CHECK (finding_revision >= 0),
-		CONSTRAINT rff_finding_category CHECK ((kind = _binary'timer' AND category = _binary'invalid_timer') OR (kind = _binary'input' AND category = _binary'invalid_input')),
-		CONSTRAINT rff_finding_field CHECK ((kind = _binary'timer' AND field = _binary'record') OR (kind = _binary'input' AND field IN (_binary'record', _binary'projection'))),
+		CONSTRAINT rff_finding_category CHECK (category IN (_binary'invalid_timer', _binary'projection_mismatch', _binary'invalid_execution', _binary'invalid_reservation', _binary'invalid_hook', _binary'invalid_input')),
+		CONSTRAINT rff_finding_field CHECK (field IN (_binary'record', _binary'selection', _binary'active', _binary'projection')),
 		CONSTRAINT rff_finding_scope CHECK (kind = _binary'input' OR (scope_channel = _binary'' AND finding_revision = 0)),
 		CONSTRAINT rff_finding_status CHECK ((open_marker = 0 AND resolved_at = _binary'') OR (open_marker > 0 AND resolved_at <> _binary'')),
 		UNIQUE KEY rff_integrity_open_lookup (kind, locator, open_marker),
@@ -187,14 +233,20 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		for _, statement := range []string{
 			executionsDDL,
+			executionRevisionDDL,
 			activeDDL,
+			activeRevisionDDL,
 			leasesDDL,
 			hookWorkDDL,
+			hookRevisionDDL,
 			notificationWorkDDL,
 			timersDDL,
 			timerRevisionDDL,
 			integrityFindingsDDL,
 			integrityAuditDDL,
+			executionAllocationDDL,
+			activeAllocationDDL,
+			hookAllocationDDL,
 			timerAllocationDDL,
 			inputsDDL,
 			inputRevisionDDL,
@@ -313,12 +365,12 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 	}
 	expected := map[string][]column{
 		"rff_schema_version":     {{"version", "tinyint unsigned"}},
-		"rff_executions":         {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}},
-		"rff_active":             {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}},
+		"rff_executions":         {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}, {"selection_status", "varbinary(32)"}, {"selection_compatibility", "tinyint unsigned"}, {"revision", "bigint"}},
+		"rff_active":             {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"revision", "bigint"}},
 		"rff_transition_leases":  {{"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
-		"rff_hook_work":          {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}},
+		"rff_hook_work":          {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"dispatch_kind", "varbinary(16)"}, {"started", "tinyint unsigned"}, {"completed", "tinyint unsigned"}, {"available_at_seconds", "bigint"}, {"available_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
 		"rff_notification_work":  {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}},
-		"rff_timers":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}, {"revision", "bigint"}},
+		"rff_timers":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"deadline_seconds", "bigint"}, {"deadline_nanoseconds", "int"}, {"completed", "tinyint"}, {"compatibility_blocked", "tinyint"}, {"lease_expires_seconds", "bigint"}, {"lease_expires_nanoseconds", "int"}, {"record", "longblob"}, {"revision", "bigint"}},
 		"rff_integrity_findings": {{"row_id", "bigint unsigned"}, {"kind", "varbinary(16)"}, {"locator", "bigint unsigned"}, {"finding_revision", "bigint"}, {"category", "varbinary(32)"}, {"field", "varbinary(32)"}, {"scope_channel", "longblob"}, {"detected_at", "varbinary(64)"}, {"resolved_at", "varbinary(64)"}, {"open_marker", "bigint unsigned"}},
 		"rff_integrity_audit":    {{"row_id", "bigint unsigned"}, {"finding_id", "bigint unsigned"}, {"revision", "bigint"}, {"action", "varbinary(16)"}, {"actor", "longblob"}, {"reason", "longblob"}, {"occurred_at", "varbinary(64)"}},
 		"rff_inputs":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}, {"channel", "longblob"}, {"outcome_present", "tinyint unsigned"}, {"revision", "bigint"}},
@@ -369,7 +421,12 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 			if wanted[i].name == "row_id" {
 				extra = "auto_increment"
 			}
-			if found[i].name != wanted[i].name || found[i].columnType != wanted[i].columnType || found[i].nullable != "NO" || found[i].extra != extra {
+			nullable := "NO"
+			if (table == "rff_hook_work" && (wanted[i].name == "lease_expires_at_seconds" || wanted[i].name == "lease_expires_at_nanoseconds")) ||
+				(table == "rff_timers" && (wanted[i].name == "lease_expires_seconds" || wanted[i].name == "lease_expires_nanoseconds")) {
+				nullable = "YES"
+			}
+			if found[i].name != wanted[i].name || found[i].columnType != wanted[i].columnType || found[i].nullable != nullable || found[i].extra != extra {
 				return fmt.Errorf("%w: incompatible column %s in %s", ErrUnsupportedSchema, found[i].name, table)
 			}
 		}
@@ -402,41 +459,57 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 		{"rff_timer_allocation", timerAllocationAction, "AFTER", "INSERT", "rff_timers"},
 		{"rff_input_revision", inputRevisionAction, "BEFORE", "UPDATE", "rff_inputs"},
 		{"rff_input_allocation", inputAllocationAction, "AFTER", "INSERT", "rff_inputs"},
+		{"rff_execution_revision", executionRevisionAction, "BEFORE", "UPDATE", "rff_executions"},
+		{"rff_execution_allocation", executionAllocationAction, "AFTER", "INSERT", "rff_executions"},
+		{"rff_active_revision", activeRevisionAction, "BEFORE", "UPDATE", "rff_active"},
+		{"rff_active_allocation", activeAllocationAction, "AFTER", "INSERT", "rff_active"},
+		{"rff_hook_revision", hookRevisionAction, "BEFORE", "UPDATE", "rff_hook_work"},
+		{"rff_hook_allocation", hookAllocationAction, "AFTER", "INSERT", "rff_hook_work"},
 	} {
 		var statement, timing, event, table string
 		if err := db.QueryRowContext(ctx, `SELECT action_statement, action_timing, event_manipulation, event_object_table
 			FROM information_schema.triggers WHERE trigger_schema = DATABASE() AND trigger_name = ?`, trigger.name).Scan(&statement, &timing, &event, &table); err != nil ||
 			statement != trigger.action || timing != trigger.timing || event != trigger.event || table != trigger.table {
-			return fmt.Errorf("%w: incompatible durable record trigger", ErrUnsupportedSchema)
+			return fmt.Errorf("%w: incompatible adapter trigger", ErrUnsupportedSchema)
 		}
 	}
-	for name, expected := range map[string]string{
-		"rff_finding_kind":     "(`kind` in (_binary\\'timer\\',_binary\\'input\\'))",
-		"rff_finding_locator":  "(`locator` > 0)",
-		"rff_finding_revision": "(`finding_revision` >= 0)",
-		"rff_finding_category": "(((`kind` = _binary\\'timer\\') and (`category` = _binary\\'invalid_timer\\')) or ((`kind` = _binary\\'input\\') and (`category` = _binary\\'invalid_input\\')))",
-		"rff_finding_field":    "(((`kind` = _binary\\'timer\\') and (`field` = _binary\\'record\\')) or ((`kind` = _binary\\'input\\') and (`field` in (_binary\\'record\\',_binary\\'projection\\'))))",
-		"rff_finding_scope":    "((`kind` = _binary\\'input\\') or ((`scope_channel` = _binary\\'\\') and (`finding_revision` = 0)))",
-		"rff_finding_status":   "(((`open_marker` = 0) and (`resolved_at` = _binary\\'\\')) or ((`open_marker` > 0) and (`resolved_at` <> _binary\\'\\')))",
+	type checkConstraint struct {
+		table  string
+		clause string
+	}
+	for name, expected := range map[string]checkConstraint{
+		"rff_timer_deadline_nanoseconds": {table: "rff_timers", clause: "(`deadline_nanoseconds` between 0 and 999999999)"},
+		"rff_timer_completion":           {table: "rff_timers", clause: "(`completed` in (0,1))"},
+		"rff_timer_compatibility":        {table: "rff_timers", clause: "(`compatibility_blocked` in (0,1))"},
+		"rff_timer_lease_pair":           {table: "rff_timers", clause: "(((`lease_expires_seconds` is null) and (`lease_expires_nanoseconds` is null)) or ((`lease_expires_seconds` is not null) and (`lease_expires_nanoseconds` is not null) and (`lease_expires_nanoseconds` between 0 and 999999999)))"},
+		"rff_finding_kind":               {table: "rff_integrity_findings", clause: "(`kind` in (_binary\\'timer\\',_binary\\'hook\\',_binary\\'execution\\',_binary\\'reservation\\',_binary\\'input\\'))"},
+		"rff_finding_locator":            {table: "rff_integrity_findings", clause: "(`locator` > 0)"},
+		"rff_finding_category":           {table: "rff_integrity_findings", clause: "(`category` in (_binary\\'invalid_timer\\',_binary\\'projection_mismatch\\',_binary\\'invalid_execution\\',_binary\\'invalid_reservation\\',_binary\\'invalid_hook\\',_binary\\'invalid_input\\'))"},
+		"rff_finding_field":              {table: "rff_integrity_findings", clause: "(`field` in (_binary\\'record\\',_binary\\'selection\\',_binary\\'active\\',_binary\\'projection\\'))"},
+		"rff_finding_status":             {table: "rff_integrity_findings", clause: "(((`open_marker` = 0) and (`resolved_at` = _binary\\'\\')) or ((`open_marker` > 0) and (`resolved_at` <> _binary\\'\\')))"},
+		"rff_hook_flags":                 {table: "rff_hook_work", clause: "((`started` in (0,1)) and (`completed` in (0,1)) and (`lease_owner_present` in (0,1)))"},
+		"rff_hook_dispatch":              {table: "rff_hook_work", clause: "(`dispatch_kind` in (_binary\\'enter\\',_binary\\'transition\\',_binary\\'retry\\',_binary\\'recover\\'))"},
+		"rff_hook_time":                  {table: "rff_hook_work", clause: "(`available_at_nanoseconds` <= 999999999)"},
+		"rff_hook_lease":                 {table: "rff_hook_work", clause: "(((`lease_owner_present` = 0) and (`lease_expires_at_seconds` is null) and (`lease_expires_at_nanoseconds` is null)) or ((`lease_owner_present` = 1) and (`lease_expires_at_seconds` is not null) and (`lease_expires_at_nanoseconds` is not null) and (`lease_expires_at_nanoseconds` <= 999999999)))"},
+		"rff_finding_revision":           {table: "rff_integrity_findings", clause: "(`finding_revision` >= 0)"},
+		"rff_finding_scope":              {table: "rff_integrity_findings", clause: "((`kind` = _binary\\'input\\') or ((`scope_channel` = _binary\\'\\') and (`finding_revision` = 0)))"},
+		"rff_input_outcome":              {table: "rff_inputs", clause: "(`outcome_present` in (0,1))"},
+		"rff_input_revision_value":       {table: "rff_inputs", clause: "(`revision` > 0)"},
 	} {
 		var clause, enforced string
 		err := db.QueryRowContext(ctx, `SELECT c.check_clause, t.enforced FROM information_schema.check_constraints c
 			JOIN information_schema.table_constraints t ON t.constraint_schema = c.constraint_schema AND t.constraint_name = c.constraint_name
-			WHERE t.table_schema = DATABASE() AND t.table_name = 'rff_integrity_findings' AND t.constraint_name = ?`, name).Scan(&clause, &enforced)
-		if err != nil || clause != expected || enforced != "YES" {
-			return fmt.Errorf("%w: incompatible integrity constraint %s: %q", ErrUnsupportedSchema, name, clause)
+			WHERE t.table_schema = DATABASE() AND t.table_name = ? AND t.constraint_name = ?`, expected.table, name).Scan(&clause, &enforced)
+		if err != nil || clause != expected.clause || enforced != "YES" {
+			return fmt.Errorf("%w: incompatible integrity constraint %s: clause=%q enforced=%q", ErrUnsupportedSchema, name, clause, enforced)
 		}
 	}
-	for name, expected := range map[string]string{
-		"rff_input_outcome":        "(`outcome_present` in (0,1))",
-		"rff_input_revision_value": "(`revision` > 0)",
-	} {
-		var clause, enforced string
-		err := db.QueryRowContext(ctx, `SELECT c.check_clause, t.enforced FROM information_schema.check_constraints c
-			JOIN information_schema.table_constraints t ON t.constraint_schema = c.constraint_schema AND t.constraint_name = c.constraint_name
-			WHERE t.table_schema = DATABASE() AND t.table_name = 'rff_inputs' AND t.constraint_name = ?`, name).Scan(&clause, &enforced)
-		if err != nil || clause != expected || enforced != "YES" {
-			return fmt.Errorf("%w: incompatible input constraint %s: %q", ErrUnsupportedSchema, name, clause)
+	for _, table := range []string{"rff_timers", "rff_executions", "rff_active", "rff_hook_work"} {
+		var revisionDefault sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT column_default FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'revision'`, table).Scan(&revisionDefault); err != nil ||
+			!revisionDefault.Valid || revisionDefault.String != "1" {
+			return fmt.Errorf("%w: incompatible revision default on %s", ErrUnsupportedSchema, table)
 		}
 	}
 	return nil
@@ -451,9 +524,10 @@ func validateMySQLIndexes(ctx context.Context, db schemaReader, timerOnly bool) 
 	expected := map[string]map[string]index{
 		"rff_schema_version": {},
 		"rff_executions": {
-			"PRIMARY":                       {columns: []string{"row_id"}, prefixLengths: []int{0}},
-			"rff_execution_id_lookup":       {columns: []string{"id"}, prefixLengths: []int{0}},
-			"rff_execution_identity_lookup": {columns: []string{"entity", "request_key"}, prefixLengths: []int{256, 256}, nonUnique: true},
+			"PRIMARY":                         {columns: []string{"row_id"}, prefixLengths: []int{0}},
+			"rff_execution_id_lookup":         {columns: []string{"id"}, prefixLengths: []int{0}},
+			"rff_execution_identity_lookup":   {columns: []string{"entity", "request_key"}, prefixLengths: []int{256, 256}, nonUnique: true},
+			"rff_execution_hook_state_lookup": {columns: []string{"selection_status", "selection_compatibility", "id"}, prefixLengths: []int{0, 0, 0}, nonUnique: true},
 		},
 		"rff_active": {
 			"PRIMARY":                     {columns: []string{"row_id"}, prefixLengths: []int{0}},
@@ -461,9 +535,9 @@ func validateMySQLIndexes(ctx context.Context, db schemaReader, timerOnly bool) 
 			"rff_active_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
 		},
 		"rff_transition_leases":  {"rff_lease_entity_lookup": {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_hook_work":          {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}},
+		"rff_hook_work":          {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}, "rff_hook_ready_lookup": {columns: []string{"completed", "started", "available_at_seconds", "available_at_nanoseconds", "execution_id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
 		"rff_notification_work":  {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}},
-		"rff_timers":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}},
+		"rff_timers":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_timer_deadline_lookup": {columns: []string{"completed", "compatibility_blocked", "deadline_seconds", "deadline_nanoseconds", "id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
 		"rff_integrity_findings": {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_open_lookup": {columns: []string{"kind", "locator", "open_marker"}, prefixLengths: []int{0, 0, 0}}, "rff_integrity_open_scope": {columns: []string{"kind", "open_marker", "locator"}, prefixLengths: []int{0, 0, 0}, nonUnique: true}, "rff_integrity_input_channel_lookup": {columns: []string{"kind", "scope_channel", "open_marker"}, prefixLengths: []int{0, 256, 0}, nonUnique: true}},
 		"rff_integrity_audit":    {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_audit_lookup": {columns: []string{"finding_id", "row_id"}, prefixLengths: []int{0, 0}, nonUnique: true}},
 		"rff_inputs":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_input_selection_lookup": {columns: []string{"channel", "outcome_present", "id"}, prefixLengths: []int{256, 0, 0}, nonUnique: true}},

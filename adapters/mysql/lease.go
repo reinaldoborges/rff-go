@@ -47,6 +47,19 @@ func (s *Store[EntityID, StateID]) AcquireTransitionLease(
 	if err != nil {
 		return result, err
 	}
+	if _, err := loadHookExecution(ctx, tx, executionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, transition.ErrStaleLease
+		}
+		var detected hookFindingError
+		if !errors.As(err, &detected) {
+			return result, err
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return result, errors.Join(err, fmt.Errorf("commit execution integrity finding: %w", commitErr))
+		}
+		return result, err
+	}
 	var active string
 	if err := tx.QueryRowContext(ctx, `SELECT execution_id FROM rff_active WHERE entity = ?`, encoded).Scan(&active); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -123,6 +136,19 @@ func (s *Store[EntityID, StateID]) RenewTransitionLease(
 	now := clock()
 	expiry, err := leaseExpiry(now, ttl)
 	if err != nil {
+		return result, err
+	}
+	if _, err := loadHookExecution(ctx, tx, lease.ExecutionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, transition.ErrStaleLease
+		}
+		var detected hookFindingError
+		if !errors.As(err, &detected) {
+			return result, err
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return result, errors.Join(err, fmt.Errorf("commit execution integrity finding: %w", commitErr))
+		}
 		return result, err
 	}
 	var oldExpiry string

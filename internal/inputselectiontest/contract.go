@@ -212,6 +212,30 @@ func CheckHiddenProjectionCorruptionMayOmitInput(t *testing.T, store Store, db *
 	}
 }
 
+// CheckFindingCoexistence verifies input repair alongside prior hook findings.
+func CheckFindingCoexistence(t *testing.T, store Store, db *sql.DB, maintenance Maintenance) {
+	t.Helper()
+	ctx := context.Background()
+	seedInput(t, store, "coexist-input", "actual")
+	if _, err := db.ExecContext(ctx, `UPDATE rff_inputs SET channel = ? WHERE id = ?`, []byte("wrong"), "coexist-input"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PendingInputIDs(ctx, "wrong"); !errors.Is(err, transition.ErrIntegrity) {
+		t.Fatalf("input projection corruption: %v", err)
+	}
+	findings, err := maintenance.Findings(ctx, "operator", "inspect mixed findings")
+	if err != nil || len(findings) != 2 || findings[0].Kind != "hook" || findings[1].Kind != "input" || findings[1].Revision <= 0 {
+		t.Fatalf("mixed findings: %+v, %v", findings, err)
+	}
+	if err := maintenance.Resolve(ctx, "operator", "repair input", findings[1]); err != nil {
+		t.Fatalf("repair input alongside hook finding: %v", err)
+	}
+	got, err := store.PendingInputIDs(ctx, "actual")
+	if err != nil || !reflect.DeepEqual(got, []string{"coexist-input"}) {
+		t.Fatalf("input after mixed repair: %q, %v", got, err)
+	}
+}
+
 func CheckUnknownChannelQuarantine(t *testing.T, store Store, db *sql.DB, open OpenMaintenance) {
 	t.Helper()
 	ctx := context.Background()

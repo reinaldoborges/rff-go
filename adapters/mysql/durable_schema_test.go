@@ -20,6 +20,9 @@ func TestDurableIdentityKeysEnforceFullByteUniqueness(t *testing.T) {
 		for _, id := range []string{first, second, "Case", "case", "x\x00a", "x\x00b", "é", "e\u0301"} {
 			query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
 			args := []any{id, []byte("{}")}
+			if table == "rff_timers" {
+				query = "INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record) VALUES (?, 0, 0, 0, 0, ?)"
+			}
 			if table == "rff_inputs" {
 				query = "INSERT INTO rff_inputs (id, record, channel, outcome_present) VALUES (?, ?, ?, 0)"
 				args = []any{id, []byte("{}"), []byte{}}
@@ -30,6 +33,9 @@ func TestDurableIdentityKeysEnforceFullByteUniqueness(t *testing.T) {
 		}
 		query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
 		args := []any{first, []byte("{}")}
+		if table == "rff_timers" {
+			query = "INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record) VALUES (?, 0, 0, 0, 0, ?)"
+		}
 		if table == "rff_inputs" {
 			query = "INSERT INTO rff_inputs (id, record, channel, outcome_present) VALUES (?, ?, ?, 0)"
 			args = []any{first, []byte("{}"), []byte{}}

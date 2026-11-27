@@ -260,7 +260,13 @@ func (s *Store[EntityID, StateID]) acceptAtomic(
 	if err != nil {
 		return result, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_executions (id, entity, request_key, record) VALUES (?, ?, ?, ?)`, next.ID, encodedEntity, key, encoded); err != nil {
+	compatibility := 0
+	if next.Compatibility != nil {
+		compatibility = 1
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_executions
+		(id, entity, request_key, record, selection_status, selection_compatibility)
+		VALUES (?, ?, ?, ?, ?, ?)`, next.ID, encodedEntity, key, encoded, next.Status, compatibility); err != nil {
 		return result, false, fmt.Errorf("insert execution: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_active (entity, execution_id) VALUES (?, ?)`, encodedEntity, next.ID); err != nil {

@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -215,7 +216,10 @@ func validateWork(executionID string, work hookWork) error {
 }
 
 func validateHookWork(ctx context.Context, tx *sql.Tx) (err error) {
-	rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.id FROM rff_hook_work AS w
+	rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.id,
+		w.dispatch_kind, w.started, w.completed, w.available_at_seconds, w.available_at_nanoseconds,
+		w.lease_owner_present, w.lease_expires_at_seconds, w.lease_expires_at_nanoseconds, w.row_id, w.revision
+		FROM rff_hook_work AS w
 		LEFT JOIN rff_executions AS e ON e.id = w.execution_id`)
 	if err != nil {
 		return fmt.Errorf("%w: read hook work: %w", ErrUnsupportedSchema, err)
@@ -229,8 +233,14 @@ func validateHookWork(ctx context.Context, tx *sql.Tx) (err error) {
 		var id string
 		var data []byte
 		var linked sql.NullString
-		if err := rows.Scan(&id, &data, &linked); err != nil {
+		var projection hookSelectionProjection
+		if err := rows.Scan(&id, &data, &linked, &projection.dispatchKind, &projection.started, &projection.completed,
+			&projection.availableSeconds, &projection.availableNanoseconds, &projection.leaseOwnerPresent,
+			&projection.leaseExpiresSeconds, &projection.leaseExpiresNanoseconds, &projection.locator, &projection.revision); err != nil {
 			return fmt.Errorf("%w: read hook work: %w", ErrUnsupportedSchema, err)
+		}
+		if projection.locator <= 0 || projection.revision <= 0 {
+			return fmt.Errorf("%w: invalid hook locator or revision", ErrUnsupportedSchema)
 		}
 		var work hookWork
 		if err := json.Unmarshal(data, &work); err != nil {
@@ -241,6 +251,9 @@ func validateHookWork(ctx context.Context, tx *sql.Tx) (err error) {
 		}
 		if err := validateWork(id, work); err != nil {
 			return err
+		}
+		if !projection.matches(work) {
+			return fmt.Errorf("%w: inconsistent hook selection projection", ErrUnsupportedSchema)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -259,18 +272,28 @@ func (s *Store[EntityID, StateID]) hookTransaction(ctx context.Context, fn func(
 			err = errors.Join(err, fmt.Errorf("rollback hook transaction: %w", rollbackErr))
 		}
 	}()
-	if err := fn(tx); err != nil {
-		return err
+	result := fn(tx)
+	var detected hookFindingError
+	if result != nil && !errors.As(result, &detected) {
+		return result
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit hook transaction: %w", err)
 	}
-	return nil
+	return result
 }
 
 func loadHook(ctx context.Context, tx *sql.Tx, id string) (hookWork, error) {
 	var data []byte
-	err := tx.QueryRowContext(ctx, `SELECT work FROM rff_hook_work WHERE execution_id = ?`, id).Scan(&data)
+	var projection hookSelectionProjection
+	err := tx.QueryRowContext(ctx, `SELECT row_id, revision, work, dispatch_kind, started, completed,
+		available_at_seconds, available_at_nanoseconds, lease_owner_present,
+		lease_expires_at_seconds, lease_expires_at_nanoseconds
+		FROM rff_hook_work WHERE execution_id = ? FOR UPDATE`, id).Scan(
+		&projection.locator, &projection.revision, &data, &projection.dispatchKind, &projection.started,
+		&projection.completed, &projection.availableSeconds, &projection.availableNanoseconds,
+		&projection.leaseOwnerPresent, &projection.leaseExpiresSeconds, &projection.leaseExpiresNanoseconds,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return hookWork{}, transition.ErrNoHookActivity
 	}
@@ -279,9 +302,26 @@ func loadHook(ctx context.Context, tx *sql.Tx, id string) (hookWork, error) {
 	}
 	var work hookWork
 	if err := json.Unmarshal(data, &work); err != nil {
-		return work, fmt.Errorf("%w: decode hook work: %w", ErrUnsupportedSchema, err)
+		return work, errors.Join(fmt.Errorf("%w: decode hook work: %w", ErrUnsupportedSchema, err),
+			recordHookFinding(ctx, tx, projection.locator, "invalid_hook", "record"))
 	}
 	if err := validateWork(id, work); err != nil {
+		return work, errors.Join(err, recordHookFinding(ctx, tx, projection.locator, "invalid_hook", "record"))
+	}
+	if projection.locator <= 0 || projection.revision <= 0 {
+		return work, fmt.Errorf("%w: invalid hook locator or revision", ErrUnsupportedSchema)
+	}
+	quarantined, err := hookQuarantined(ctx, tx, projection.locator)
+	if err != nil {
+		return work, fmt.Errorf("check hook quarantine: %w", err)
+	}
+	if quarantined {
+		return work, transition.ErrIntegrity
+	}
+	if !projection.matches(work) {
+		return work, recordHookFinding(ctx, tx, projection.locator, "projection_mismatch", "selection")
+	}
+	if _, err := loadHookExecution(ctx, tx, id); err != nil {
 		return work, err
 	}
 	return work, nil
@@ -295,19 +335,119 @@ func saveHook(ctx context.Context, tx *sql.Tx, id string, work hookWork) error {
 	if err != nil {
 		return fmt.Errorf("encode hook work: %w", err)
 	}
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_hook_work WHERE execution_id = ?)`, id).Scan(&exists); err != nil {
-		return fmt.Errorf("check hook work: %w", err)
-	}
-	if exists {
-		_, err = tx.ExecContext(ctx, `UPDATE rff_hook_work SET work = ? WHERE execution_id = ?`, data, id)
-	} else {
-		_, err = tx.ExecContext(ctx, `INSERT INTO rff_hook_work (execution_id, work) VALUES (?, ?)`, id, data)
-	}
+	projection := projectHookSelection(work)
+	_, err = tx.ExecContext(ctx, `INSERT INTO rff_hook_work (
+		execution_id, work, dispatch_kind, started, completed, available_at_seconds, available_at_nanoseconds,
+		lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON DUPLICATE KEY UPDATE work = VALUES(work), dispatch_kind = VALUES(dispatch_kind),
+		started = VALUES(started), completed = VALUES(completed),
+		available_at_seconds = VALUES(available_at_seconds),
+		available_at_nanoseconds = VALUES(available_at_nanoseconds),
+		lease_owner_present = VALUES(lease_owner_present),
+		lease_expires_at_seconds = VALUES(lease_expires_at_seconds),
+		lease_expires_at_nanoseconds = VALUES(lease_expires_at_nanoseconds)`,
+		id, data, projection.dispatchKind, projection.started, projection.completed,
+		projection.availableSeconds, projection.availableNanoseconds, projection.leaseOwnerPresent,
+		projection.leaseExpiresSeconds, projection.leaseExpiresNanoseconds)
 	if err != nil {
 		return fmt.Errorf("write hook work: %w", err)
 	}
 	return nil
+}
+
+type hookSelectionProjection struct {
+	locator                 int64
+	revision                int64
+	dispatchKind            string
+	started                 bool
+	completed               bool
+	availableSeconds        int64
+	availableNanoseconds    int64
+	leaseOwnerPresent       bool
+	leaseExpiresSeconds     sql.NullInt64
+	leaseExpiresNanoseconds sql.NullInt64
+}
+
+func projectHookSelection(work hookWork) hookSelectionProjection {
+	projection := hookSelectionProjection{
+		dispatchKind:         string(work.Progress.Dispatch.Kind),
+		started:              work.Started,
+		completed:            work.Progress.Completed,
+		availableSeconds:     work.Progress.AvailableAt.Unix(),
+		availableNanoseconds: int64(work.Progress.AvailableAt.Nanosecond()),
+		leaseOwnerPresent:    work.Owner != "",
+	}
+	if projection.leaseOwnerPresent {
+		projection.leaseExpiresSeconds = sql.NullInt64{Int64: work.ExpiresAt.Unix(), Valid: true}
+		projection.leaseExpiresNanoseconds = sql.NullInt64{Int64: int64(work.ExpiresAt.Nanosecond()), Valid: true}
+	}
+	return projection
+}
+
+func (projection hookSelectionProjection) matches(work hookWork) bool {
+	expected := projectHookSelection(work)
+	return projection.dispatchKind == expected.dispatchKind &&
+		projection.started == expected.started &&
+		projection.completed == expected.completed &&
+		projection.availableSeconds == expected.availableSeconds &&
+		projection.availableNanoseconds == expected.availableNanoseconds &&
+		projection.leaseOwnerPresent == expected.leaseOwnerPresent &&
+		projection.leaseExpiresSeconds == expected.leaseExpiresSeconds &&
+		projection.leaseExpiresNanoseconds == expected.leaseExpiresNanoseconds
+}
+
+func loadHookExecution(ctx context.Context, tx *sql.Tx, id string) (diskRecord, error) {
+	var execution diskRecord
+	var rowID, revision int64
+	var reservationID sql.NullInt64
+	var data, entity, reservationEntity []byte
+	var status string
+	var compatibility int
+	err := tx.QueryRowContext(ctx, `SELECT e.row_id, e.revision, e.record, e.selection_status, e.selection_compatibility,
+		e.entity, a.row_id, a.entity FROM rff_executions e
+		LEFT JOIN rff_active a ON a.execution_id = e.id WHERE e.id = ? FOR UPDATE`, id).Scan(
+		&rowID, &revision, &data, &status, &compatibility, &entity, &reservationID, &reservationEntity,
+	)
+	if err != nil {
+		return execution, fmt.Errorf("read hook execution: %w", err)
+	}
+	if rowID <= 0 || revision <= 0 {
+		return execution, fmt.Errorf("%w: invalid hook execution locator or revision", ErrUnsupportedSchema)
+	}
+	quarantined, err := executionQuarantined(ctx, tx, rowID)
+	if err != nil {
+		return execution, fmt.Errorf("check execution quarantine: %w", err)
+	}
+	if quarantined {
+		return execution, transition.ErrIntegrity
+	}
+	if err := json.Unmarshal(data, &execution); err != nil ||
+		!transition.SupportedExecutionSchema(execution.SchemaVersion) || execution.ID != id {
+		return execution, errors.Join(err, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record"))
+	}
+	if !bytes.Equal(entity, execution.Entity) {
+		return execution, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+	}
+	if status != string(execution.Status) || (compatibility == 1) != (execution.Compatibility != nil) ||
+		compatibility < 0 || compatibility > 1 {
+		return execution, recordExecutionFinding(ctx, tx, id, "projection_mismatch", "selection")
+	}
+	if reservationID.Valid {
+		quarantined, err := reservationQuarantined(ctx, tx, reservationID.Int64)
+		if err != nil {
+			return execution, fmt.Errorf("check reservation quarantine: %w", err)
+		}
+		if quarantined {
+			return execution, transition.ErrIntegrity
+		}
+		if !bytes.Equal(entity, reservationEntity) {
+			return execution, recordReservationFinding(ctx, tx, reservationID.Int64)
+		}
+	} else if execution.Status != transition.Complete && execution.Status != transition.Aborted {
+		return execution, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+	}
+	return execution, nil
 }
 
 func validHookLease(ctx context.Context, tx *sql.Tx, lease transition.HookLease, work hookWork, now time.Time) error {
@@ -358,6 +498,9 @@ func (s *Store[EntityID, StateID]) validTransitionFence(ctx context.Context, tx 
 	}
 	if !now.Before(expires) {
 		return transition.ErrStaleLease
+	}
+	if _, err := loadHookExecution(ctx, tx, lease.ExecutionID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -773,11 +916,7 @@ func (s *Store[EntityID, StateID]) MarkWorkSuccess(ctx context.Context, lease tr
 		sum := sha256.Sum256([]byte("rff-commit:" + lease.ExecutionID))
 		operationID = "rff-commit:" + hex.EncodeToString(sum[:])
 		execution.CommitOperationID = operationID
-		data, err = json.Marshal(execution)
-		if err != nil {
-			return fmt.Errorf("encode successful execution: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE rff_executions SET record = ? WHERE id = ?`, data, lease.ExecutionID); err != nil {
+		if err := saveExecution(ctx, tx, lease.ExecutionID, execution); err != nil {
 			return fmt.Errorf("record successful work: %w", err)
 		}
 		return nil

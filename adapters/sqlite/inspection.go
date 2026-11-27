@@ -49,6 +49,9 @@ func (s *Store[EntityID, StateID]) InspectExecution(ctx context.Context, id stri
 		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || !transition.SupportedExecutionSchema(record.SchemaVersion) {
 			return fmt.Errorf("%w: invalid inspected execution", ErrUnsupportedSchema)
 		}
+		if _, err := loadHookExecution(ctx, tx, id); err != nil {
+			return err
+		}
 		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
 			return fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
 		}

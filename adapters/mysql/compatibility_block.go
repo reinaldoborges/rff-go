@@ -16,22 +16,22 @@ import (
 
 // ReadCompatibility inspects a diagnostic without decoding application state.
 func (s *Store[EntityID, StateID]) ReadCompatibility(ctx context.Context, id string) (*transition.CompatibilityDiagnostic, error) {
-	var data []byte
-	err := s.db.QueryRowContext(ctx, `SELECT record FROM rff_executions WHERE id = ?`, id).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, transition.ErrExecutionNotActive
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read compatibility diagnostic: %w", err)
-	}
-	var record diskRecord
-	if err := json.Unmarshal(data, &record); err != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.ID != id {
-		return nil, fmt.Errorf("%w: invalid compatibility execution", ErrUnsupportedSchema)
-	}
-	if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
-		return nil, fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
-	}
-	return record.Compatibility, nil
+	var result *transition.CompatibilityDiagnostic
+	err := s.hookTransaction(ctx, func(tx *sql.Tx) error {
+		record, err := loadHookExecution(ctx, tx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return transition.ErrExecutionNotActive
+		}
+		if err != nil {
+			return err
+		}
+		if record.Compatibility != nil && !validDiagnostic(record, *record.Compatibility) {
+			return fmt.Errorf("%w: invalid compatibility diagnostic", ErrUnsupportedSchema)
+		}
+		result = record.Compatibility
+		return nil
+	})
+	return result, err
 }
 
 // BlockUnreadableExecution records a decode failure without requiring decoded IDs.
@@ -48,6 +48,9 @@ func (s *Store[EntityID, StateID]) BlockUnreadableExecution(ctx context.Context,
 		}
 		if err != nil {
 			return fmt.Errorf("read unreadable execution: %w", err)
+		}
+		if _, err := loadHookExecution(ctx, tx, id); err != nil {
+			return err
 		}
 		var record diskRecord
 		if err := json.Unmarshal(data, &record); err != nil || record.ID != id || !transition.SupportedExecutionSchema(record.SchemaVersion) {
