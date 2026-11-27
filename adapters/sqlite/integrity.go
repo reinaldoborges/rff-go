@@ -56,6 +56,7 @@ func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) erro
 		"rff_integrity_open_lookup": integrityIndexDDL, "rff_integrity_history_lookup": integrityHistoryIndexDDL,
 		"rff_integrity_input_channel_lookup": integrityChannelIndexDDL,
 		"rff_integrity_audit":                integrityAuditDDL, "rff_integrity_audit_lookup": integrityAuditIndexDDL,
+		"rff_integrity_sweep_state": integritySweepStateDDL, "rff_integrity_sweep_progress": integritySweepProgressDDL,
 	}
 	if full {
 		for name, ddl := range map[string]string{

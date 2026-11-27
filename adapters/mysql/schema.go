@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const adapterSchemaVersion = 9
+const adapterSchemaVersion = 10
 
 const (
 	schemaVersionDDL = `CREATE TABLE rff_schema_version (
@@ -154,6 +154,21 @@ const (
 		occurred_at VARBINARY(64) NOT NULL,
 		KEY rff_integrity_audit_lookup (finding_id, row_id)
 	) ENGINE=InnoDB`
+	integritySweepStateDDL = `CREATE TABLE IF NOT EXISTS rff_integrity_sweep_state (
+		id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+		sweep_id BIGINT UNSIGNED NOT NULL,
+		started_at VARBINARY(64) NOT NULL,
+		updated_at VARBINARY(64) NOT NULL,
+		complete TINYINT UNSIGNED NOT NULL,
+		healthy TINYINT UNSIGNED NOT NULL,
+		incomplete TINYINT UNSIGNED NOT NULL
+	) ENGINE=InnoDB`
+	integritySweepProgressDDL = `CREATE TABLE IF NOT EXISTS rff_integrity_sweep_progress (
+		kind VARBINARY(16) NOT NULL PRIMARY KEY,
+		high_water_mark BIGINT UNSIGNED NOT NULL,
+		inspected_through BIGINT UNSIGNED NOT NULL,
+		inspected BIGINT UNSIGNED NOT NULL
+	) ENGINE=InnoDB`
 	inputsDDL = `CREATE TABLE rff_inputs (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		id VARBINARY(256) NOT NULL,
@@ -204,6 +219,8 @@ var adapterTables = []string{
 	"rff_timers",
 	"rff_integrity_findings",
 	"rff_integrity_audit",
+	"rff_integrity_sweep_state",
+	"rff_integrity_sweep_progress",
 	"rff_inputs",
 	"rff_continuations",
 	"rff_successors",
@@ -261,6 +278,8 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			timerRevisionDDL,
 			integrityFindingsDDL,
 			integrityAuditDDL,
+			integritySweepStateDDL,
+			integritySweepProgressDDL,
 			executionAllocationDDL,
 			activeAllocationDDL,
 			hookAllocationDDL,
@@ -287,7 +306,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	} else {
 		for _, name := range adapterTables {
-			if !existing[name] {
+			if !existing[name] && name != "rff_integrity_sweep_state" && name != "rff_integrity_sweep_progress" {
 				return fmt.Errorf("%w: adapter table %s is missing", ErrUnsupportedSchema, name)
 			}
 		}
@@ -306,8 +325,29 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 			return fmt.Errorf("%w: read adapter version: %w", ErrUnsupportedSchema, err)
 		}
-		if count != 1 || version != adapterSchemaVersion {
+		if count != 1 {
 			return fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, version)
+		}
+		if version == adapterSchemaVersion-1 {
+			for _, statement := range []string{integritySweepStateDDL, integritySweepProgressDDL} {
+				if _, err := s.db.ExecContext(ctx, statement); err != nil {
+					return fmt.Errorf("migrate MySQL integrity sweep tables: %w", err)
+				}
+			}
+			existing["rff_integrity_sweep_state"] = true
+			existing["rff_integrity_sweep_progress"] = true
+			if _, err := s.db.ExecContext(ctx, `UPDATE rff_schema_version SET version = ?`, adapterSchemaVersion); err != nil {
+				return fmt.Errorf("update MySQL adapter version: %w", err)
+			}
+			version = adapterSchemaVersion
+		}
+		if version != adapterSchemaVersion {
+			return fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, version)
+		}
+		for _, name := range adapterTables {
+			if !existing[name] {
+				return fmt.Errorf("%w: adapter table %s is missing", ErrUnsupportedSchema, name)
+			}
 		}
 	}
 
@@ -382,20 +422,22 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 		columnType string
 	}
 	expected := map[string][]column{
-		"rff_schema_version":     {{"version", "tinyint unsigned"}},
-		"rff_executions":         {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}, {"selection_status", "varbinary(32)"}, {"selection_compatibility", "tinyint unsigned"}, {"revision", "bigint"}},
-		"rff_active":             {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"revision", "bigint"}},
-		"rff_transition_leases":  {{"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
-		"rff_hook_work":          {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"dispatch_kind", "varbinary(16)"}, {"started", "tinyint unsigned"}, {"completed", "tinyint unsigned"}, {"available_at_seconds", "bigint"}, {"available_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
-		"rff_notification_work":  {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"completed", "tinyint unsigned"}, {"due_at_seconds", "bigint"}, {"due_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
-		"rff_timers":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"deadline_seconds", "bigint"}, {"deadline_nanoseconds", "int"}, {"completed", "tinyint"}, {"compatibility_blocked", "tinyint"}, {"lease_expires_seconds", "bigint"}, {"lease_expires_nanoseconds", "int"}, {"record", "longblob"}, {"revision", "bigint"}},
-		"rff_integrity_findings": {{"row_id", "bigint unsigned"}, {"kind", "varbinary(16)"}, {"locator", "bigint unsigned"}, {"finding_revision", "bigint"}, {"category", "varbinary(32)"}, {"field", "varbinary(32)"}, {"scope_channel", "longblob"}, {"detected_at", "varbinary(64)"}, {"resolved_at", "varbinary(64)"}, {"open_marker", "bigint unsigned"}},
-		"rff_integrity_audit":    {{"row_id", "bigint unsigned"}, {"finding_id", "bigint unsigned"}, {"revision", "bigint"}, {"action", "varbinary(32)"}, {"actor", "longblob"}, {"reason", "longblob"}, {"occurred_at", "varbinary(64)"}},
-		"rff_inputs":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}, {"channel", "longblob"}, {"outcome_present", "tinyint unsigned"}, {"revision", "bigint"}},
-		"rff_continuations":      {{"digest", "binary(32)"}, {"record", "longblob"}},
-		"rff_successors":         {{"digest", "binary(32)"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"phase", "varbinary(16)"}, {"record", "longblob"}},
-		"rff_operations":         {{"execution_id", "varbinary(256)"}, {"operation_key", "longblob"}, {"record", "longblob"}},
-		"rff_transaction_lock":   {{"id", "tinyint unsigned"}},
+		"rff_schema_version":           {{"version", "tinyint unsigned"}},
+		"rff_executions":               {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}, {"selection_status", "varbinary(32)"}, {"selection_compatibility", "tinyint unsigned"}, {"revision", "bigint"}},
+		"rff_active":                   {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"revision", "bigint"}},
+		"rff_transition_leases":        {{"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
+		"rff_hook_work":                {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"dispatch_kind", "varbinary(16)"}, {"started", "tinyint unsigned"}, {"completed", "tinyint unsigned"}, {"available_at_seconds", "bigint"}, {"available_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
+		"rff_notification_work":        {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"completed", "tinyint unsigned"}, {"due_at_seconds", "bigint"}, {"due_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
+		"rff_timers":                   {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"deadline_seconds", "bigint"}, {"deadline_nanoseconds", "int"}, {"completed", "tinyint"}, {"compatibility_blocked", "tinyint"}, {"lease_expires_seconds", "bigint"}, {"lease_expires_nanoseconds", "int"}, {"record", "longblob"}, {"revision", "bigint"}},
+		"rff_integrity_findings":       {{"row_id", "bigint unsigned"}, {"kind", "varbinary(16)"}, {"locator", "bigint unsigned"}, {"finding_revision", "bigint"}, {"category", "varbinary(32)"}, {"field", "varbinary(32)"}, {"scope_channel", "longblob"}, {"detected_at", "varbinary(64)"}, {"resolved_at", "varbinary(64)"}, {"open_marker", "bigint unsigned"}},
+		"rff_integrity_audit":          {{"row_id", "bigint unsigned"}, {"finding_id", "bigint unsigned"}, {"revision", "bigint"}, {"action", "varbinary(32)"}, {"actor", "longblob"}, {"reason", "longblob"}, {"occurred_at", "varbinary(64)"}},
+		"rff_integrity_sweep_state":    {{"id", "tinyint unsigned"}, {"sweep_id", "bigint unsigned"}, {"started_at", "varbinary(64)"}, {"updated_at", "varbinary(64)"}, {"complete", "tinyint unsigned"}, {"healthy", "tinyint unsigned"}, {"incomplete", "tinyint unsigned"}},
+		"rff_integrity_sweep_progress": {{"kind", "varbinary(16)"}, {"high_water_mark", "bigint unsigned"}, {"inspected_through", "bigint unsigned"}, {"inspected", "bigint unsigned"}},
+		"rff_inputs":                   {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}, {"channel", "longblob"}, {"outcome_present", "tinyint unsigned"}, {"revision", "bigint"}},
+		"rff_continuations":            {{"digest", "binary(32)"}, {"record", "longblob"}},
+		"rff_successors":               {{"digest", "binary(32)"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"phase", "varbinary(16)"}, {"record", "longblob"}},
+		"rff_operations":               {{"execution_id", "varbinary(256)"}, {"operation_key", "longblob"}, {"record", "longblob"}},
+		"rff_transaction_lock":         {{"id", "tinyint unsigned"}},
 	}
 	for table, wanted := range expected {
 		if timerOnly && !timerIntegrityTable(table) {
@@ -565,11 +607,13 @@ func validateMySQLIndexes(ctx context.Context, db schemaReader, timerOnly bool) 
 			"rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
 			"rff_notification_ready_lookup":     {columns: []string{"completed", "execution_id", "due_at_seconds", "due_at_nanoseconds", "lease_owner_present", "lease_expires_at_seconds", "lease_expires_at_nanoseconds"}, prefixLengths: []int{0, 0, 0, 0, 0, 0, 0}, nonUnique: true},
 		},
-		"rff_timers":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_timer_deadline_lookup": {columns: []string{"completed", "compatibility_blocked", "deadline_seconds", "deadline_nanoseconds", "id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
-		"rff_integrity_findings": {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_open_lookup": {columns: []string{"kind", "locator", "open_marker"}, prefixLengths: []int{0, 0, 0}}, "rff_integrity_open_scope": {columns: []string{"kind", "open_marker", "locator"}, prefixLengths: []int{0, 0, 0}, nonUnique: true}, "rff_integrity_input_channel_lookup": {columns: []string{"kind", "scope_channel", "open_marker"}, prefixLengths: []int{0, 256, 0}, nonUnique: true}},
-		"rff_integrity_audit":    {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_audit_lookup": {columns: []string{"finding_id", "row_id"}, prefixLengths: []int{0, 0}, nonUnique: true}},
-		"rff_inputs":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_input_selection_lookup": {columns: []string{"channel", "outcome_present", "id"}, prefixLengths: []int{256, 0, 0}, nonUnique: true}},
-		"rff_continuations":      {"PRIMARY": {columns: []string{"digest"}, prefixLengths: []int{0}}},
+		"rff_timers":                   {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_timer_deadline_lookup": {columns: []string{"completed", "compatibility_blocked", "deadline_seconds", "deadline_nanoseconds", "id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
+		"rff_integrity_findings":       {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_open_lookup": {columns: []string{"kind", "locator", "open_marker"}, prefixLengths: []int{0, 0, 0}}, "rff_integrity_open_scope": {columns: []string{"kind", "open_marker", "locator"}, prefixLengths: []int{0, 0, 0}, nonUnique: true}, "rff_integrity_input_channel_lookup": {columns: []string{"kind", "scope_channel", "open_marker"}, prefixLengths: []int{0, 256, 0}, nonUnique: true}},
+		"rff_integrity_audit":          {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_audit_lookup": {columns: []string{"finding_id", "row_id"}, prefixLengths: []int{0, 0}, nonUnique: true}},
+		"rff_integrity_sweep_state":    {"PRIMARY": {columns: []string{"id"}, prefixLengths: []int{0}}},
+		"rff_integrity_sweep_progress": {"PRIMARY": {columns: []string{"kind"}, prefixLengths: []int{0}}},
+		"rff_inputs":                   {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_input_selection_lookup": {columns: []string{"channel", "outcome_present", "id"}, prefixLengths: []int{256, 0, 0}, nonUnique: true}},
+		"rff_continuations":            {"PRIMARY": {columns: []string{"digest"}, prefixLengths: []int{0}}},
 		"rff_successors": {
 			"PRIMARY":                        {columns: []string{"digest"}, prefixLengths: []int{0}},
 			"rff_successor_entity_lookup":    {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true},

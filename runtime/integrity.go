@@ -46,3 +46,25 @@ type IntegrityAudit struct {
 	Reason     string
 	OccurredAt time.Time
 }
+
+// IntegritySweepCoverage reports only records visited within the sweep's
+// fixed high-water mark. It does not imply a snapshot or discovery guarantee.
+type IntegritySweepCoverage struct {
+	Kind             string
+	HighWaterMark    int64
+	InspectedThrough int64
+	Inspected        int64
+}
+
+// IntegritySweepProgress is the durable state of one bounded sweep. Complete
+// means all captured high-water marks were reached; Incomplete means at least
+// one inspected record could not be fully checked for compatible behavior.
+type IntegritySweepProgress struct {
+	SweepID    int64
+	StartedAt  time.Time
+	UpdatedAt  time.Time
+	Complete   bool
+	Healthy    bool
+	Incomplete bool
+	Coverage   []IntegritySweepCoverage
+}

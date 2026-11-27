@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 17
+	adapterSchemaVersion = 18
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, selection_status TEXT NOT NULL DEFAULT 'Waiting', selection_compatibility INTEGER NOT NULL DEFAULT 0 CHECK(selection_compatibility IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0), UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (row_id INTEGER PRIMARY KEY AUTOINCREMENT, entity BLOB NOT NULL UNIQUE, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
@@ -79,6 +79,8 @@ const (
 	integrityAuditDDL            = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
 	integrityAuditIndexDDL       = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
 	inputsDDL                    = `CREATE TABLE rff_inputs (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, channel BLOB NOT NULL, outcome_present INTEGER NOT NULL CHECK(outcome_present IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
+	integritySweepStateDDL       = `CREATE TABLE rff_integrity_sweep_state (id INTEGER PRIMARY KEY CHECK(id = 1), sweep_id INTEGER NOT NULL CHECK(sweep_id > 0), started_at TEXT NOT NULL, updated_at TEXT NOT NULL, complete INTEGER NOT NULL CHECK(complete IN (0, 1)), healthy INTEGER NOT NULL CHECK(healthy IN (0, 1)), incomplete INTEGER NOT NULL CHECK(incomplete IN (0, 1)))`
+	integritySweepProgressDDL    = `CREATE TABLE rff_integrity_sweep_progress (kind TEXT PRIMARY KEY CHECK(kind IN ('execution', 'reservation', 'timer', 'hook', 'notification', 'input')), high_water_mark INTEGER NOT NULL CHECK(high_water_mark >= 0), inspected_through INTEGER NOT NULL CHECK(inspected_through >= 0 AND inspected_through <= high_water_mark), inspected INTEGER NOT NULL CHECK(inspected >= 0))`
 	continuationsDDL             = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
 	successorsDDL                = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
 	operationsDDL                = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
@@ -101,28 +103,30 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, successorsExist, operationsExist, findingsExist, auditExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, successorsExist, operationsExist, findingsExist, auditExist, sweepStateExists, sweepProgressExists bool
 	for name, exists := range map[string]*bool{
-		"rff_schema_version":     &schemaExists,
-		"rff_executions":         &recordsExist,
-		"rff_active":             &activeExists,
-		"rff_transition_leases":  &leasesExist,
-		"rff_hook_work":          &hookWorkExists,
-		"rff_notification_work":  &notificationWorkExists,
-		"rff_timers":             &timersExist,
-		"rff_inputs":             &inputsExist,
-		"rff_continuations":      &continuationsExist,
-		"rff_successors":         &successorsExist,
-		"rff_operations":         &operationsExist,
-		"rff_integrity_findings": &findingsExist,
-		"rff_integrity_audit":    &auditExist,
+		"rff_schema_version":           &schemaExists,
+		"rff_executions":               &recordsExist,
+		"rff_active":                   &activeExists,
+		"rff_transition_leases":        &leasesExist,
+		"rff_hook_work":                &hookWorkExists,
+		"rff_notification_work":        &notificationWorkExists,
+		"rff_timers":                   &timersExist,
+		"rff_inputs":                   &inputsExist,
+		"rff_continuations":            &continuationsExist,
+		"rff_successors":               &successorsExist,
+		"rff_operations":               &operationsExist,
+		"rff_integrity_findings":       &findingsExist,
+		"rff_integrity_audit":          &auditExist,
+		"rff_integrity_sweep_state":    &sweepStateExists,
+		"rff_integrity_sweep_progress": &sweepProgressExists,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || successorsExist || operationsExist || findingsExist || auditExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || successorsExist || operationsExist || findingsExist || auditExist || sweepStateExists || sweepProgressExists {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
@@ -162,6 +166,8 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			notificationReadyIndexDDL,
 			integrityAuditDDL,
 			integrityAuditIndexDDL,
+			integritySweepStateDDL,
+			integritySweepProgressDDL,
 			timerLocatorDDL,
 			timerAllocationDDL,
 			inputsDDL,
@@ -226,7 +232,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		if count != 1 {
 			return fmt.Errorf("%w: expected one adapter version", ErrUnsupportedSchema)
 		}
-		if schemaVersion != adapterSchemaVersion {
+		if schemaVersion > adapterSchemaVersion {
 			return fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, schemaVersion)
 		}
 		if err := validateRecords(ctx, tx); err != nil {
@@ -408,6 +414,20 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		if schemaVersion < adapterSchemaVersion {
 			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 12`); err != nil {
+				return fmt.Errorf("update adapter version: %w", err)
+			}
+		}
+		if schemaVersion < 18 {
+			if sweepStateExists || sweepProgressExists {
+				return fmt.Errorf("%w: unexpected integrity sweep tables", ErrUnsupportedSchema)
+			}
+			if _, err := tx.ExecContext(ctx, integritySweepStateDDL); err != nil {
+				return fmt.Errorf("create integrity sweep state: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, integritySweepProgressDDL); err != nil {
+				return fmt.Errorf("create integrity sweep progress: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE rff_schema_version SET version = 18`); err != nil {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}
