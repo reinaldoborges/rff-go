@@ -324,6 +324,9 @@ func validHookLease(ctx context.Context, tx *sql.Tx, lease transition.HookLease,
 }
 
 func (s *Store[EntityID, StateID]) validTransitionFence(ctx context.Context, tx *sql.Tx, lease transition.TransitionLease[EntityID], now time.Time) error {
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return errors.Join(err, transition.ErrStaleLease)
+	}
 	entity, err := s.encodeEntity(lease.Entity)
 	if err != nil {
 		return err

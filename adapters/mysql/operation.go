@@ -589,6 +589,9 @@ func (s *Store[EntityID, StateID]) ReplayOperationResolution(
 	requestID, principal, reason string,
 	assessment transition.OperationAssessment,
 ) (transition.OperationInspection, bool, error) {
+	if err := transition.ValidateDurableID(identity.ExecutionID); err != nil {
+		return transition.OperationInspection{}, false, err
+	}
 	if identity.ExecutionID == "" || identity.Key == "" || requestID == "" || principal == "" || reason == "" {
 		return transition.OperationInspection{}, false, transition.ErrInvalidRequest
 	}
@@ -630,6 +633,9 @@ func (s *Store[EntityID, StateID]) RecordOperationResolution(
 	assessment transition.OperationAssessment,
 	clock func() time.Time,
 ) (transition.OperationInspection, error) {
+	if err := transition.ValidateDurableID(identity.ExecutionID); err != nil {
+		return transition.OperationInspection{}, err
+	}
 	if identity.ExecutionID == "" || identity.Key == "" || requestID == "" || principal == "" || reason == "" || clock == nil {
 		return transition.OperationInspection{}, transition.ErrInvalidRequest
 	}

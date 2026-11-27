@@ -291,8 +291,11 @@ func (s *Store[EntityID, StateID]) prepareSuccessor(
 		if err != nil {
 			return err
 		}
-		if next == nil || validateSuccessorBinding(*next) != nil {
+		if next == nil {
 			return transition.ErrInvalidDecision
+		}
+		if err := validateSuccessorBinding(*next); err != nil {
+			return err
 		}
 		if err := transition.MatchContinuationMarkers(marker, next.Origin); err != nil {
 			return err

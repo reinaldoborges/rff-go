@@ -91,7 +91,10 @@ func NewInputIngress[Value any](store InputStore, channel string, resolve CodecR
 // Submit durably accepts an input before invoking the host, or returns its
 // previously recorded outcome. An error after acceptance can be reconciled.
 func (i *InputIngress[Value]) Submit(ctx context.Context, request InputRequest[Value]) (InputOutcome, error) {
-	if request.ID == "" || request.WorkflowID == "" || request.Codec.Name == "" || request.Codec.Version == "" ||
+	if err := ValidateDurableID(request.ID); err != nil {
+		return InputOutcome{}, err
+	}
+	if request.WorkflowID == "" || request.Codec.Name == "" || request.Codec.Version == "" ||
 		(request.Kind != Command && request.Kind != ExternalEvent && request.Kind != HumanDecision) {
 		return InputOutcome{}, ErrInvalidRequest
 	}

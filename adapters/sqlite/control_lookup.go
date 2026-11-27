@@ -15,6 +15,9 @@ func (s *Store[EntityID, StateID]) readControlExecution(
 	ctx context.Context, tx *sql.Tx, lease transition.TransitionLease[EntityID],
 ) (diskRecord, error) {
 	var stored diskRecord
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return stored, errors.Join(err, transition.ErrStaleLease)
+	}
 	entity, err := s.encodeEntity(lease.Entity)
 	if err != nil {
 		return stored, err

@@ -339,7 +339,7 @@ func TestLongIdentifiersRemainExact(t *testing.T) {
 	store := openMySQL(t)
 	entity := strings.Repeat("e", 700) + "\x00entity"
 	key := strings.Repeat("k", 700) + " \x00key"
-	executionID := strings.Repeat("i", 700) + "\x00execution"
+	executionID := strings.Repeat("i", 246) + "\x00execution"
 	decide := func(view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
 		if view.Existing != nil || view.Active {
 			return nil, nil

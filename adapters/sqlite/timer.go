@@ -16,7 +16,7 @@ func decodeTimer(id string, data []byte) (transition.TimerRecord, error) {
 	var record transition.TimerRecord
 	if err := json.Unmarshal(data, &record); err != nil ||
 		(record.SchemaVersion != 1 && record.SchemaVersion != transition.CurrentTimerSchemaVersion) || record.ID != id ||
-		record.ID == "" || record.WorkflowID == "" || record.Deadline.IsZero() ||
+		transition.ValidateDurableID(record.ID) != nil || record.WorkflowID == "" || record.Deadline.IsZero() ||
 		record.Event.Codec.Name == "" || record.Event.Codec.Version == "" ||
 		(record.Generation == 0 && (record.Owner != "" || !record.LeaseExpiresAt.IsZero() || record.Completed)) ||
 		(record.Generation > 0 && (record.Generation > math.MaxInt64 || record.Owner == "" || record.LeaseExpiresAt.IsZero())) {
@@ -36,7 +36,10 @@ func decodeTimer(id string, data []byte) (transition.TimerRecord, error) {
 func (s *Store[EntityID, StateID]) ScheduleTimer(ctx context.Context, id string,
 	decide func(*transition.TimerRecord) (*transition.TimerRecord, error),
 ) (record transition.TimerRecord, created bool, err error) {
-	if id == "" || decide == nil {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return record, false, err
+	}
+	if decide == nil {
 		return record, false, transition.ErrInvalidRequest
 	}
 	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
@@ -155,6 +158,9 @@ func (s *Store[EntityID, StateID]) ClaimDueTimer(ctx context.Context, owner stri
 func (s *Store[EntityID, StateID]) BlockTimerCompatibility(
 	ctx context.Context, lease transition.TimerLease, clock func() time.Time, diagnostic transition.CompatibilityDiagnostic,
 ) error {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || clock == nil {
 		return transition.ErrInvalidLease
 	}
@@ -236,6 +242,9 @@ func (s *Store[EntityID, StateID]) BlockedTimers(ctx context.Context) (records [
 func (s *Store[EntityID, StateID]) ClearTimerCompatibility(
 	ctx context.Context, id string, generation uint64, expected transition.CompatibilityDiagnostic,
 ) error {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return err
+	}
 	if id == "" || generation == 0 {
 		return transition.ErrInvalidRequest
 	}
@@ -272,6 +281,9 @@ func (s *Store[EntityID, StateID]) ClearTimerCompatibility(
 
 // CompleteTimer fences late reports and retains the original scheduling record.
 func (s *Store[EntityID, StateID]) CompleteTimer(ctx context.Context, lease transition.TimerLease, clock func() time.Time) error {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || lease.ExpiresAt.IsZero() || clock == nil {
 		return transition.ErrInvalidLease
 	}
@@ -312,6 +324,9 @@ func (s *Store[EntityID, StateID]) CompleteTimer(ctx context.Context, lease tran
 
 // RenewTimer extends a current, unexpired delivery claim.
 func (s *Store[EntityID, StateID]) RenewTimer(ctx context.Context, lease transition.TimerLease, clock func() time.Time, ttl time.Duration) (transition.TimerLease, error) {
+	if err := transition.ValidateDurableID(lease.ID); err != nil {
+		return transition.TimerLease{}, errors.Join(err, transition.ErrInvalidLease)
+	}
 	if lease.ID == "" || lease.Owner == "" || lease.Generation == 0 || clock == nil || ttl <= 0 {
 		return transition.TimerLease{}, transition.ErrInvalidLease
 	}

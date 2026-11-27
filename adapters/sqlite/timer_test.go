@@ -431,7 +431,7 @@ func TestTimerHandlerCompatibilityFailureRemainsRetryable(t *testing.T) {
 	}
 }
 
-func TestLegacyTimerRecordSurvivesSchemaMigration(t *testing.T) {
+func TestLegacyTimerRecordSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
@@ -457,8 +457,7 @@ func TestLegacyTimerRecordSurvivesSchemaMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE rff_timers SET record = CAST(json_set(CAST(record AS TEXT), '$.SchemaVersion', 1) AS BLOB);
-		UPDATE rff_schema_version SET version = 8`); err != nil {
+	if _, err := db.Exec(`UPDATE rff_timers SET record = CAST(json_set(CAST(record AS TEXT), '$.SchemaVersion', 1) AS BLOB)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

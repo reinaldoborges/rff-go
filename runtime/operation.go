@@ -729,6 +729,9 @@ func TrackOperation(ctx context.Context, request OperationRequest, dispatch func
 
 // NormalizeOperationBinding clones and sorts a binding's prerequisite keys.
 func NormalizeOperationBinding(binding OperationBinding) (OperationBinding, error) {
+	if err := ValidateDurableID(binding.Identity.ExecutionID); err != nil {
+		return OperationBinding{}, err
+	}
 	binding.Input = slices.Clone(binding.Input)
 	binding.Prerequisites = slices.Clone(binding.Prerequisites)
 	for _, key := range binding.Prerequisites {

@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
-func TestStoreMigrationPreservesTransitionLease(t *testing.T) {
+func TestOldStoreSchemasAreRejectedWithoutMigration(t *testing.T) {
 	for _, migration := range []struct {
 		name string
 		sql  string
@@ -44,7 +45,7 @@ func TestStoreMigrationPreservesTransitionLease(t *testing.T) {
 				t.Fatal(err)
 			}
 			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-			lease, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", fixedClock(now), time.Minute)
+			_, err = store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", fixedClock(now), time.Minute)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -58,27 +59,23 @@ func TestStoreMigrationPreservesTransitionLease(t *testing.T) {
 			if _, err := db.Exec(migration.sql); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
+			defer db.Close()
 			store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := store.Close(); err != nil {
-					t.Error(err)
+			if !errors.Is(err, sqlite.ErrUnsupportedSchema) {
+				if err == nil {
+					store.Close()
 				}
-			})
-			renewed, err := store.RenewTransitionLease(ctx, lease, fixedClock(now.Add(time.Second)), time.Minute)
-			if err != nil || renewed.Generation != lease.Generation {
-				t.Fatalf("migration lost transition fence: lease=%+v error=%v", renewed, err)
+				t.Fatalf("old schema accepted: %v", err)
+			}
+			var count int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM rff_transition_leases WHERE execution_id = 'execution'`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("rejection changed lease: count=%d err=%v", count, err)
 			}
 		})
 	}
 }
 
-func TestSchemaMigrationPreservesActiveExecutionAndAttemptHistory(t *testing.T) {
+func TestReopenPreservesActiveExecutionAndAttemptHistory(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "active-old.db")
 	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
@@ -142,16 +139,6 @@ func TestSchemaMigrationPreservesActiveExecutionAndAttemptHistory(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`DROP TABLE rff_inputs; UPDATE rff_schema_version SET version = 7`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})

@@ -13,18 +13,18 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 12
+	adapterSchemaVersion = 13
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
-	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL, entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
-	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id))`
-	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
-	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
-	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id), work BLOB NOT NULL)`
-	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
-	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
+	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
+	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
+	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
+	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
+	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
+	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
 	continuationsDDL     = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
-	successorsDDL        = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE, phase TEXT NOT NULL, record BLOB NOT NULL)`
-	operationsDDL        = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
+	successorsDDL        = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
+	operationsDDL        = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -62,7 +62,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (12)`,
+			`INSERT INTO rff_schema_version (version) VALUES (13)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
@@ -125,6 +125,9 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		if count != 1 {
 			return fmt.Errorf("%w: expected one adapter version", ErrUnsupportedSchema)
+		}
+		if schemaVersion != adapterSchemaVersion {
+			return fmt.Errorf("%w: adapter version %d", ErrUnsupportedSchema, schemaVersion)
 		}
 		if err := validateRecords(ctx, tx); err != nil {
 			return err
@@ -306,8 +309,30 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			}
 		}
 	}
+	if err := validateIdentityIndexes(ctx, tx); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema initialization: %w", err)
+	}
+	return nil
+}
+
+func validateIdentityIndexes(ctx context.Context, tx *sql.Tx) error {
+	for table, column := range map[string]string{
+		"rff_executions": "id", "rff_active": "execution_id",
+		"rff_hook_work": "execution_id", "rff_notification_work": "execution_id",
+		"rff_timers": "id", "rff_inputs": "id", "rff_successors": "execution_id",
+	} {
+		var count int
+		err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list(?) AS i
+			WHERE i."unique" = 1 AND i.partial = 0
+			AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name = i.name)
+			AND (SELECT COUNT(*) FROM pragma_index_info(i.name)) = 1
+			AND EXISTS (SELECT 1 FROM pragma_index_info(i.name) WHERE name = ?)`, table, table, column).Scan(&count)
+		if err != nil || count == 0 {
+			return fmt.Errorf("%w: missing full-value unique identity index on %s: %v", ErrUnsupportedSchema, table, err)
+		}
 	}
 	return nil
 }
@@ -381,7 +406,7 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("%w: decode execution: %w", ErrUnsupportedSchema, err)
 		}
-		if !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
+		if transition.ValidateDurableID(id) != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
 			transition.ValidateContinuationSnapshot(record.Continuation) != nil || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
 		}

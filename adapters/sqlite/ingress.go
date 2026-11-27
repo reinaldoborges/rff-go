@@ -13,7 +13,7 @@ import (
 func decodeInput(id string, data []byte) (transition.InputRecord, error) {
 	var record transition.InputRecord
 	if err := json.Unmarshal(data, &record); err != nil || record.SchemaVersion != 1 || record.ID != id ||
-		record.ID == "" || record.Channel == "" || record.WorkflowID == "" ||
+		transition.ValidateDurableID(record.ID) != nil || record.Channel == "" || record.WorkflowID == "" ||
 		(record.Kind != transition.Command && record.Kind != transition.ExternalEvent && record.Kind != transition.HumanDecision) ||
 		record.Value.Codec.Name == "" || record.Value.Codec.Version == "" {
 		return transition.InputRecord{}, fmt.Errorf("%w: invalid input", ErrUnsupportedSchema)
@@ -37,7 +37,10 @@ func saveInputOutcome(ctx context.Context, tx *sql.Tx, record *transition.InputR
 func (s *Store[EntityID, StateID]) AcceptInput(ctx context.Context, id string,
 	decide func(*transition.InputRecord) (*transition.InputRecord, error),
 ) (record transition.InputRecord, created bool, err error) {
-	if id == "" || decide == nil {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return record, false, err
+	}
+	if decide == nil {
 		return record, false, transition.ErrInvalidRequest
 	}
 	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
@@ -136,6 +139,9 @@ func (s *Store[EntityID, StateID]) PendingInputIDs(ctx context.Context, channel 
 
 // CompleteInput records the first host outcome and rejects conflicting reports.
 func (s *Store[EntityID, StateID]) CompleteInput(ctx context.Context, id string, outcome transition.InputOutcome) (record transition.InputRecord, err error) {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return record, err
+	}
 	err = s.hookTransaction(ctx, func(tx *sql.Tx) error {
 		var data []byte
 		err := tx.QueryRowContext(ctx, `SELECT record FROM rff_inputs WHERE id = ?`, id).Scan(&data)

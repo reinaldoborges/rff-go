@@ -145,6 +145,9 @@ func (r *diskRecord) UnmarshalJSON(data []byte) error {
 }
 
 func (s *Store[EntityID, StateID]) encodeRecord(record transition.Execution[EntityID, StateID], entity []byte) ([]byte, error) {
+	if err := transition.ValidateDurableID(record.ID); err != nil {
+		return nil, err
+	}
 	target, err := s.encodeState(record.Target)
 	if err != nil {
 		return nil, fmt.Errorf("encode target: %w", err)
@@ -177,7 +180,7 @@ func (s *Store[EntityID, StateID]) decodeRecord(data []byte) (transition.Executi
 	if err := json.Unmarshal(data, &record); err != nil {
 		return transition.Execution[EntityID, StateID]{}, fmt.Errorf("%w: decode record: %w", ErrUnsupportedSchema, err)
 	}
-	if !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil {
+	if transition.ValidateDurableID(record.ID) != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil {
 		return transition.Execution[EntityID, StateID]{}, ErrUnsupportedSchema
 	}
 	if err := transition.ValidateContinuationSnapshot(record.Continuation); err != nil {
