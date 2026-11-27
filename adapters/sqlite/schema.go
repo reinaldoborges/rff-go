@@ -13,15 +13,16 @@ import (
 )
 
 const (
-	adapterSchemaVersion     = 14
+	adapterSchemaVersion     = 15
 	schemaVersionDDL         = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL            = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
 	activeDDL                = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
 	leasesDDL                = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
 	hookWorkDDL              = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
 	notificationWorkDDL      = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	timersDDL                = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
-	timerRevisionDDL         = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	timersDDL                = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), deadline_seconds INTEGER NOT NULL, deadline_nanoseconds INTEGER NOT NULL CHECK(deadline_nanoseconds BETWEEN 0 AND 999999999), completed INTEGER NOT NULL CHECK(completed IN (0, 1)), compatibility_blocked INTEGER NOT NULL CHECK(compatibility_blocked IN (0, 1)), lease_expires_seconds INTEGER, lease_expires_nanoseconds INTEGER, record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0), CHECK((lease_expires_seconds IS NULL AND lease_expires_nanoseconds IS NULL) OR (lease_expires_seconds IS NOT NULL AND lease_expires_nanoseconds IS NOT NULL AND lease_expires_nanoseconds BETWEEN 0 AND 999999999)))`
+	timerDeadlineIndexDDL    = `CREATE INDEX rff_timer_deadline_lookup ON rff_timers(deadline_seconds, deadline_nanoseconds, id) WHERE completed = 0 AND compatibility_blocked = 0`
+	timerRevisionDDL         = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
 	timerRevisionGuardDDL    = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
 	timerLocatorDDL          = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
 	timerAllocationDDL       = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
@@ -73,13 +74,14 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (14)`,
+			`INSERT INTO rff_schema_version (version) VALUES (15)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
 			hookWorkDDL,
 			notificationWorkDDL,
 			timersDDL,
+			timerDeadlineIndexDDL,
 			timerRevisionDDL,
 			timerRevisionGuardDDL,
 			integrityFindingsDDL,

@@ -491,13 +491,25 @@ reports the remaining incompatibility rather than an empty queue.
 ### Timer integrity maintenance
 
 SQLite and MySQL detect unreadable or identity-inconsistent timer records when
-timer operations encounter them. Detection fails visibly with
+timer operations encounter them. Indexed timer claims also compare each SQL
+candidate's deadline, completion, compatibility, and lease projection with its
+serialized `TimerRecord` in the same transaction. Detection fails visibly with
 `runtime.ErrIntegrity` and atomically records a safe finding. A finding
 quarantines that timer, including its claims, renewals, completions and
 compatibility mutations; independently validated timers remain eligible.
 Repeated detection is deduplicated; a recurring condition creates a new
 history entry for the same protected locator. Already-running external effects
 are not stopped or undone.
+
+Timer projections are workload-specific indexes, not authority. Claims order
+by deadline seconds, nanoseconds, then the full ID; instants retain signed Unix
+seconds and nanoseconds. A corrupt projection can make a timer disappear from
+the candidate query or disturb which timer appears globally earliest. Claims
+validate only selected candidates, so this path does not guarantee discovery
+of hidden projection corruption and does not run a mandatory full integrity
+sweep. Authorized resolution rebuilds projection fields from the current
+readable serialized timer; it cannot discover rows hidden by incorrect
+metadata. No latency improvement is claimed.
 
 Use `sqlite.OpenIntegrityMaintenance` or `mysql.OpenIntegrityMaintenance`
 with a host authorization callback to inspect and resolve findings without
@@ -521,7 +533,7 @@ A stale observation conflicts, a missing record cannot
 resolve, and unavailable schema, finding or audit storage fails closed.
 Normal initialization still rejects malformed records without writing.
 This timer path does not run an integrity sweep or guarantee discovery of
-records not encountered by a timer operation.
+records or projection mismatches not encountered by a timer operation.
 
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
@@ -533,7 +545,8 @@ go test ./runtime -run TestAcceptanceStoreContract
 
 `internal/runtimecontract` provides reusable execution, wakeup, worker-loss,
 commit-rejection, notification-handoff, delivery and repair,
-timer-delivery and compatibility, typed-ingress, authorized-control, migration, capacity,
+timer-delivery, compatibility, indexed-selection, typed-ingress,
+authorized-control, migration, capacity,
 retry-budget, pinned versions, and execution-compatibility contracts over the
 runtime ports.
 Run them against the SQLite adapter with:

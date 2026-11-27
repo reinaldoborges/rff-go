@@ -240,8 +240,20 @@ func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string
 	if marker != 0 || revision != observed.Revision {
 		return transition.ErrConflict
 	}
-	if _, err := decodeTimer(id, data); err != nil {
+	record, err := decodeTimer(id, data)
+	if err != nil {
 		return transition.ErrIntegrity
+	}
+	projection, err := timerProjectionFor(record)
+	if err != nil {
+		return transition.ErrIntegrity
+	}
+	projectionArgs := timerProjectionArgs(projection)
+	projectionArgs = append(projectionArgs, locator)
+	if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET deadline_seconds = ?, deadline_nanoseconds = ?,
+		completed = ?, compatibility_blocked = ?, lease_expires_seconds = ?, lease_expires_nanoseconds = ?
+		WHERE row_id = ?`, projectionArgs...); err != nil {
+		return fmt.Errorf("rebuild timer projection: %w", err)
 	}
 	now := time.Now().UTC()
 	if now.Before(observed.DetectedAt) {
@@ -289,7 +301,12 @@ func timerQuarantined(ctx context.Context, tx *sql.Tx, locator int64) (bool, err
 func loadIntegrityTimer(ctx context.Context, tx *sql.Tx, id string) (transition.TimerRecord, error) {
 	var locator, revision int64
 	var data []byte
-	err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision FROM rff_timers WHERE id = ? FOR UPDATE`, id).Scan(&locator, &data, &revision)
+	var actual timerProjection
+	err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision, deadline_seconds, deadline_nanoseconds,
+		completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds
+		FROM rff_timers WHERE id = ? FOR UPDATE`, id).Scan(&locator, &data, &revision, &actual.deadlineSeconds,
+		&actual.deadlineNanoseconds, &actual.completed, &actual.compatibilityBlocked,
+		&actual.leaseExpiresSeconds, &actual.leaseExpiresNanoseconds)
 	if err != nil {
 		return transition.TimerRecord{}, err
 	}
@@ -304,7 +321,7 @@ func loadIntegrityTimer(ctx context.Context, tx *sql.Tx, id string) (transition.
 		return transition.TimerRecord{}, transition.ErrIntegrity
 	}
 	record, err := decodeTimer(id, data)
-	if err != nil {
+	if err != nil || !timerProjectionMatches(record, actual) {
 		return transition.TimerRecord{}, recordTimerFinding(ctx, tx, locator)
 	}
 	return record, nil

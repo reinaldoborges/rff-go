@@ -18,11 +18,19 @@ func TestDurableIdentityKeysEnforceFullByteUniqueness(t *testing.T) {
 		first := strings.Repeat("x", 254) + "a"
 		second := strings.Repeat("x", 254) + "b"
 		for _, id := range []string{first, second, "Case", "case", "x\x00a", "x\x00b", "é", "e\u0301"} {
-			if _, err := db.ExecContext(t.Context(), "INSERT INTO "+table+" (id, record) VALUES (?, ?)", id, []byte("{}")); err != nil {
+			query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
+			if table == "rff_timers" {
+				query = "INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record) VALUES (?, 0, 0, 0, 0, ?)"
+			}
+			if _, err := db.ExecContext(t.Context(), query, id, []byte("{}")); err != nil {
 				t.Fatalf("%s insert %q: %v", table, id, err)
 			}
 		}
-		if _, err := db.ExecContext(t.Context(), "INSERT INTO "+table+" (id, record) VALUES (?, ?)", first, []byte("{}")); err == nil {
+		query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
+		if table == "rff_timers" {
+			query = "INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record) VALUES (?, 0, 0, 0, 0, ?)"
+		}
+		if _, err := db.ExecContext(t.Context(), query, first, []byte("{}")); err == nil {
 			t.Fatalf("%s accepted duplicate full ID", table)
 		}
 	}

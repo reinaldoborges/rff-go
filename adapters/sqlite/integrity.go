@@ -50,7 +50,8 @@ func (m *IntegrityMaintenance) Close() error { return m.db.Close() }
 func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) error {
 	definitions := map[string]string{
 		"rff_schema_version": schemaVersionDDL, "rff_timers": timersDDL, "rff_timer_revision": timerRevisionDDL, "rff_timer_revision_guard": timerRevisionGuardDDL, "rff_timer_locator": timerLocatorDDL,
-		"rff_timer_allocation": timerAllocationDDL, "rff_integrity_findings": integrityFindingsDDL,
+		"rff_timer_allocation": timerAllocationDDL, "rff_timer_deadline_lookup": timerDeadlineIndexDDL,
+		"rff_integrity_findings":    integrityFindingsDDL,
 		"rff_integrity_open_lookup": integrityIndexDDL, "rff_integrity_history_lookup": integrityHistoryIndexDDL,
 		"rff_integrity_audit": integrityAuditDDL, "rff_integrity_audit_lookup": integrityAuditIndexDDL,
 	}
@@ -264,8 +265,20 @@ func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string
 	if revision != observed.Revision {
 		return transition.ErrConflict
 	}
-	if _, err := decodeTimer(id, data); err != nil {
+	record, err := decodeTimer(id, data)
+	if err != nil {
 		return transition.ErrIntegrity
+	}
+	projection, err := timerProjectionFor(record)
+	if err != nil {
+		return transition.ErrIntegrity
+	}
+	projectionArgs := timerProjectionArgs(projection)
+	projectionArgs = append(projectionArgs, locator)
+	if _, err := tx.ExecContext(ctx, `UPDATE rff_timers SET deadline_seconds = ?, deadline_nanoseconds = ?,
+		completed = ?, compatibility_blocked = ?, lease_expires_seconds = ?, lease_expires_nanoseconds = ?
+		WHERE row_id = ?`, projectionArgs...); err != nil {
+		return fmt.Errorf("rebuild timer projection: %w", err)
 	}
 	now := time.Now().UTC()
 	if now.Before(observed.DetectedAt) {
@@ -314,7 +327,12 @@ func timerQuarantined(ctx context.Context, tx *sql.Tx, locator int64) (bool, err
 func loadIntegrityTimer(ctx context.Context, tx *sql.Tx, id string) (transition.TimerRecord, error) {
 	var locator, revision int64
 	var data []byte
-	err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision FROM rff_timers WHERE id = ?`, id).Scan(&locator, &data, &revision)
+	var actual timerProjection
+	err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision, deadline_seconds, deadline_nanoseconds,
+		completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds
+		FROM rff_timers WHERE id = ?`, id).Scan(&locator, &data, &revision, &actual.deadlineSeconds,
+		&actual.deadlineNanoseconds, &actual.completed, &actual.compatibilityBlocked,
+		&actual.leaseExpiresSeconds, &actual.leaseExpiresNanoseconds)
 	if err != nil {
 		return transition.TimerRecord{}, err
 	}
@@ -329,7 +347,7 @@ func loadIntegrityTimer(ctx context.Context, tx *sql.Tx, id string) (transition.
 		return transition.TimerRecord{}, transition.ErrIntegrity
 	}
 	record, err := decodeTimer(id, data)
-	if err != nil {
+	if err != nil || !timerProjectionMatches(record, actual) {
 		return transition.TimerRecord{}, recordTimerFinding(ctx, tx, locator)
 	}
 	return record, nil

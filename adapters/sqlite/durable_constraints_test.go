@@ -24,6 +24,9 @@ func TestDurableIdentityByteConstraints(t *testing.T) {
 	defer db.Close()
 	for _, table := range []string{"rff_timers", "rff_inputs"} {
 		query := "INSERT INTO " + table + " (id, record) VALUES (?, ?)"
+		if table == "rff_timers" {
+			query = "INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record) VALUES (?, 0, 0, 0, 0, ?)"
+		}
 		for _, id := range []string{"a\x00b", "a\x00c", strings.Repeat("x", 256)} {
 			if _, err := db.ExecContext(context.Background(), query, id, []byte("{}")); err != nil {
 				t.Fatalf("%s insert %q: %v", table, id, err)
