@@ -7,8 +7,19 @@ import (
 	"time"
 
 	"github.com/reinaldoborges/rff-go/adapters/mysql"
+	"github.com/reinaldoborges/rff-go/internal/runtimecontract"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+func TestHiddenTimerProjectionCanChangeEarliestSelection(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimecontract.CheckHiddenTimerProjection(t, store, db)
+}
 
 type timerSelectionCodec struct{}
 

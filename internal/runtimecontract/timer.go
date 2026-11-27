@@ -2,6 +2,7 @@ package runtimecontract
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -10,6 +11,37 @@ import (
 
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+// CheckHiddenTimerProjection documents the boundary of candidate validation:
+// filtering can conceal the earliest authoritative timer.
+func CheckHiddenTimerProjection(t *testing.T, store TimerStore, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 123456789, time.UTC)
+	scheduler, err := transition.NewTimerScheduler[string](store,
+		func(transition.CodecVersion) (transition.Codec[string], error) { return stringCodec{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		id       string
+		deadline time.Time
+	}{{"earliest", now.Add(-time.Second)}, {"later", now}} {
+		if _, _, err := scheduler.Schedule(ctx, transition.TimerRequest[string]{
+			ID: item.id, WorkflowID: "workflow", Deadline: item.deadline, Event: "event",
+			EventCodec: transition.CodecVersion{Name: "event", Version: "1"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE rff_timers SET deadline_seconds = ? WHERE id = ?`, now.Add(time.Hour).Unix(), "earliest"); err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := store.ClaimDueTimer(ctx, "worker", func() time.Time { return now }, time.Minute)
+	if err != nil || record.ID != "later" {
+		t.Fatalf("hidden earliest timer: got %q, error %v", record.ID, err)
+	}
+}
 
 // TimerStore combines the runtime ports needed by the timer compatibility contract.
 type TimerStore interface {

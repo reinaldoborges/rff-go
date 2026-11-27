@@ -9,8 +9,19 @@ import (
 	"github.com/reinaldoborges/rff-go/adapters/mysql"
 	"github.com/reinaldoborges/rff-go/fsm"
 	"github.com/reinaldoborges/rff-go/internal/inputselectiontest"
+	"github.com/reinaldoborges/rff-go/internal/runtimecontract"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+func TestHiddenHookProjectionCanChangeFirstSelection(t *testing.T) {
+	db, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimecontract.CheckHiddenHookProjection(t, store, db)
+}
 
 func TestClaimHookDetectsAndRepairsProjectionMismatch(t *testing.T) {
 	ctx := context.Background()

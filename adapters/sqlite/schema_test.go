@@ -18,6 +18,9 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 	}{
 		{"future adapter version", `UPDATE rff_schema_version SET version = 99`},
 		{"incomplete tables", `DROP TABLE rff_active`},
+		{"malformed input projection schema", `ALTER TABLE rff_inputs ADD COLUMN extra_projection TEXT`},
+		{"missing selection index", `DROP INDEX rff_timer_deadline_lookup`},
+		{"malformed selection index", `DROP INDEX rff_timer_deadline_lookup; CREATE INDEX rff_timer_deadline_lookup ON rff_timers(id)`},
 		{"pre-operation store", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 9`},
 		{"continuation-only version ten", `DROP TABLE rff_operations; UPDATE rff_schema_version SET version = 10`},
 		{"missing continuation table", `DROP TABLE rff_continuations`},

@@ -9,8 +9,24 @@ import (
 	"time"
 
 	"github.com/reinaldoborges/rff-go/adapters/sqlite"
+	"github.com/reinaldoborges/rff-go/internal/runtimecontract"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+func TestHiddenTimerProjectionCanChangeEarliestSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hidden-timer.db")
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtimecontract.CheckHiddenTimerProjection(t, store, db)
+}
 
 func TestTimerProjectionMismatchIsVisibleAndAuthorizedRepairRebuildsIt(t *testing.T) {
 	ctx := context.Background()

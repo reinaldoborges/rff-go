@@ -11,8 +11,24 @@ import (
 	"github.com/reinaldoborges/rff-go/adapters/sqlite"
 	"github.com/reinaldoborges/rff-go/fsm"
 	"github.com/reinaldoborges/rff-go/internal/inputselectiontest"
+	"github.com/reinaldoborges/rff-go/internal/runtimecontract"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
+
+func TestHiddenHookProjectionCanChangeFirstSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hidden-hook.db")
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtimecontract.CheckHiddenHookProjection(t, store, db)
+}
 
 func TestClaimHookDetectsAndQuarantinesProjectionMismatch(t *testing.T) {
 	ctx := context.Background()
