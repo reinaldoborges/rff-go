@@ -94,6 +94,9 @@ func (s *Store[EntityID, StateID]) ClaimHook(ctx context.Context, owner string, 
 }
 
 func loadClaim(ctx context.Context, tx *sql.Tx, lease transition.HookLease, now time.Time) (hookWork, error) {
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return hookWork{}, errors.Join(err, transition.ErrStaleActivityLease)
+	}
 	work, err := loadHook(ctx, tx, lease.ExecutionID)
 	if errors.Is(err, transition.ErrNoHookActivity) {
 		return hookWork{}, transition.ErrStaleActivityLease

@@ -36,6 +36,9 @@ func (s *Store[EntityID, StateID]) ReadCompatibility(ctx context.Context, id str
 
 // BlockUnreadableExecution records a decode failure without requiring decoded IDs.
 func (s *Store[EntityID, StateID]) BlockUnreadableExecution(ctx context.Context, id string) error {
+	if err := transition.ValidateDurableID(id); err != nil {
+		return err
+	}
 	return s.hookTransaction(ctx, func(tx *sql.Tx) error {
 		var data []byte
 		err := tx.QueryRowContext(ctx, `SELECT e.record FROM rff_executions AS e

@@ -66,7 +66,7 @@ func TestTransitionLeaseReclaimSurvivesReopenAndRejectsStaleRenewal(t *testing.T
 	}
 }
 
-func TestVersionOneStoreMigratesWithoutLosingAcceptance(t *testing.T) {
+func TestVersionOneStoreRejectedWithoutLosingAcceptance(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "migration.db")
 	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
@@ -93,29 +93,17 @@ func TestVersionOneStoreMigratesWithoutLosingAcceptance(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE rff_inputs; DROP TABLE rff_timers; DROP TABLE rff_notification_work; DROP TABLE rff_hook_work; DROP TABLE rff_transition_leases; UPDATE rff_schema_version SET version = 1`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer db.Close()
 	store, err = sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Error(err)
+	if !errors.Is(err, sqlite.ErrUnsupportedSchema) {
+		if err == nil {
+			store.Close()
 		}
-	})
-	record, created, err := store.Accept(ctx, "entity", "key", func(view transition.AcceptanceView[string, string]) (*transition.Execution[string, string], error) {
-		if view.Existing == nil || !view.Active {
-			t.Fatal("migration lost accepted execution or reservation")
-		}
-		return nil, nil
-	})
-	if err != nil || created || record.ID != "execution" {
-		t.Fatalf("migration changed acceptance: record=%+v created=%v error=%v", record, created, err)
+		t.Fatalf("old schema accepted: %v", err)
 	}
-	if _, err := store.AcquireTransitionLease(ctx, "entity", "execution", "coordinator", fixedClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), time.Minute); err != nil {
-		t.Fatalf("migrated store cannot acquire a lease: %v", err)
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rff_executions WHERE id = 'execution'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("rejection changed acceptance: count=%d error=%v", count, err)
 	}
 
 }

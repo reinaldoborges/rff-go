@@ -38,7 +38,10 @@ func ValidateContinuationMarker[EntityID comparable, StateID comparable](marker 
 	if marker.SchemaVersion != 1 {
 		return fmt.Errorf("%w: unsupported continuation marker version", ErrCompatibility)
 	}
-	if marker.ExecutionID == "" || marker.OperationID == "" || marker.MachineID == "" || marker.MachineVersion == "" {
+	if err := ValidateDurableID(marker.ExecutionID); err != nil {
+		return err
+	}
+	if marker.OperationID == "" || marker.MachineID == "" || marker.MachineVersion == "" {
 		return fmt.Errorf("%w: incomplete continuation marker", ErrInvalidRequest)
 	}
 	return validatePolicy(marker.Policy)

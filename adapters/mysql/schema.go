@@ -7,53 +7,59 @@ import (
 	"fmt"
 )
 
-const adapterSchemaVersion = 4
+const adapterSchemaVersion = 5
 
 const (
 	schemaVersionDDL = `CREATE TABLE rff_schema_version (
 		version TINYINT UNSIGNED NOT NULL
 	) ENGINE=InnoDB`
 	executionsDDL = `CREATE TABLE rff_executions (
-		id LONGBLOB NOT NULL,
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		id VARBINARY(256) NOT NULL,
 		entity LONGBLOB NOT NULL,
 		request_key LONGBLOB NOT NULL,
 		record LONGBLOB NOT NULL,
-		KEY rff_execution_id_lookup (id(256)),
+		UNIQUE KEY rff_execution_id_lookup (id),
 		KEY rff_execution_identity_lookup (entity(256), request_key(256))
 	) ENGINE=InnoDB`
 	activeDDL = `CREATE TABLE rff_active (
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		entity LONGBLOB NOT NULL,
-		execution_id LONGBLOB NOT NULL,
+		execution_id VARBINARY(256) NOT NULL,
 		KEY rff_active_entity_lookup (entity(256)),
-		KEY rff_active_execution_lookup (execution_id(256))
+		UNIQUE KEY rff_active_execution_lookup (execution_id)
 	) ENGINE=InnoDB`
 	leasesDDL = `CREATE TABLE rff_transition_leases (
 		entity LONGBLOB NOT NULL,
-		execution_id LONGBLOB NOT NULL,
+		execution_id VARBINARY(256) NOT NULL,
 		owner LONGBLOB NOT NULL,
 		generation BIGINT NOT NULL,
 		expires_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
 		KEY rff_lease_entity_lookup (entity(256))
 	) ENGINE=InnoDB`
 	hookWorkDDL = `CREATE TABLE rff_hook_work (
-		execution_id LONGBLOB NOT NULL,
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		execution_id VARBINARY(256) NOT NULL,
 		work LONGBLOB NOT NULL,
-		KEY rff_hook_execution_lookup (execution_id(256))
+		UNIQUE KEY rff_hook_execution_lookup (execution_id)
 	) ENGINE=InnoDB`
 	notificationWorkDDL = `CREATE TABLE rff_notification_work (
-		execution_id LONGBLOB NOT NULL,
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		execution_id VARBINARY(256) NOT NULL,
 		work LONGBLOB NOT NULL,
-		KEY rff_notification_execution_lookup (execution_id(256))
+		UNIQUE KEY rff_notification_execution_lookup (execution_id)
 	) ENGINE=InnoDB`
 	timersDDL = `CREATE TABLE rff_timers (
-		id LONGBLOB NOT NULL,
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		id VARBINARY(256) NOT NULL,
 		record LONGBLOB NOT NULL,
-		KEY rff_timer_id_lookup (id(256))
+		UNIQUE KEY rff_timer_id_lookup (id)
 	) ENGINE=InnoDB`
 	inputsDDL = `CREATE TABLE rff_inputs (
-		id LONGBLOB NOT NULL,
+		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		id VARBINARY(256) NOT NULL,
 		record LONGBLOB NOT NULL,
-		KEY rff_input_id_lookup (id(256))
+		UNIQUE KEY rff_input_id_lookup (id)
 	) ENGINE=InnoDB`
 	continuationsDDL = `CREATE TABLE rff_continuations (
 		digest BINARY(32) NOT NULL PRIMARY KEY,
@@ -62,17 +68,17 @@ const (
 	successorsDDL = `CREATE TABLE rff_successors (
 		digest BINARY(32) NOT NULL PRIMARY KEY,
 		entity LONGBLOB NOT NULL,
-		execution_id LONGBLOB NOT NULL,
+		execution_id VARBINARY(256) NOT NULL,
 		phase VARBINARY(16) NOT NULL,
 		record LONGBLOB NOT NULL,
 		KEY rff_successor_entity_lookup (entity(256)),
-		KEY rff_successor_execution_lookup (execution_id(256))
+		UNIQUE KEY rff_successor_execution_lookup (execution_id)
 	) ENGINE=InnoDB`
 	operationsDDL = `CREATE TABLE rff_operations (
-		execution_id LONGBLOB NOT NULL,
+		execution_id VARBINARY(256) NOT NULL,
 		operation_key LONGBLOB NOT NULL,
 		record LONGBLOB NOT NULL,
-		KEY rff_operation_identity_lookup (execution_id(256), operation_key(256))
+		KEY rff_operation_identity_lookup (execution_id, operation_key(256))
 	) ENGINE=InnoDB`
 	transactionLockDDL = `CREATE TABLE rff_transaction_lock (
 		id TINYINT UNSIGNED NOT NULL PRIMARY KEY
@@ -215,16 +221,16 @@ func validateMySQLSchema(ctx context.Context, db *sql.DB) error {
 	}
 	expected := map[string][]column{
 		"rff_schema_version":    {{"version", "tinyint unsigned"}},
-		"rff_executions":        {{"id", "longblob"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}},
-		"rff_active":            {{"entity", "longblob"}, {"execution_id", "longblob"}},
-		"rff_transition_leases": {{"entity", "longblob"}, {"execution_id", "longblob"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
-		"rff_hook_work":         {{"execution_id", "longblob"}, {"work", "longblob"}},
-		"rff_notification_work": {{"execution_id", "longblob"}, {"work", "longblob"}},
-		"rff_timers":            {{"id", "longblob"}, {"record", "longblob"}},
-		"rff_inputs":            {{"id", "longblob"}, {"record", "longblob"}},
+		"rff_executions":        {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"entity", "longblob"}, {"request_key", "longblob"}, {"record", "longblob"}},
+		"rff_active":            {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}},
+		"rff_transition_leases": {{"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
+		"rff_hook_work":         {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}},
+		"rff_notification_work": {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}},
+		"rff_timers":            {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}},
+		"rff_inputs":            {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}},
 		"rff_continuations":     {{"digest", "binary(32)"}, {"record", "longblob"}},
-		"rff_successors":        {{"digest", "binary(32)"}, {"entity", "longblob"}, {"execution_id", "longblob"}, {"phase", "varbinary(16)"}, {"record", "longblob"}},
-		"rff_operations":        {{"execution_id", "longblob"}, {"operation_key", "longblob"}, {"record", "longblob"}},
+		"rff_successors":        {{"digest", "binary(32)"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"phase", "varbinary(16)"}, {"record", "longblob"}},
+		"rff_operations":        {{"execution_id", "varbinary(256)"}, {"operation_key", "longblob"}, {"record", "longblob"}},
 		"rff_transaction_lock":  {{"id", "tinyint unsigned"}},
 	}
 	for table, wanted := range expected {
@@ -236,7 +242,7 @@ func validateMySQLSchema(ctx context.Context, db *sql.DB) error {
 		if engine != "InnoDB" {
 			return fmt.Errorf("%w: table %s must use InnoDB", ErrUnsupportedSchema, table)
 		}
-		rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, is_nullable FROM information_schema.columns
+		rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, is_nullable, extra FROM information_schema.columns
 			WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position`, table)
 		if err != nil {
 			return fmt.Errorf("%w: inspect columns for %s: %w", ErrUnsupportedSchema, table, err)
@@ -245,11 +251,12 @@ func validateMySQLSchema(ctx context.Context, db *sql.DB) error {
 			name       string
 			columnType string
 			nullable   string
+			extra      string
 		}
 		var found []columnDefinition
 		for rows.Next() {
 			var definition columnDefinition
-			if err := rows.Scan(&definition.name, &definition.columnType, &definition.nullable); err != nil {
+			if err := rows.Scan(&definition.name, &definition.columnType, &definition.nullable, &definition.extra); err != nil {
 				return errors.Join(fmt.Errorf("%w: inspect columns for %s: %w", ErrUnsupportedSchema, table, err), rows.Close())
 			}
 			found = append(found, definition)
@@ -261,7 +268,11 @@ func validateMySQLSchema(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("%w: incompatible columns in %s", ErrUnsupportedSchema, table)
 		}
 		for i := range wanted {
-			if found[i].name != wanted[i].name || found[i].columnType != wanted[i].columnType || found[i].nullable != "NO" {
+			extra := ""
+			if wanted[i].name == "row_id" {
+				extra = "auto_increment"
+			}
+			if found[i].name != wanted[i].name || found[i].columnType != wanted[i].columnType || found[i].nullable != "NO" || found[i].extra != extra {
 				return fmt.Errorf("%w: incompatible column %s in %s", ErrUnsupportedSchema, found[i].name, table)
 			}
 		}
@@ -288,25 +299,27 @@ func validateMySQLIndexes(ctx context.Context, db *sql.DB) error {
 	expected := map[string]map[string]index{
 		"rff_schema_version": {},
 		"rff_executions": {
-			"rff_execution_id_lookup":       {columns: []string{"id"}, prefixLengths: []int{256}, nonUnique: true},
+			"PRIMARY":                       {columns: []string{"row_id"}, prefixLengths: []int{0}},
+			"rff_execution_id_lookup":       {columns: []string{"id"}, prefixLengths: []int{0}},
 			"rff_execution_identity_lookup": {columns: []string{"entity", "request_key"}, prefixLengths: []int{256, 256}, nonUnique: true},
 		},
 		"rff_active": {
+			"PRIMARY":                     {columns: []string{"row_id"}, prefixLengths: []int{0}},
 			"rff_active_entity_lookup":    {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true},
-			"rff_active_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{256}, nonUnique: true},
+			"rff_active_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
 		},
 		"rff_transition_leases": {"rff_lease_entity_lookup": {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_hook_work":         {"rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_notification_work": {"rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_timers":            {"rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_inputs":            {"rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{256}, nonUnique: true}},
+		"rff_hook_work":         {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}},
+		"rff_notification_work": {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}},
+		"rff_timers":            {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}},
+		"rff_inputs":            {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_input_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}},
 		"rff_continuations":     {"PRIMARY": {columns: []string{"digest"}, prefixLengths: []int{0}}},
 		"rff_successors": {
 			"PRIMARY":                        {columns: []string{"digest"}, prefixLengths: []int{0}},
 			"rff_successor_entity_lookup":    {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true},
-			"rff_successor_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{256}, nonUnique: true},
+			"rff_successor_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
 		},
-		"rff_operations":       {"rff_operation_identity_lookup": {columns: []string{"execution_id", "operation_key"}, prefixLengths: []int{256, 256}, nonUnique: true}},
+		"rff_operations":       {"rff_operation_identity_lookup": {columns: []string{"execution_id", "operation_key"}, prefixLengths: []int{0, 256}, nonUnique: true}},
 		"rff_transaction_lock": {"PRIMARY": {columns: []string{"id"}, prefixLengths: []int{0}}},
 	}
 	for table, wanted := range expected {

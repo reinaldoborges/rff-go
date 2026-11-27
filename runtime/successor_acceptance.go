@@ -40,8 +40,11 @@ func ValidateSuccessorBinding[EntityID comparable, StateID comparable](binding S
 	if err := ValidateContinuationMarker(m); err != nil {
 		return err
 	}
+	if err := ValidateDurableID(e.ID); err != nil {
+		return err
+	}
 	if len(binding.OriginRevision) == 0 || e.SchemaVersion != CurrentSchemaVersion ||
-		e.ID == "" || e.Key == "" || e.Entity != m.Entity || e.Operation != Transition ||
+		e.Key == "" || e.Entity != m.Entity || e.Operation != Transition ||
 		!e.HasPrevious || e.Previous != m.Target || e.Status != Waiting ||
 		e.MachineID == "" || e.MachineVersion == "" ||
 		e.Event.Codec.Name == "" || e.Event.Codec.Version == "" ||

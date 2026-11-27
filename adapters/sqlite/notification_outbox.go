@@ -99,6 +99,12 @@ func intentFromExecution[EntityID comparable, StateID comparable](execution tran
 func (o *NotificationOutbox[EntityID, StateID]) Handoff(
 	ctx context.Context, lease transition.TransitionLease[EntityID], intent transition.NotificationIntent[EntityID, StateID],
 ) error {
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return errors.Join(err, transition.ErrInvalidHook)
+	}
+	if err := transition.ValidateDurableID(intent.ExecutionID); err != nil {
+		return errors.Join(err, transition.ErrInvalidHook)
+	}
 	if intent.ID == "" || intent.ExecutionID != lease.ExecutionID || intent.Entity != lease.Entity {
 		return transition.ErrInvalidHook
 	}
@@ -287,6 +293,9 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 }
 
 func notificationClaim(ctx context.Context, tx *sql.Tx, lease transition.NotificationLease, now time.Time) (notificationWork, error) {
+	if err := transition.ValidateDurableID(lease.ExecutionID); err != nil {
+		return notificationWork{}, errors.Join(err, transition.ErrStaleNotificationLease)
+	}
 	var work notificationWork
 	var data, executionData []byte
 	err := tx.QueryRowContext(ctx, `SELECT w.work, e.record FROM rff_notification_work AS w

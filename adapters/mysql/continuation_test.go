@@ -19,7 +19,7 @@ func TestContinuationMarkersSurviveReopenAndRejectConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := transition.ContinuationMarker[string, string]{
-		SchemaVersion: 1, ExecutionID: string([]byte{0xff, 0, 'a'}), OperationID: string([]byte{0xfe}),
+		SchemaVersion: 1, ExecutionID: "é\x00a", OperationID: string([]byte{0xfe}),
 		Entity: "entity", Target: "due", MachineID: "plan", MachineVersion: "1",
 		Policy: fsm.Policy{MaxAttempts: 2, AttemptTimeout: time.Second, OverallTimeout: time.Minute},
 	}

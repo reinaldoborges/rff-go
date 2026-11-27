@@ -81,7 +81,7 @@ func validateRecords(ctx context.Context, tx *sql.Tx) (err error) {
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("%w: decode execution: %w", ErrUnsupportedSchema, err)
 		}
-		if !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
+		if transition.ValidateDurableID(id) != nil || !transition.SupportedExecutionSchema(record.SchemaVersion) || record.SchemaVersion == 1 && record.Continuation != nil ||
 			transition.ValidateContinuationSnapshot(record.Continuation) != nil || record.ID != id || record.Key != key || !bytes.Equal(record.Entity, entity) {
 			return fmt.Errorf("%w: unsupported or inconsistent execution record", ErrUnsupportedSchema)
 		}

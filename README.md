@@ -155,6 +155,13 @@ verified. `CodecRegistry` provides concurrency-safe exact-version lookup and
 rejects duplicate codec registrations; applications may also supply their own
 resolver.
 
+Execution IDs (including generated IDs), timer IDs, and input IDs must be
+nonempty valid UTF-8 of at most 256 bytes. This also applies with custom
+persistence adapters. Invalid IDs return `runtime.ErrInvalidDurableID` before
+durable writes. Accepted IDs retain their exact bytes, including embedded NULs,
+and are case-sensitive and not Unicode-normalized. Entity IDs, channels,
+operation keys, and other identifiers are not subject to this limit.
+
 The hook runner rehydrates pinned machine and codec versions and invokes state
 hooks without rerunning selection. It does not schedule work, fence attempts, or
 persist hook outcomes.
@@ -511,11 +518,8 @@ depends on the filesystem and hardware honoring SQLite's sync and locking
 requirements. In-memory databases are not supported by this adapter.
 
 The adapter owns its `rff_` tables and rejects unsupported schemas without
-rewriting them. Fresh stores include the operation tables; pre-operation
-stores without them are incompatible and are not migrated or backfilled.
-Operation-only version 10 stores are upgraded transactionally with the
-Continuation table; continuation-only version 10 stores are incompatible.
-Stores without the successor table are incompatible and are not backfilled.
+rewriting or migrating them. Old disposable stores must be explicitly
+discarded and recreated by an operator.
 Unreadable operation records are isolated to the affected identity or scan.
 Older adapter versions cannot open the new schema.
 `Store.AcceptAtomic` lets a same-file host authorize and write its own audit in
@@ -583,9 +587,12 @@ The host owns application-domain tables.
 Adapter transactions acquire an InnoDB serialization row lock, including
 fenced leases and same-transaction host callbacks. The serialized transaction
 boundary deliberately mirrors SQLite's immediate transaction semantics and
-coordinates multiple adapter instances/processes. Identifier bytes are stored
-without prefix truncation; bounded prefix indexes only accelerate lookups, with
-exact-value checks and the serialization lock preserving full-key semantics.
+coordinates multiple adapter instances/processes. Execution, timer and input
+IDs use full binary keys and full-value uniqueness; unrelated identifiers use
+prefix lookup indexes with exact-value checks. Every pooled connection must
+use `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`; `mysql.Open` rejects non-strict
+connections without changing server SQL mode. Host transaction callbacks must
+not change the connection's SQL mode.
 An incomplete, incompatible, or unsupported MySQL adapter schema is rejected;
 MySQL does not automatically migrate older adapter schemas, including
 version 2 stores from either feature branch.
