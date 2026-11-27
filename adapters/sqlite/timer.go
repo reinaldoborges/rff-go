@@ -211,17 +211,20 @@ func (s *Store[EntityID, StateID]) ClaimDueTimer(ctx context.Context, owner stri
 		var locator, revision int64
 		var data []byte
 		var actual timerProjection
+		// The seconds bound lets SQLite stop its ordered index walk; the
+		// following predicate retains the inclusive nanosecond boundary.
 		err := tx.QueryRowContext(ctx, `SELECT t.row_id, t.id, t.record, t.revision, t.deadline_seconds,
 			t.deadline_nanoseconds, t.completed, t.compatibility_blocked, t.lease_expires_seconds, t.lease_expires_nanoseconds
 			FROM rff_timers t
 			WHERE t.completed = 0 AND t.compatibility_blocked = 0
+				AND t.deadline_seconds <= ?
 				AND (t.deadline_seconds < ? OR (t.deadline_seconds = ? AND t.deadline_nanoseconds <= ?))
 				AND (t.lease_expires_seconds IS NULL OR t.lease_expires_seconds < ?
 					OR (t.lease_expires_seconds = ? AND t.lease_expires_nanoseconds <= ?))
 				AND NOT EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
 					WHERE kind = 'timer' AND locator = t.row_id AND resolved_at IS NULL)
 			ORDER BY t.deadline_seconds, t.deadline_nanoseconds, t.id LIMIT 1`,
-			now.Unix(), now.Unix(), now.Nanosecond(), now.Unix(), now.Unix(), now.Nanosecond(),
+			now.Unix(), now.Unix(), now.Unix(), now.Nanosecond(), now.Unix(), now.Unix(), now.Nanosecond(),
 		).Scan(&locator, &id, &data, &revision, &actual.deadlineSeconds, &actual.deadlineNanoseconds,
 			&actual.completed, &actual.compatibilityBlocked, &actual.leaseExpiresSeconds, &actual.leaseExpiresNanoseconds)
 		if errors.Is(err, sql.ErrNoRows) {

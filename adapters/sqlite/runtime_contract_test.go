@@ -179,6 +179,17 @@ func TestRuntimeIndexedTimerSelectionContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeIndexedHookSelectionContract(t *testing.T) {
+	runtimecontract.RunIndexedHookSelection(t, func(t *testing.T) runtimecontract.IndexedHookStore {
+		store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "hook-selection.db"), sqlite.StringCodec{}, sqlite.StringCodec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
 func TestRuntimeInputIngressContract(t *testing.T) {
 	runtimecontract.RunInputIngress(t, func(t *testing.T) transition.InputStore {
 		t.Helper()

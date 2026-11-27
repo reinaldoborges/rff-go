@@ -193,6 +193,12 @@ func TestRuntimeIndexedTimerSelectionContract(t *testing.T) {
 	})
 }
 
+func TestRuntimeIndexedHookSelectionContract(t *testing.T) {
+	runtimecontract.RunIndexedHookSelection(t, func(t *testing.T) runtimecontract.IndexedHookStore {
+		return openMySQL(t)
+	})
+}
+
 func TestRuntimeInputIngressContract(t *testing.T) {
 	runtimecontract.RunInputIngress(t, func(t *testing.T) transition.InputStore { return openMySQL(t) })
 }

@@ -28,7 +28,13 @@ The standard baseline and CI do not run MySQL integration tests. Run this
 separate gate when MySQL verification is needed; skipped tests are unverified.
 The MySQL gate requires a disposable MySQL 8.4 service. Use a container name
 and host port unique to the current checkout; do not reuse another worktree's
-service. The test account must be able to create and drop databases:
+service. The test account must be able to create and drop databases.
+The strict-connection contract also temporarily changes the disposable
+server's global SQL mode and terminates its own idle test sessions, so the
+account needs permission to change global system variables. Do not run that
+gate against a shared server.
+
+For example:
 
 ```sh
 MYSQL_CONTAINER='<unique-container-name>'

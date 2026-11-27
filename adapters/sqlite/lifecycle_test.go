@@ -135,7 +135,8 @@ func TestEmbeddedLifecycleDurableProgressAndShutdown(t *testing.T) {
 		host := &localCommitHost{store: store, clock: time.Now}
 		l, err := transition.NewLifecycle[string, string, string, string](faultStore, runner, runner, host, transition.LifecycleConfig{
 			Coordinator: transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: 300 * time.Millisecond, Clock: time.Now},
-			Worker: transition.WorkerConfig{ID: "worker", Capacity: 2, LeaseTTL: 150 * time.Millisecond,
+			// Leave room for SQLite and scheduler delays while both hooks are busy.
+			Worker: transition.WorkerConfig{ID: "worker", Capacity: 2, LeaseTTL: time.Second,
 				RenewalInterval: 30 * time.Millisecond, Clock: transition.SystemWorkerClock{}},
 			PollInterval: 20 * time.Millisecond,
 			ClassifyError: func(err error) transition.PathErrorClass {
