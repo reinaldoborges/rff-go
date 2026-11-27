@@ -231,16 +231,16 @@ func TestNotificationClaimsQuarantineSharedExecutionAndReservationFindings(t *te
 		t.Fatal(err)
 	}
 	detected := now.Format(time.RFC3339Nano)
-	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		VALUES ('execution', ?, 'invalid_execution', 'record', ?)`, executionLocator, detected); err != nil {
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		VALUES ('execution', ?, 0, 'invalid_execution', 'record', X'', ?)`, executionLocator, detected); err != nil {
 		t.Fatal(err)
 	}
 	var reservationLocator int64
 	if err := admin.QueryRowContext(ctx, `SELECT row_id FROM rff_active WHERE execution_id = 'c'`).Scan(&reservationLocator); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		VALUES ('reservation', ?, 'invalid_reservation', 'active', ?)`, reservationLocator, detected); err != nil {
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		VALUES ('reservation', ?, 0, 'invalid_reservation', 'active', X'', ?)`, reservationLocator, detected); err != nil {
 		t.Fatal(err)
 	}
 	outbox, err := sqlite.NewNotificationOutbox(store, fixedClock(now))

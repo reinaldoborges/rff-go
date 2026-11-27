@@ -411,7 +411,7 @@ func TestLegacyPendingInputReplaysAfterEntityRemapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.Exec(`UPDATE rff_inputs SET record = CAST(json_set(CAST(record AS TEXT), '$.Outcome', NULL) AS BLOB)
+	result, err := db.Exec(`UPDATE rff_inputs SET record = CAST(json_set(CAST(record AS TEXT), '$.Outcome', NULL) AS BLOB), outcome_present = 0
 		WHERE json_extract(CAST(record AS TEXT), '$.Channel') = 'taskmanager-tasks'`)
 	if err != nil {
 		t.Fatal(err)

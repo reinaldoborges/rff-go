@@ -285,8 +285,8 @@ func TestNotificationClaimsQuarantineSharedExecutionAndReservationFindings(t *te
 		t.Fatal(err)
 	}
 	detected := now.Format(time.RFC3339Nano)
-	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field,
-		detected_at, resolved_at, open_marker) VALUES ('execution', ?, 'invalid_execution', 'record', ?, '', 0)`,
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel,
+		detected_at, resolved_at, open_marker) VALUES ('execution', ?, 0, 'invalid_execution', 'record', _binary'', ?, '', 0)`,
 		executionLocator, detected); err != nil {
 		t.Fatal(err)
 	}
@@ -294,8 +294,8 @@ func TestNotificationClaimsQuarantineSharedExecutionAndReservationFindings(t *te
 	if err := admin.QueryRowContext(ctx, `SELECT row_id FROM rff_active WHERE execution_id = 'c'`).Scan(&reservationLocator); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field,
-		detected_at, resolved_at, open_marker) VALUES ('reservation', ?, 'invalid_reservation', 'active', ?, '', 0)`,
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel,
+		detected_at, resolved_at, open_marker) VALUES ('reservation', ?, 0, 'invalid_reservation', 'active', _binary'', ?, '', 0)`,
 		reservationLocator, detected); err != nil {
 		t.Fatal(err)
 	}

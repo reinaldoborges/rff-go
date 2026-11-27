@@ -554,6 +554,27 @@ Normal initialization still rejects malformed records without writing.
 This timer path does not run an integrity sweep or guarantee discovery of
 records or projection mismatches not encountered by a timer operation.
 
+### Pending input selection integrity
+
+SQLite and MySQL select pending inputs using transactionally maintained
+channel and outcome-presence projections. A listing is exact-channel,
+case-sensitive, ordered by full input-ID bytes, and unbounded. MySQL's
+channel-prefix index is only a candidate lookup; the full channel value is
+rechecked. Returned records and projections are checked in the same
+transaction. A detected mismatch fails with `runtime.ErrIncompleteInputList`
+(wrapping `runtime.ErrIntegrity`) and
+quarantines the input. A known finding blocks the affected exact channel; an
+unreadable record with unknown channel blocks listings for every channel until
+authorized resolution. A `Submit` targeting a quarantined input does not invoke
+its handler.
+
+An authorized `Resolve` rebuilds only the derived projection from a readable,
+valid authoritative input record and atomically records an audit. Unreadable
+authority must be restored by a trusted host first. Projection corruption that
+has not yet been encountered can hide a matching input and allow an incomplete
+successful list. Optional checks or sweeps do not establish a current global
+snapshot and are not part of ordinary selection readiness.
+
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
 in-memory test fake exercises that contract without claiming durability:

@@ -54,7 +54,8 @@ func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) erro
 		"rff_timer_allocation": timerAllocationDDL, "rff_timer_deadline_lookup": timerDeadlineIndexDDL,
 		"rff_integrity_findings":    integrityFindingsDDL,
 		"rff_integrity_open_lookup": integrityIndexDDL, "rff_integrity_history_lookup": integrityHistoryIndexDDL,
-		"rff_integrity_audit": integrityAuditDDL, "rff_integrity_audit_lookup": integrityAuditIndexDDL,
+		"rff_integrity_input_channel_lookup": integrityChannelIndexDDL,
+		"rff_integrity_audit":                integrityAuditDDL, "rff_integrity_audit_lookup": integrityAuditIndexDDL,
 	}
 	if full {
 		for name, ddl := range map[string]string{
@@ -65,6 +66,9 @@ func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) erro
 			"rff_notification_locator": notificationLocatorDDL, "rff_notification_allocation": notificationAllocationDDL,
 			"rff_inputs": inputsDDL, "rff_continuations": continuationsDDL,
 			"rff_successors": successorsDDL, "rff_operations": operationsDDL,
+			"rff_input_selection_lookup": inputSelectionIndexDDL,
+			"rff_input_revision":         inputRevisionDDL, "rff_input_revision_guard": inputRevisionGuardDDL,
+			"rff_input_locator": inputLocatorDDL, "rff_input_allocation": inputAllocationDDL,
 			"rff_execution_revision": executionRevisionDDL, "rff_execution_revision_guard": executionRevisionGuardDDL,
 			"rff_execution_locator": executionLocatorDDL, "rff_execution_allocation": executionAllocationDDL,
 			"rff_active_revision": activeRevisionDDL, "rff_active_revision_guard": activeRevisionGuardDDL,
@@ -105,6 +109,8 @@ func (m *IntegrityMaintenance) checkAccess(ctx context.Context, action, actor, r
 
 func validIntegrityFinding(finding transition.IntegrityFinding) bool {
 	switch finding.Kind {
+	case "input":
+		return finding.Category == "invalid_input" && (finding.Field == "record" || finding.Field == "projection")
 	case "timer":
 		return finding.Category == "invalid_timer" && finding.Field == "record"
 	case "hook":
@@ -154,7 +160,7 @@ func (m *IntegrityMaintenance) findings(ctx context.Context, actor, reason strin
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT f.finding_id, f.kind, f.locator, f.category, f.field, f.detected_at, f.resolved_at,
 		CASE f.kind WHEN 'timer' THEN COALESCE(t.revision, 0) WHEN 'hook' THEN COALESCE(h.revision, 0)
-			WHEN 'notification' THEN COALESCE(n.revision, 0)
+			WHEN 'notification' THEN COALESCE(n.revision, 0) WHEN 'input' THEN f.finding_revision
 			WHEN 'execution' THEN COALESCE(e.revision, 0) WHEN 'reservation' THEN COALESCE(a.revision, 0) ELSE 0 END
 		FROM rff_integrity_findings AS f
 		LEFT JOIN rff_timers AS t ON f.kind = 'timer' AND t.row_id = f.locator
@@ -255,13 +261,16 @@ func (m *IntegrityMaintenance) audit(ctx context.Context, actor, reason string, 
 	return result, nil
 }
 
-// Resolve revalidates the observed timer and atomically records its resolution.
+// Resolve revalidates the observed durable record and atomically records its resolution.
 func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string, observed transition.IntegrityFinding) error {
 	if err := m.checkAccess(ctx, "resolve", actor, reason, observed.ID, observed.Locator); err != nil {
 		return err
 	}
-	if observed.ID <= 0 || observed.Locator <= 0 || observed.Revision <= 0 || observed.Kind != "timer" ||
-		observed.Category != "invalid_timer" || observed.Field != "record" || observed.ResolvedAt != nil || observed.DetectedAt.IsZero() {
+	validTimer := observed.Kind == "timer" && observed.Category == "invalid_timer" && observed.Field == "record"
+	validInput := observed.Kind == "input" && observed.Category == "invalid_input" &&
+		(observed.Field == "record" || observed.Field == "projection")
+	if observed.ID <= 0 || observed.Locator <= 0 || observed.Revision <= 0 || (!validTimer && !validInput) ||
+		observed.ResolvedAt != nil || observed.DetectedAt.IsZero() {
 		return transition.ErrInvalidRequest
 	}
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -271,6 +280,9 @@ func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string
 	defer tx.Rollback()
 	if err := validateIntegrityStructure(ctx, tx, true); err != nil {
 		return err
+	}
+	if validInput {
+		return m.resolveInput(ctx, tx, actor, reason, observed)
 	}
 	var id string
 	var data []byte
@@ -339,6 +351,78 @@ func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string
 	return tx.Commit()
 }
 
+func (m *IntegrityMaintenance) resolveInput(ctx context.Context, tx *sql.Tx, actor, reason string, observed transition.IntegrityFinding) error {
+	var id, kind, category, field, detected string
+	var resolved sql.NullString
+	var data []byte
+	var locator, findingRevision, revision, outcomePresent int64
+	err := tx.QueryRowContext(ctx, `SELECT f.kind, f.locator, f.category, f.field, f.detected_at, f.resolved_at, f.finding_revision,
+		i.id, i.record, i.outcome_present, i.revision
+		FROM rff_integrity_findings f JOIN rff_inputs i ON i.row_id = f.locator WHERE f.finding_id = ?`, observed.ID).
+		Scan(&kind, &locator, &category, &field, &detected, &resolved, &findingRevision, &id, &data, &outcomePresent, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return transition.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if kind != observed.Kind || locator != observed.Locator || category != observed.Category || field != observed.Field ||
+		detected != observed.DetectedAt.Format(time.RFC3339Nano) || findingRevision != observed.Revision {
+		return transition.ErrConflict
+	}
+	if resolved.Valid {
+		var replay bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_audit INDEXED BY rff_integrity_audit_lookup
+			WHERE finding_id = ? AND revision = ? AND action = 'resolve' AND actor = ? AND reason = ?)`,
+			observed.ID, observed.Revision, actor, reason).Scan(&replay); err != nil {
+			return err
+		}
+		if !replay {
+			return transition.ErrConflict
+		}
+		return tx.Commit()
+	}
+	if revision != observed.Revision {
+		return transition.ErrConflict
+	}
+	record, err := decodeInput(id, data)
+	if err != nil {
+		return transition.ErrIntegrity
+	}
+	presence := 0
+	if record.Outcome != nil {
+		presence = 1
+	}
+	if outcomePresent != 0 && outcomePresent != 1 {
+		return ErrUnsupportedSchema
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE rff_inputs SET channel = ?, outcome_present = ? WHERE row_id = ? AND revision = ?`,
+		[]byte(record.Channel), presence, locator, observed.Revision)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return transition.ErrConflict
+	}
+	now := time.Now().UTC()
+	if now.Before(observed.DetectedAt) {
+		now = observed.DetectedAt
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_audit(finding_id, revision, action, actor, reason, occurred_at) VALUES (?, ?, 'resolve', ?, ?, ?)`,
+		observed.ID, observed.Revision, actor, reason, stamp); err != nil {
+		return fmt.Errorf("audit input integrity resolution: %w", err)
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE rff_integrity_findings SET resolved_at = ? WHERE finding_id = ? AND resolved_at IS NULL`, stamp, observed.ID)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return transition.ErrConflict
+	}
+	return tx.Commit()
+}
+
 type timerFindingError struct{}
 
 func (timerFindingError) Error() string { return transition.ErrIntegrity.Error() }
@@ -349,8 +433,8 @@ func recordTimerFinding(ctx context.Context, tx *sql.Tx, locator int64) error {
 		return fmt.Errorf("%w: invalid timer locator", ErrUnsupportedSchema)
 	}
 
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		SELECT 'timer', ?, 'invalid_timer', 'record', ? WHERE NOT EXISTS
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at, resolved_at)
+		SELECT 'timer', ?, 0, 'invalid_timer', 'record', X'', ?, NULL WHERE NOT EXISTS
 		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup WHERE kind = 'timer' AND locator = ? AND resolved_at IS NULL)`,
 		locator, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {
 		return fmt.Errorf("persist integrity finding: %w", err)
@@ -596,8 +680,8 @@ func recordHookFinding(ctx context.Context, tx *sql.Tx, locator int64, category,
 	if locator <= 0 || !((category == "projection_mismatch" && field == "selection") || (category == "invalid_hook" && field == "record")) {
 		return fmt.Errorf("%w: invalid hook locator", ErrUnsupportedSchema)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		SELECT 'hook', ?, ?, ?, ? WHERE NOT EXISTS
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		SELECT 'hook', ?, 0, ?, ?, X'', ? WHERE NOT EXISTS
 		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
 			WHERE kind = 'hook' AND locator = ? AND resolved_at IS NULL)`,
 		locator, category, field, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {
@@ -616,8 +700,8 @@ func recordNotificationFinding(ctx context.Context, tx *sql.Tx, locator int64, c
 		(category == "invalid_notification" && field == "record")) {
 		return fmt.Errorf("%w: invalid notification locator", ErrUnsupportedSchema)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		SELECT 'notification', ?, ?, ?, ? WHERE NOT EXISTS
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		SELECT 'notification', ?, 0, ?, ?, X'', ? WHERE NOT EXISTS
 		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
 			WHERE kind = 'notification' AND locator = ? AND resolved_at IS NULL)`,
 		locator, category, field, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {
@@ -634,8 +718,8 @@ func recordExecutionFinding(ctx context.Context, tx *sql.Tx, id, category, field
 	if locator <= 0 {
 		return fmt.Errorf("%w: invalid execution locator", ErrUnsupportedSchema)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		SELECT 'execution', ?, ?, ?, ? WHERE NOT EXISTS
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		SELECT 'execution', ?, 0, ?, ?, X'', ? WHERE NOT EXISTS
 		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
 			WHERE kind = 'execution' AND locator = ? AND resolved_at IS NULL)`,
 		locator, category, field, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {
@@ -648,8 +732,8 @@ func recordReservationFinding(ctx context.Context, tx *sql.Tx, locator int64) er
 	if locator <= 0 {
 		return fmt.Errorf("%w: invalid reservation locator", ErrUnsupportedSchema)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
-		SELECT 'reservation', ?, 'invalid_reservation', 'active', ? WHERE NOT EXISTS
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, finding_revision, category, field, scope_channel, detected_at)
+		SELECT 'reservation', ?, 0, 'invalid_reservation', 'active', X'', ? WHERE NOT EXISTS
 		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
 			WHERE kind = 'reservation' AND locator = ? AND resolved_at IS NULL)`,
 		locator, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {

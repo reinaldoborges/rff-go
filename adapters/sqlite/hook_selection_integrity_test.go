@@ -10,6 +10,7 @@ import (
 
 	"github.com/reinaldoborges/rff-go/adapters/sqlite"
 	"github.com/reinaldoborges/rff-go/fsm"
+	"github.com/reinaldoborges/rff-go/internal/inputselectiontest"
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
@@ -115,6 +116,7 @@ func TestClaimHookDetectsAndQuarantinesProjectionMismatch(t *testing.T) {
 	if err != nil || len(audit) != 1 || audit[0].Action != "rebuild_hook" {
 		t.Fatalf("projection rebuild audit = %+v, %v", audit, err)
 	}
+	inputselectiontest.CheckFindingCoexistence(t, store, admin, maintenance)
 }
 
 func TestClaimHookQuarantinesExecutionAndReservationDependencies(t *testing.T) {

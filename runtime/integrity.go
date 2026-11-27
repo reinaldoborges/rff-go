@@ -9,6 +9,9 @@ import (
 // ErrIntegrity indicates a detected or quarantined durable record.
 var ErrIntegrity = errors.New("durable record integrity finding")
 
+// ErrIncompleteInputList indicates that pending input discovery cannot prove a complete result.
+var ErrIncompleteInputList = errors.New("pending input list is incomplete")
+
 // ErrIntegrityPageRequired indicates that finding or audit history must be paged.
 var ErrIntegrityPageRequired = errors.New("integrity history requires pagination")
 
