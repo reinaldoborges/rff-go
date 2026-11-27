@@ -13,18 +13,27 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 13
-	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
-	executionsDDL        = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
-	activeDDL            = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
-	leasesDDL            = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
-	hookWorkDDL          = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	notificationWorkDDL  = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	timersDDL            = `CREATE TABLE rff_timers (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
-	inputsDDL            = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
-	continuationsDDL     = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
-	successorsDDL        = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
-	operationsDDL        = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
+	adapterSchemaVersion     = 14
+	schemaVersionDDL         = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
+	executionsDDL            = `CREATE TABLE rff_executions (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, UNIQUE(entity, request_key))`
+	activeDDL                = `CREATE TABLE rff_active (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256))`
+	leasesDDL                = `CREATE TABLE rff_transition_leases (entity BLOB PRIMARY KEY NOT NULL, execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at TEXT NOT NULL)`
+	hookWorkDDL              = `CREATE TABLE rff_hook_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
+	notificationWorkDDL      = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
+	timersDDL                = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
+	timerRevisionDDL         = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	timerRevisionGuardDDL    = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
+	timerLocatorDDL          = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
+	timerAllocationDDL       = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
+	integrityFindingsDDL     = `CREATE TABLE rff_integrity_findings (finding_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind = 'timer'), locator INTEGER NOT NULL CHECK(locator > 0), category TEXT NOT NULL CHECK(category = 'invalid_timer'), field TEXT NOT NULL CHECK(field = 'record'), detected_at TEXT NOT NULL, resolved_at TEXT)`
+	integrityIndexDDL        = `CREATE UNIQUE INDEX rff_integrity_open_lookup ON rff_integrity_findings(kind, locator) WHERE resolved_at IS NULL`
+	integrityHistoryIndexDDL = `CREATE INDEX rff_integrity_history_lookup ON rff_integrity_findings(kind, locator, finding_id)`
+	integrityAuditDDL        = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
+	integrityAuditIndexDDL   = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
+	inputsDDL                = `CREATE TABLE rff_inputs (id TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL)`
+	continuationsDDL         = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	successorsDDL            = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
+	operationsDDL            = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
@@ -38,37 +47,48 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 	}()
 
-	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, successorsExist, operationsExist bool
+	var schemaExists, recordsExist, activeExists, leasesExist, hookWorkExists, notificationWorkExists, timersExist, inputsExist, continuationsExist, successorsExist, operationsExist, findingsExist, auditExist bool
 	for name, exists := range map[string]*bool{
-		"rff_schema_version":    &schemaExists,
-		"rff_executions":        &recordsExist,
-		"rff_active":            &activeExists,
-		"rff_transition_leases": &leasesExist,
-		"rff_hook_work":         &hookWorkExists,
-		"rff_notification_work": &notificationWorkExists,
-		"rff_timers":            &timersExist,
-		"rff_inputs":            &inputsExist,
-		"rff_continuations":     &continuationsExist,
-		"rff_successors":        &successorsExist,
-		"rff_operations":        &operationsExist,
+		"rff_schema_version":     &schemaExists,
+		"rff_executions":         &recordsExist,
+		"rff_active":             &activeExists,
+		"rff_transition_leases":  &leasesExist,
+		"rff_hook_work":          &hookWorkExists,
+		"rff_notification_work":  &notificationWorkExists,
+		"rff_timers":             &timersExist,
+		"rff_inputs":             &inputsExist,
+		"rff_continuations":      &continuationsExist,
+		"rff_successors":         &successorsExist,
+		"rff_operations":         &operationsExist,
+		"rff_integrity_findings": &findingsExist,
+		"rff_integrity_audit":    &auditExist,
 	} {
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`, name).Scan(exists); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 	}
 	if !schemaExists {
-		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || successorsExist || operationsExist {
+		if recordsExist || activeExists || leasesExist || hookWorkExists || notificationWorkExists || timersExist || inputsExist || continuationsExist || successorsExist || operationsExist || findingsExist || auditExist {
 			return fmt.Errorf("%w: adapter tables exist without a schema version", ErrUnsupportedSchema)
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (13)`,
+			`INSERT INTO rff_schema_version (version) VALUES (14)`,
 			executionsDDL,
 			activeDDL,
 			leasesDDL,
 			hookWorkDDL,
 			notificationWorkDDL,
 			timersDDL,
+			timerRevisionDDL,
+			timerRevisionGuardDDL,
+			integrityFindingsDDL,
+			integrityIndexDDL,
+			integrityHistoryIndexDDL,
+			integrityAuditDDL,
+			integrityAuditIndexDDL,
+			timerLocatorDDL,
+			timerAllocationDDL,
 			inputsDDL,
 			continuationsDDL,
 			successorsDDL,
@@ -308,6 +328,9 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 				return fmt.Errorf("update adapter version: %w", err)
 			}
 		}
+	}
+	if err := validateIntegrityStructure(ctx, tx, false); err != nil {
+		return err
 	}
 	if err := validateIdentityIndexes(ctx, tx); err != nil {
 		return err

@@ -488,6 +488,41 @@ revalidates blocked timers before each scan and resumes them when their pinned
 codec can decode the original event. When no other timer can be claimed, it
 reports the remaining incompatibility rather than an empty queue.
 
+### Timer integrity maintenance
+
+SQLite and MySQL detect unreadable or identity-inconsistent timer records when
+timer operations encounter them. Detection fails visibly with
+`runtime.ErrIntegrity` and atomically records a safe finding. A finding
+quarantines that timer, including its claims, renewals, completions and
+compatibility mutations; independently validated timers remain eligible.
+Repeated detection is deduplicated; a recurring condition creates a new
+history entry for the same protected locator. Already-running external effects
+are not stopped or undone.
+
+Use `sqlite.OpenIntegrityMaintenance` or `mysql.OpenIntegrityMaintenance`
+with a host authorization callback to inspect and resolve findings without
+starting workers or initializing the normal store. Every inspection, audit
+read and resolution invokes that callback. The host must supply a safe acting
+identity and reason, protect the maintenance handle and locators, and avoid
+putting user IDs, secrets or raw errors in audit context. Inspection
+authorization covers the store-wide list; audit and resolution authorization
+include the finding ID, and resolution also includes the locator. `FindingsPage` and
+`AuditPage` use exclusive numeric cursors and bounded pages; `Findings` and
+`Audit` return `runtime.ErrIntegrityPageRequired` when their bounded first
+page would omit history. Findings expose no timer ID or record payload.
+
+Unreadable authority is never automatically rewritten or deleted. A trusted
+host-controlled restoration must restore the original authoritative record;
+then inspect again and pass the fresh finding to `Resolve`. Resolution checks
+the current record, locator and revision and commits its audit with the
+quarantine change. An identical authorized resolution replay returns its
+original outcome without another audit entry; a different decision conflicts.
+A stale observation conflicts, a missing record cannot
+resolve, and unavailable schema, finding or audit storage fails closed.
+Normal initialization still rejects malformed records without writing.
+This timer path does not run an integrity sweep or guarantee discovery of
+records not encountered by a timer operation.
+
 Adapter tests can use `internal/acceptancecontract` with an isolated store and
 injected failures before commit and after commit with a lost response. The
 in-memory test fake exercises that contract without claiming durability:

@@ -1,0 +1,369 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"time"
+
+	transition "github.com/reinaldoborges/rff-go/runtime"
+)
+
+// IntegrityMaintenance is a worker-free, host-authorized maintenance handle.
+type IntegrityMaintenance struct {
+	db        *sql.DB
+	authorize transition.IntegrityAuthorizer
+}
+
+// OpenIntegrityMaintenance opens an existing store without initializing workers
+// or reading authoritative records. The authorizer is invoked on every action.
+func OpenIntegrityMaintenance(path string, authorize transition.IntegrityAuthorizer) (*IntegrityMaintenance, error) {
+	if path == "" || path == ":memory:" || authorize == nil {
+		return nil, transition.ErrInvalidRequest
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	uri := url.URL{Scheme: "file", Path: absolute}
+	query := uri.Query()
+	query.Set("mode", "rw")
+	query.Set("_txlock", "immediate")
+	query.Set("_busy_timeout", "5000")
+	query.Set("_foreign_keys", "on")
+	query.Set("_synchronous", "FULL")
+	uri.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite3", uri.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return &IntegrityMaintenance{db: db, authorize: authorize}, nil
+}
+
+// Close releases the maintenance connection.
+func (m *IntegrityMaintenance) Close() error { return m.db.Close() }
+
+func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) error {
+	definitions := map[string]string{
+		"rff_schema_version": schemaVersionDDL, "rff_timers": timersDDL, "rff_timer_revision": timerRevisionDDL, "rff_timer_revision_guard": timerRevisionGuardDDL, "rff_timer_locator": timerLocatorDDL,
+		"rff_timer_allocation": timerAllocationDDL, "rff_integrity_findings": integrityFindingsDDL,
+		"rff_integrity_open_lookup": integrityIndexDDL, "rff_integrity_history_lookup": integrityHistoryIndexDDL,
+		"rff_integrity_audit": integrityAuditDDL, "rff_integrity_audit_lookup": integrityAuditIndexDDL,
+	}
+	if full {
+		for name, ddl := range map[string]string{
+			"rff_executions": executionsDDL,
+			"rff_active":     activeDDL, "rff_transition_leases": leasesDDL,
+			"rff_hook_work": hookWorkDDL, "rff_notification_work": notificationWorkDDL,
+			"rff_inputs": inputsDDL, "rff_continuations": continuationsDDL,
+			"rff_successors": successorsDDL, "rff_operations": operationsDDL,
+		} {
+			definitions[name] = ddl
+		}
+	}
+	for name, expected := range definitions {
+		var actual string
+		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name = ?`, name).Scan(&actual); err != nil || actual != expected {
+			return fmt.Errorf("%w: incompatible integrity structure", ErrUnsupportedSchema)
+		}
+	}
+	var version, count int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0), COUNT(*) FROM rff_schema_version`).Scan(&version, &count); err != nil || version != adapterSchemaVersion || count != 1 {
+		return fmt.Errorf("%w: incompatible schema version", ErrUnsupportedSchema)
+	}
+	if full {
+		return validateIdentityIndexes(ctx, tx)
+	}
+	return nil
+}
+
+func (m *IntegrityMaintenance) checkAccess(ctx context.Context, action, actor, reason string, findingID, locator int64) error {
+	if actor == "" || reason == "" {
+		return transition.ErrInvalidRequest
+	}
+	if err := m.authorize(ctx, action, actor, reason, findingID, locator); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Findings returns safe finding history after explicit authorization.
+func (m *IntegrityMaintenance) Findings(ctx context.Context, actor, reason string) ([]transition.IntegrityFinding, error) {
+	result, err := m.findings(ctx, actor, reason, 0, transition.MaxIntegrityPageSize+1)
+	if len(result) > transition.MaxIntegrityPageSize {
+		return nil, transition.ErrIntegrityPageRequired
+	}
+	return result, err
+}
+
+// FindingsPage reads at most limit findings after the supplied finding ID.
+func (m *IntegrityMaintenance) FindingsPage(ctx context.Context, actor, reason string, afterID int64, limit int) ([]transition.IntegrityFinding, error) {
+	if afterID < 0 || limit <= 0 || limit > transition.MaxIntegrityPageSize {
+		return nil, transition.ErrInvalidRequest
+	}
+	return m.findings(ctx, actor, reason, afterID, limit)
+}
+
+func (m *IntegrityMaintenance) findings(ctx context.Context, actor, reason string, afterID int64, limit int) (result []transition.IntegrityFinding, err error) {
+	if err := m.checkAccess(ctx, "inspect", actor, reason, 0, 0); err != nil {
+		return nil, err
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := validateIntegrityStructure(ctx, tx, true); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT f.finding_id, f.kind, f.locator, f.category, f.field, f.detected_at, f.resolved_at, COALESCE(t.revision, 0)
+		FROM rff_integrity_findings AS f LEFT JOIN rff_timers AS t ON f.kind = 'timer' AND t.row_id = f.locator
+		WHERE f.finding_id > ? ORDER BY f.finding_id LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read integrity findings: %w", err)
+	}
+	for rows.Next() {
+		var finding transition.IntegrityFinding
+		var detected string
+		var resolved sql.NullString
+		if err := rows.Scan(&finding.ID, &finding.Kind, &finding.Locator, &finding.Category, &finding.Field, &detected, &resolved, &finding.Revision); err != nil {
+			return nil, errors.Join(err, rows.Close())
+		}
+		finding.DetectedAt, err = time.Parse(time.RFC3339Nano, detected)
+		if err != nil || finding.ID <= 0 || finding.Locator <= 0 || finding.Revision < 0 || finding.Kind != "timer" || finding.Category != "invalid_timer" || finding.Field != "record" {
+			return nil, errors.Join(ErrUnsupportedSchema, rows.Close())
+		}
+		if resolved.Valid {
+			t, parseErr := time.Parse(time.RFC3339Nano, resolved.String)
+			if parseErr != nil || t.Before(finding.DetectedAt) {
+				return nil, errors.Join(ErrUnsupportedSchema, rows.Close())
+			}
+			finding.ResolvedAt = &t
+		}
+		result = append(result, finding)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Audit returns authorized safe audit history for one finding.
+func (m *IntegrityMaintenance) Audit(ctx context.Context, actor, reason string, findingID int64) ([]transition.IntegrityAudit, error) {
+	result, err := m.audit(ctx, actor, reason, findingID, 0, transition.MaxIntegrityPageSize+1)
+	if len(result) > transition.MaxIntegrityPageSize {
+		return nil, transition.ErrIntegrityPageRequired
+	}
+	return result, err
+}
+
+// AuditPage reads at most limit audit entries after the supplied audit ID.
+func (m *IntegrityMaintenance) AuditPage(ctx context.Context, actor, reason string, findingID, afterID int64, limit int) ([]transition.IntegrityAudit, error) {
+	if afterID < 0 || limit <= 0 || limit > transition.MaxIntegrityPageSize {
+		return nil, transition.ErrInvalidRequest
+	}
+	return m.audit(ctx, actor, reason, findingID, afterID, limit)
+}
+
+func (m *IntegrityMaintenance) audit(ctx context.Context, actor, reason string, findingID, afterID int64, limit int) ([]transition.IntegrityAudit, error) {
+	if err := m.checkAccess(ctx, "audit", actor, reason, findingID, 0); err != nil {
+		return nil, err
+	}
+	if findingID <= 0 {
+		return nil, transition.ErrInvalidRequest
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := validateIntegrityStructure(ctx, tx, true); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT audit_id, finding_id, revision, action, actor, reason, occurred_at
+		FROM rff_integrity_audit INDEXED BY rff_integrity_audit_lookup WHERE finding_id = ? AND audit_id > ? ORDER BY audit_id LIMIT ?`, findingID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	var result []transition.IntegrityAudit
+	for rows.Next() {
+		var audit transition.IntegrityAudit
+		var occurred string
+		if err := rows.Scan(&audit.ID, &audit.FindingID, &audit.Revision, &audit.Action, &audit.Actor, &audit.Reason, &occurred); err != nil {
+			return nil, errors.Join(err, rows.Close())
+		}
+		audit.OccurredAt, err = time.Parse(time.RFC3339Nano, occurred)
+		if err != nil || audit.ID <= 0 || audit.FindingID != findingID || audit.Revision <= 0 || audit.Action != "resolve" || audit.Actor == "" || audit.Reason == "" {
+			return nil, errors.Join(ErrUnsupportedSchema, rows.Close())
+		}
+		result = append(result, audit)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Resolve revalidates the observed timer and atomically records its resolution.
+func (m *IntegrityMaintenance) Resolve(ctx context.Context, actor, reason string, observed transition.IntegrityFinding) error {
+	if err := m.checkAccess(ctx, "resolve", actor, reason, observed.ID, observed.Locator); err != nil {
+		return err
+	}
+	if observed.ID <= 0 || observed.Locator <= 0 || observed.Revision <= 0 || observed.Kind != "timer" ||
+		observed.Category != "invalid_timer" || observed.Field != "record" || observed.ResolvedAt != nil || observed.DetectedAt.IsZero() {
+		return transition.ErrInvalidRequest
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validateIntegrityStructure(ctx, tx, true); err != nil {
+		return err
+	}
+	var id string
+	var data []byte
+	var locator, revision int64
+	var kind, category, field, detected string
+	var resolved sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT f.kind, f.locator, f.category, f.field, f.detected_at, f.resolved_at, t.id, t.record, t.revision
+		FROM rff_integrity_findings f JOIN rff_timers t ON t.row_id = f.locator
+		WHERE f.finding_id = ?`, observed.ID).Scan(&kind, &locator, &category, &field, &detected, &resolved, &id, &data, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return transition.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if kind != observed.Kind || locator != observed.Locator || category != observed.Category || field != observed.Field ||
+		detected != observed.DetectedAt.Format(time.RFC3339Nano) {
+		return transition.ErrConflict
+	}
+	if resolved.Valid {
+		var replay bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_audit INDEXED BY rff_integrity_audit_lookup
+			WHERE finding_id = ? AND revision = ? AND action = 'resolve' AND actor = ? AND reason = ?)`,
+			observed.ID, observed.Revision, actor, reason).Scan(&replay); err != nil {
+			return err
+		}
+		if !replay {
+			return transition.ErrConflict
+		}
+		return tx.Commit()
+	}
+	if revision != observed.Revision {
+		return transition.ErrConflict
+	}
+	if _, err := decodeTimer(id, data); err != nil {
+		return transition.ErrIntegrity
+	}
+	now := time.Now().UTC()
+	if now.Before(observed.DetectedAt) {
+		now = observed.DetectedAt
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_audit(finding_id, revision, action, actor, reason, occurred_at) VALUES (?, ?, 'resolve', ?, ?, ?)`, observed.ID, observed.Revision, actor, reason, stamp); err != nil {
+		return fmt.Errorf("audit integrity resolution: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE rff_integrity_findings SET resolved_at = ? WHERE finding_id = ? AND resolved_at IS NULL`, stamp, observed.ID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		return transition.ErrConflict
+	}
+	return tx.Commit()
+}
+
+type timerFindingError struct{}
+
+func (timerFindingError) Error() string { return transition.ErrIntegrity.Error() }
+func (timerFindingError) Unwrap() error { return transition.ErrIntegrity }
+
+func recordTimerFinding(ctx context.Context, tx *sql.Tx, locator int64) error {
+	if locator <= 0 {
+		return fmt.Errorf("%w: invalid timer locator", ErrUnsupportedSchema)
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rff_integrity_findings(kind, locator, category, field, detected_at)
+		SELECT 'timer', ?, 'invalid_timer', 'record', ? WHERE NOT EXISTS
+		(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup WHERE kind = 'timer' AND locator = ? AND resolved_at IS NULL)`,
+		locator, time.Now().UTC().Format(time.RFC3339Nano), locator); err != nil {
+		return fmt.Errorf("persist integrity finding: %w", err)
+	}
+	return timerFindingError{}
+}
+
+func timerQuarantined(ctx context.Context, tx *sql.Tx, locator int64) (bool, error) {
+	var quarantined bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_open_lookup
+		WHERE kind = 'timer' AND locator = ? AND resolved_at IS NULL)`, locator).Scan(&quarantined)
+	return quarantined, err
+}
+
+func loadIntegrityTimer(ctx context.Context, tx *sql.Tx, id string) (transition.TimerRecord, error) {
+	var locator, revision int64
+	var data []byte
+	err := tx.QueryRowContext(ctx, `SELECT row_id, record, revision FROM rff_timers WHERE id = ?`, id).Scan(&locator, &data, &revision)
+	if err != nil {
+		return transition.TimerRecord{}, err
+	}
+	if locator <= 0 || revision <= 0 {
+		return transition.TimerRecord{}, ErrUnsupportedSchema
+	}
+	quarantined, err := timerQuarantined(ctx, tx, locator)
+	if err != nil {
+		return transition.TimerRecord{}, err
+	}
+	if quarantined {
+		return transition.TimerRecord{}, transition.ErrIntegrity
+	}
+	record, err := decodeTimer(id, data)
+	if err != nil {
+		return transition.TimerRecord{}, recordTimerFinding(ctx, tx, locator)
+	}
+	return record, nil
+}
+
+func (s *Store[EntityID, StateID]) timerTransaction(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, rollbackErr)
+		}
+	}()
+	if err := validateIntegrityStructure(ctx, tx, false); err != nil {
+		return err
+	}
+	var missing bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_findings f INDEXED BY rff_integrity_open_lookup
+		WHERE f.kind = 'timer' AND f.resolved_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM rff_timers t WHERE t.row_id = f.locator))`).Scan(&missing); err != nil {
+		return err
+	}
+	if missing {
+		return transition.ErrIntegrity
+	}
+	result := fn(tx)
+	var detected timerFindingError
+	if result != nil && !errors.As(result, &detected) {
+		return result
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit timer transaction: %w", err)
+	}
+	return result
+}
