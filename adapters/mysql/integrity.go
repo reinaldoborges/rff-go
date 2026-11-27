@@ -128,6 +128,24 @@ func (m *IntegrityMaintenance) findings(ctx context.Context, actor, reason strin
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
+	for i := range result {
+		finding := &result[i]
+		if finding.Kind != "execution" || finding.Category != "invalid_execution" || finding.Field != "record" || finding.Revision <= 0 {
+			continue
+		}
+		snapshot, snapshotErr := loadExecutionRecoverySnapshot(ctx, tx, finding.Locator, false)
+		if errors.Is(snapshotErr, transition.ErrIntegrity) || errors.Is(snapshotErr, transition.ErrConflict) {
+			continue
+		}
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		finding.DependencyDigest, snapshotErr = executionRecoveryDigest(snapshot)
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		finding.DependenciesKnown = true
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -205,7 +223,8 @@ func (m *IntegrityMaintenance) audit(ctx context.Context, actor, reason string, 
 		}
 		audit.OccurredAt, err = time.Parse(time.RFC3339Nano, occurred)
 		if err != nil || audit.ID <= 0 || audit.FindingID != findingID || audit.Revision <= 0 ||
-			(audit.Action != "resolve" && audit.Action != "rebuild_hook" && audit.Action != "rebuild_notification") || audit.Actor == "" || audit.Reason == "" {
+			(audit.Action != "resolve" && audit.Action != "rebuild_hook" && audit.Action != "rebuild_notification" &&
+				audit.Action != "restore_execution") || audit.Actor == "" || audit.Reason == "" {
 			return nil, errors.Join(ErrUnsupportedSchema, rows.Close())
 		}
 		result = append(result, audit)

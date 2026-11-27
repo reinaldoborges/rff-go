@@ -78,16 +78,26 @@ const (
 	integrityHistoryIndexDDL     = `CREATE INDEX rff_integrity_history_lookup ON rff_integrity_findings(kind, locator, finding_id)`
 	integrityAuditDDL            = `CREATE TABLE rff_integrity_audit (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL)`
 	integrityAuditIndexDDL       = `CREATE INDEX rff_integrity_audit_lookup ON rff_integrity_audit(finding_id, audit_id)`
-	inputsDDL                    = `CREATE TABLE rff_inputs (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, channel BLOB NOT NULL, outcome_present INTEGER NOT NULL CHECK(outcome_present IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
-	continuationsDDL             = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
-	successorsDDL                = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
-	operationsDDL                = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
-	inputRevisionDDL             = `CREATE TRIGGER rff_input_revision AFTER UPDATE OF id, record, channel, outcome_present ON rff_inputs BEGIN UPDATE rff_inputs SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
-	inputRevisionGuardDDL        = `CREATE TRIGGER rff_input_revision_guard BEFORE UPDATE OF revision ON rff_inputs WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'input revision is monotonic'); END`
-	inputLocatorDDL              = `CREATE TRIGGER rff_input_locator BEFORE UPDATE OF row_id ON rff_inputs WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'input locator is immutable'); END`
-	inputAllocationDDL           = `CREATE TRIGGER rff_input_allocation AFTER INSERT ON rff_inputs WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'input' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'input locator was previously used'); END`
-	inputSelectionIndexDDL       = `CREATE INDEX rff_input_selection_lookup ON rff_inputs(channel, outcome_present, id)`
-	integrityChannelIndexDDL     = `CREATE INDEX rff_integrity_input_channel_lookup ON rff_integrity_findings(kind, scope_channel, resolved_at)`
+	integrityExecutionArchiveDDL = `CREATE TABLE rff_integrity_execution_archive (
+		finding_id INTEGER PRIMARY KEY REFERENCES rff_integrity_findings(finding_id),
+		locator INTEGER NOT NULL CHECK(locator > 0),
+		revision INTEGER NOT NULL CHECK(revision > 0),
+		record_digest BLOB NOT NULL CHECK(length(record_digest) = 32),
+		dependency_digest BLOB NOT NULL CHECK(length(dependency_digest) = 32),
+		record BLOB NOT NULL
+	)`
+	integrityExecutionArchiveUpdateGuardDDL = `CREATE TRIGGER rff_integrity_execution_archive_update_guard BEFORE UPDATE ON rff_integrity_execution_archive BEGIN SELECT RAISE(ABORT, 'integrity evidence is immutable'); END`
+	integrityExecutionArchiveDeleteGuardDDL = `CREATE TRIGGER rff_integrity_execution_archive_delete_guard BEFORE DELETE ON rff_integrity_execution_archive BEGIN SELECT RAISE(ABORT, 'integrity evidence is immutable'); END`
+	inputsDDL                               = `CREATE TABLE rff_inputs (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, channel BLOB NOT NULL, outcome_present INTEGER NOT NULL CHECK(outcome_present IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
+	continuationsDDL                        = `CREATE TABLE rff_continuations (digest BLOB PRIMARY KEY NOT NULL, record BLOB NOT NULL)`
+	successorsDDL                           = `CREATE TABLE rff_successors (digest BLOB PRIMARY KEY NOT NULL, entity BLOB NOT NULL, execution_id BLOB NOT NULL UNIQUE CHECK(length(execution_id) BETWEEN 1 AND 256), phase TEXT NOT NULL, record BLOB NOT NULL)`
+	operationsDDL                           = `CREATE TABLE rff_operations (execution_id TEXT NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), operation_key BLOB NOT NULL, record BLOB NOT NULL, PRIMARY KEY(execution_id, operation_key))`
+	inputRevisionDDL                        = `CREATE TRIGGER rff_input_revision AFTER UPDATE OF id, record, channel, outcome_present ON rff_inputs BEGIN UPDATE rff_inputs SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	inputRevisionGuardDDL                   = `CREATE TRIGGER rff_input_revision_guard BEFORE UPDATE OF revision ON rff_inputs WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'input revision is monotonic'); END`
+	inputLocatorDDL                         = `CREATE TRIGGER rff_input_locator BEFORE UPDATE OF row_id ON rff_inputs WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'input locator is immutable'); END`
+	inputAllocationDDL                      = `CREATE TRIGGER rff_input_allocation AFTER INSERT ON rff_inputs WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'input' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'input locator was previously used'); END`
+	inputSelectionIndexDDL                  = `CREATE INDEX rff_input_selection_lookup ON rff_inputs(channel, outcome_present, id)`
+	integrityChannelIndexDDL                = `CREATE INDEX rff_integrity_input_channel_lookup ON rff_integrity_findings(kind, scope_channel, resolved_at)`
 )
 
 func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {

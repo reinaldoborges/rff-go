@@ -87,12 +87,37 @@ func validateIntegrityStructure(ctx context.Context, tx *sql.Tx, full bool) erro
 			return fmt.Errorf("%w: incompatible integrity structure", ErrUnsupportedSchema)
 		}
 	}
+	if err := validateIntegrityExecutionArchiveStructure(ctx, tx); err != nil {
+		return err
+	}
 	var version, count int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0), COUNT(*) FROM rff_schema_version`).Scan(&version, &count); err != nil || version != adapterSchemaVersion || count != 1 {
 		return fmt.Errorf("%w: incompatible schema version", ErrUnsupportedSchema)
 	}
 	if full {
 		return validateIdentityIndexes(ctx, tx)
+	}
+	return nil
+}
+
+func validateIntegrityExecutionArchiveStructure(ctx context.Context, tx *sql.Tx) error {
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'rff_integrity_execution_archive'`).Scan(&exists); err != nil {
+		return fmt.Errorf("%w: inspect execution evidence archive: %w", ErrUnsupportedSchema, err)
+	}
+	if exists == 0 {
+		return nil
+	}
+	for name, expected := range map[string]string{
+		"rff_integrity_execution_archive":              integrityExecutionArchiveDDL,
+		"rff_integrity_execution_archive_update_guard": integrityExecutionArchiveUpdateGuardDDL,
+		"rff_integrity_execution_archive_delete_guard": integrityExecutionArchiveDeleteGuardDDL,
+	} {
+		var actual string
+		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name = ?`, name).Scan(&actual); err != nil || actual != expected {
+			return fmt.Errorf("%w: incompatible execution evidence archive", ErrUnsupportedSchema)
+		}
 	}
 	return nil
 }
@@ -195,6 +220,24 @@ func (m *IntegrityMaintenance) findings(ctx context.Context, actor, reason strin
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
+	for i := range result {
+		finding := &result[i]
+		if finding.Kind != "execution" || finding.Category != "invalid_execution" || finding.Field != "record" || finding.Revision <= 0 {
+			continue
+		}
+		snapshot, snapshotErr := loadExecutionRecoverySnapshot(ctx, tx, finding.Locator)
+		if errors.Is(snapshotErr, transition.ErrIntegrity) || errors.Is(snapshotErr, transition.ErrConflict) {
+			continue
+		}
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		finding.DependencyDigest, snapshotErr = executionRecoveryDigest(snapshot)
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		finding.DependenciesKnown = true
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -247,7 +290,8 @@ func (m *IntegrityMaintenance) audit(ctx context.Context, actor, reason string, 
 		}
 		audit.OccurredAt, err = time.Parse(time.RFC3339Nano, occurred)
 		if err != nil || audit.ID <= 0 || audit.FindingID != findingID || audit.Revision <= 0 ||
-			(audit.Action != "resolve" && audit.Action != "rebuild_hook" && audit.Action != "rebuild_notification") || audit.Actor == "" || audit.Reason == "" {
+			(audit.Action != "resolve" && audit.Action != "rebuild_hook" && audit.Action != "rebuild_notification" &&
+				audit.Action != "restore_execution") || audit.Actor == "" || audit.Reason == "" {
 			return nil, errors.Join(ErrUnsupportedSchema, rows.Close())
 		}
 		result = append(result, audit)
