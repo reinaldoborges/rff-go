@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -24,6 +25,44 @@ type notificationWork struct {
 	Compatibility *transition.CompatibilityDiagnostic
 }
 
+type notificationProjection struct {
+	completed              int64
+	dueSeconds             int64
+	dueNanoseconds         int64
+	leaseOwnerPresent      int64
+	leaseExpiresAtSeconds  sql.NullInt64
+	leaseExpiresAtNanosecs sql.NullInt64
+}
+
+func notificationProjectionFor(work notificationWork) (notificationProjection, error) {
+	if work.DueAt.IsZero() || (work.Owner == "") != work.ExpiresAt.IsZero() {
+		return notificationProjection{}, ErrUnsupportedSchema
+	}
+	projection := notificationProjection{
+		completed:         boolInt(work.Completed),
+		dueSeconds:        work.DueAt.Unix(),
+		dueNanoseconds:    int64(work.DueAt.Nanosecond()),
+		leaseOwnerPresent: boolInt(work.Owner != ""),
+	}
+	if work.Owner != "" {
+		projection.leaseExpiresAtSeconds = sql.NullInt64{Int64: work.ExpiresAt.Unix(), Valid: true}
+		projection.leaseExpiresAtNanosecs = sql.NullInt64{Int64: int64(work.ExpiresAt.Nanosecond()), Valid: true}
+	}
+	return projection, nil
+}
+
+func notificationProjectionMatches(work notificationWork, actual notificationProjection) bool {
+	expected, err := notificationProjectionFor(work)
+	return err == nil && expected == actual
+}
+
+func notificationProjectionArgs(projection notificationProjection) []any {
+	return []any{
+		projection.completed, projection.dueSeconds, projection.dueNanoseconds, projection.leaseOwnerPresent,
+		nullableInt64(projection.leaseExpiresAtSeconds), nullableInt64(projection.leaseExpiresAtNanosecs),
+	}
+}
+
 func validateNotification(execution diskRecord, work notificationWork) error {
 	if work.Version != 1 || work.IntentID == "" || work.IntentID != execution.NotificationIntentID ||
 		!execution.Notify || execution.CommitReceipt == nil || execution.CommitReceipt.Outcome != transition.CommitSucceeded ||
@@ -40,7 +79,9 @@ func validateNotification(execution diskRecord, work notificationWork) error {
 }
 
 func validateNotificationWork(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.record FROM rff_notification_work AS w
+	rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.record, w.completed, w.due_at_seconds,
+		w.due_at_nanoseconds, w.lease_owner_present, w.lease_expires_at_seconds, w.lease_expires_at_nanoseconds
+		FROM rff_notification_work AS w
 		LEFT JOIN rff_executions AS e ON e.id = w.execution_id`)
 	if err != nil {
 		return fmt.Errorf("%w: read notification work: %w", ErrUnsupportedSchema, err)
@@ -48,7 +89,10 @@ func validateNotificationWork(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var id string
 		var workData, executionData []byte
-		if err := rows.Scan(&id, &workData, &executionData); err != nil {
+		var projection notificationProjection
+		if err := rows.Scan(&id, &workData, &executionData, &projection.completed, &projection.dueSeconds,
+			&projection.dueNanoseconds, &projection.leaseOwnerPresent, &projection.leaseExpiresAtSeconds,
+			&projection.leaseExpiresAtNanosecs); err != nil {
 			return errors.Join(fmt.Errorf("%w: read notification work: %w", ErrUnsupportedSchema, err), rows.Close())
 		}
 		var work notificationWork
@@ -62,8 +106,66 @@ func validateNotificationWork(ctx context.Context, tx *sql.Tx) error {
 		if err := validateNotification(execution, work); err != nil {
 			return errors.Join(err, rows.Close())
 		}
+		if !notificationProjectionMatches(work, projection) {
+			return errors.Join(fmt.Errorf("%w: notification selection projection mismatch", ErrUnsupportedSchema), rows.Close())
+		}
 	}
 	return errors.Join(rows.Err(), rows.Close())
+}
+
+func loadNotificationExecution(ctx context.Context, tx *sql.Tx, id string, notificationLocator int64) ([]byte, diskRecord, error) {
+	var data, entity, reservationEntity []byte
+	var record diskRecord
+	var executionLocator, revision int64
+	var status string
+	var compatibility int64
+	var reservationLocator sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT e.row_id, e.revision, e.record, e.selection_status, e.selection_compatibility,
+		e.entity, a.row_id, a.entity FROM rff_executions e LEFT JOIN rff_active a ON a.execution_id = e.id
+		WHERE e.id = ? FOR UPDATE`, id).Scan(&executionLocator, &revision, &data, &status, &compatibility,
+		&entity, &reservationLocator, &reservationEntity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, record, recordNotificationFinding(ctx, tx, notificationLocator, "invalid_notification", "record")
+	}
+	if err != nil {
+		return nil, record, fmt.Errorf("read notification execution: %w", err)
+	}
+	if executionLocator <= 0 || revision <= 0 {
+		return nil, record, ErrUnsupportedSchema
+	}
+	quarantined, err := executionQuarantined(ctx, tx, executionLocator)
+	if err != nil {
+		return nil, record, fmt.Errorf("check notification execution quarantine: %w", err)
+	}
+	if quarantined {
+		return nil, record, transition.ErrIntegrity
+	}
+	if err := json.Unmarshal(data, &record); err != nil ||
+		!transition.SupportedExecutionSchema(record.SchemaVersion) || record.ID != id ||
+		transition.ValidateDurableID(record.ID) != nil || !bytes.Equal(entity, record.Entity) {
+		return nil, record, errors.Join(err, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record"))
+	}
+	if status != string(record.Status) || (compatibility == 1) != (record.Compatibility != nil) || compatibility < 0 || compatibility > 1 {
+		return nil, record, recordExecutionFinding(ctx, tx, id, "projection_mismatch", "selection")
+	}
+	if record.Status != transition.Notifying && record.Status != transition.Complete {
+		return nil, record, recordNotificationFinding(ctx, tx, notificationLocator, "invalid_notification", "record")
+	}
+	if reservationLocator.Valid {
+		quarantined, err := reservationQuarantined(ctx, tx, reservationLocator.Int64)
+		if err != nil {
+			return nil, record, fmt.Errorf("check notification reservation quarantine: %w", err)
+		}
+		if quarantined {
+			return nil, record, transition.ErrIntegrity
+		}
+		if record.Status != transition.Notifying || !bytes.Equal(entity, reservationEntity) {
+			return nil, record, recordReservationFinding(ctx, tx, reservationLocator.Int64)
+		}
+	} else if record.Status == transition.Notifying {
+		return nil, record, recordExecutionFinding(ctx, tx, id, "invalid_execution", "record")
+	}
+	return data, record, nil
 }
 
 // NotificationOutbox persists local handoff and independent delivery claims.
@@ -74,7 +176,31 @@ type NotificationOutbox[EntityID comparable, StateID comparable] struct {
 
 // CheckNotificationActivities validates the durable inventory without a claim.
 func (o *NotificationOutbox[EntityID, StateID]) CheckNotificationActivities(ctx context.Context) error {
-	return o.store.hookTransaction(ctx, func(tx *sql.Tx) error { return validateNotificationWork(ctx, tx) })
+	return o.store.hookTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT execution_id FROM rff_notification_work ORDER BY execution_id`)
+		if err != nil {
+			return fmt.Errorf("list notification work for integrity check: %w", err)
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return errors.Join(err, rows.Close())
+			}
+			ids = append(ids, id)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		for _, id := range ids {
+			_, err := notificationClaim(ctx, tx, transition.NotificationLease{ExecutionID: id}, now)
+			if err != nil && !errors.Is(err, transition.ErrStaleNotificationLease) {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // NewNotificationOutbox binds the outbox to a store and fence clock.
@@ -124,15 +250,35 @@ func (o *NotificationOutbox[EntityID, StateID]) Handoff(
 			return transition.ErrConflict
 		}
 		var data []byte
-		err = tx.QueryRowContext(ctx, `SELECT work FROM rff_notification_work WHERE execution_id = ?`, intent.ExecutionID).Scan(&data)
+		var locator, revision int64
+		var projection notificationProjection
+		err = tx.QueryRowContext(ctx, `SELECT row_id, work, revision, completed, due_at_seconds, due_at_nanoseconds,
+			lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds
+			FROM rff_notification_work WHERE execution_id = ? FOR UPDATE`, intent.ExecutionID).Scan(
+			&locator, &data, &revision, &projection.completed, &projection.dueSeconds, &projection.dueNanoseconds,
+			&projection.leaseOwnerPresent, &projection.leaseExpiresAtSeconds, &projection.leaseExpiresAtNanosecs,
+		)
 		if err == nil {
-			var work notificationWork
-			var record diskRecord
-			if err := json.Unmarshal(data, &work); err != nil {
-				return fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err)
+			if locator <= 0 || revision <= 0 {
+				return ErrUnsupportedSchema
 			}
-			if err := json.Unmarshal(executionData, &record); err != nil {
-				return fmt.Errorf("%w: decode notification execution: %w", ErrUnsupportedSchema, err)
+			quarantined, err := notificationQuarantined(ctx, tx, locator)
+			if err != nil {
+				return err
+			}
+			if quarantined {
+				return transition.ErrIntegrity
+			}
+			var work notificationWork
+			if err := json.Unmarshal(data, &work); err != nil {
+				return errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"), err)
+			}
+			if !notificationProjectionMatches(work, projection) {
+				return recordNotificationFinding(ctx, tx, locator, "projection_mismatch", "selection")
+			}
+			_, record, err := loadNotificationExecution(ctx, tx, intent.ExecutionID, locator)
+			if err != nil {
+				return err
 			}
 			return validateNotification(record, work)
 		}
@@ -148,11 +294,19 @@ func (o *NotificationOutbox[EntityID, StateID]) Handoff(
 			return transition.ErrInvalidHook
 		}
 		work := notificationWork{Version: 1, IntentID: intent.ID, DueAt: now.UTC()}
+		projection, err = notificationProjectionFor(work)
+		if err != nil {
+			return err
+		}
 		data, err = json.Marshal(work)
 		if err != nil {
 			return fmt.Errorf("encode notification work: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_notification_work (execution_id, work) VALUES (?, ?)`, intent.ExecutionID, data); err != nil {
+		args := append([]any{intent.ExecutionID, data}, notificationProjectionArgs(projection)...)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rff_notification_work
+			(execution_id, work, completed, due_at_seconds, due_at_nanoseconds, lease_owner_present,
+			 lease_expires_at_seconds, lease_expires_at_nanoseconds)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
 			return fmt.Errorf("create notification work: %w", err)
 		}
 		return nil
@@ -160,11 +314,18 @@ func (o *NotificationOutbox[EntityID, StateID]) Handoff(
 }
 
 func saveNotification(ctx context.Context, tx *sql.Tx, id string, work notificationWork) error {
+	projection, err := notificationProjectionFor(work)
+	if err != nil {
+		return err
+	}
 	data, err := json.Marshal(work)
 	if err != nil {
 		return fmt.Errorf("encode notification work: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE rff_notification_work SET work = ? WHERE execution_id = ?`, data, id); err != nil {
+	args := notificationProjectionArgs(projection)
+	args = append(args, data, id)
+	if _, err := tx.ExecContext(ctx, `UPDATE rff_notification_work SET completed = ?, due_at_seconds = ?, due_at_nanoseconds = ?,
+		lease_owner_present = ?, lease_expires_at_seconds = ?, lease_expires_at_nanoseconds = ?, work = ? WHERE execution_id = ?`, args...); err != nil {
 		return fmt.Errorf("save notification work: %w", err)
 	}
 	return nil
@@ -172,27 +333,51 @@ func saveNotification(ctx context.Context, tx *sql.Tx, id string, work notificat
 
 // ReadNotificationCompatibility returns a delivery diagnostic without decoding the intent.
 func (o *NotificationOutbox[EntityID, StateID]) ReadNotificationCompatibility(ctx context.Context, id string) (*transition.CompatibilityDiagnostic, error) {
-	var data, executionData []byte
-	err := o.store.db.QueryRowContext(ctx, `SELECT w.work, e.record FROM rff_notification_work AS w
-		JOIN rff_executions AS e ON e.id = w.execution_id WHERE w.execution_id = ?`, id).Scan(&data, &executionData)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, transition.ErrNoNotificationActivity
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read notification compatibility: %w", err)
-	}
-	var work notificationWork
-	var record diskRecord
-	if err := json.Unmarshal(data, &work); err != nil {
-		return nil, fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err)
-	}
-	if err := json.Unmarshal(executionData, &record); err != nil || record.ID != id {
-		return nil, fmt.Errorf("%w: invalid notification execution", ErrUnsupportedSchema)
-	}
-	if err := validateNotification(record, work); err != nil {
-		return nil, err
-	}
-	return work.Compatibility, nil
+	var diagnostic *transition.CompatibilityDiagnostic
+	err := o.store.hookTransaction(ctx, func(tx *sql.Tx) error {
+		var data []byte
+		var locator, revision int64
+		var projection notificationProjection
+		err := tx.QueryRowContext(ctx, `SELECT row_id, work, revision, completed, due_at_seconds, due_at_nanoseconds,
+			lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds
+			FROM rff_notification_work WHERE execution_id = ? FOR UPDATE`, id).Scan(
+			&locator, &data, &revision, &projection.completed, &projection.dueSeconds, &projection.dueNanoseconds,
+			&projection.leaseOwnerPresent, &projection.leaseExpiresAtSeconds, &projection.leaseExpiresAtNanosecs,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return transition.ErrNoNotificationActivity
+		}
+		if err != nil {
+			return fmt.Errorf("read notification compatibility: %w", err)
+		}
+		if locator <= 0 || revision <= 0 {
+			return ErrUnsupportedSchema
+		}
+		quarantined, err := notificationQuarantined(ctx, tx, locator)
+		if err != nil {
+			return err
+		}
+		if quarantined {
+			return transition.ErrIntegrity
+		}
+		var work notificationWork
+		if err := json.Unmarshal(data, &work); err != nil {
+			return errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"), err)
+		}
+		if !notificationProjectionMatches(work, projection) {
+			return recordNotificationFinding(ctx, tx, locator, "projection_mismatch", "selection")
+		}
+		_, record, err := loadNotificationExecution(ctx, tx, id, locator)
+		if err != nil {
+			return err
+		}
+		if err := validateNotification(record, work); err != nil {
+			return errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"), err)
+		}
+		diagnostic = work.Compatibility
+		return nil
+	})
+	return diagnostic, err
 }
 
 // ClaimNotification claims a due notification, counting this delivery attempt.
@@ -210,54 +395,92 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 		if err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT w.execution_id, w.work, e.record FROM rff_notification_work AS w
-			JOIN rff_executions AS e ON e.id = w.execution_id ORDER BY w.execution_id`)
-		if err != nil {
-			return fmt.Errorf("list notification work: %w", err)
-		}
+		const candidates = `SELECT w.row_id, w.execution_id, w.work, w.revision,
+			w.completed, w.due_at_seconds, w.due_at_nanoseconds, w.lease_owner_present,
+			w.lease_expires_at_seconds, w.lease_expires_at_nanoseconds
+			FROM rff_notification_work AS w
+			WHERE w.completed = 0 AND w.execution_id > ?
+				AND (w.due_at_seconds < ? OR (w.due_at_seconds = ? AND w.due_at_nanoseconds <= ?))
+				AND (w.lease_owner_present = 0 OR w.lease_expires_at_seconds < ? OR
+					(w.lease_expires_at_seconds = ? AND w.lease_expires_at_nanoseconds <= ?))
+			ORDER BY w.execution_id LIMIT 1 FOR UPDATE`
 		var id string
 		var work notificationWork
 		var execution transition.Execution[EntityID, StateID]
-		blocked := make(map[string]notificationWork)
-		for rows.Next() {
+		type blockedWork struct {
+			id   string
+			work notificationWork
+		}
+		var blocked []blockedWork
+		lastID := ""
+		for {
 			var candidateID string
-			var data, candidateExecution []byte
-			if err := rows.Scan(&candidateID, &data, &candidateExecution); err != nil {
-				return errors.Join(err, rows.Close())
+			var data []byte
+			var locator, revision int64
+			var projection notificationProjection
+			err := tx.QueryRowContext(ctx, candidates, lastID,
+				now.Unix(), now.Unix(), now.Nanosecond(), now.Unix(), now.Unix(), now.Nanosecond(),
+			).Scan(&locator, &candidateID, &data, &revision, &projection.completed,
+				&projection.dueSeconds, &projection.dueNanoseconds, &projection.leaseOwnerPresent,
+				&projection.leaseExpiresAtSeconds, &projection.leaseExpiresAtNanosecs)
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("select eligible notification work: %w", err)
+			}
+			if locator <= 0 || revision <= 0 {
+				return ErrUnsupportedSchema
+			}
+			quarantined, err := notificationQuarantined(ctx, tx, locator)
+			if err != nil {
+				return fmt.Errorf("check notification quarantine: %w", err)
+			}
+			if quarantined {
+				unavailable = errors.Join(unavailable, transition.ErrIntegrity)
+				lastID = candidateID
+				continue
 			}
 			var candidate notificationWork
-			var record diskRecord
 			if err := json.Unmarshal(data, &candidate); err != nil {
-				return errors.Join(fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err), rows.Close())
+				return errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"),
+					fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err))
 			}
-			if err := json.Unmarshal(candidateExecution, &record); err != nil || record.ID != candidateID {
-				return errors.Join(fmt.Errorf("%w: invalid notification execution", ErrUnsupportedSchema), err, rows.Close())
+			if !notificationProjectionMatches(candidate, projection) {
+				return recordNotificationFinding(ctx, tx, locator, "projection_mismatch", "selection")
+			}
+			candidateExecution, record, err := loadNotificationExecution(ctx, tx, candidateID, locator)
+			if err != nil {
+				if errors.Is(err, transition.ErrIntegrity) {
+					unavailable = errors.Join(unavailable, err)
+					lastID = candidateID
+					continue
+				}
+				return err
 			}
 			if err := validateNotification(record, candidate); err != nil {
-				return errors.Join(err, rows.Close())
-			}
-			if candidate.Completed || now.Before(candidate.DueAt) || candidate.Owner != "" && now.Before(candidate.ExpiresAt) {
-				continue
+				return errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"), err)
 			}
 			decoded, decodeErr := o.store.decodeRecord(candidateExecution)
 			if decodeErr != nil {
 				var compatibility *transition.CompatibilityError
-				if !errors.As(decodeErr, &compatibility) || !validDiagnostic(record, compatibility.Diagnostic) {
-					return errors.Join(decodeErr, rows.Close())
+				if !errors.As(decodeErr, &compatibility) {
+					return errors.Join(recordExecutionFinding(ctx, tx, candidateID, "invalid_execution", "record"), decodeErr)
+				}
+				if !validDiagnostic(record, compatibility.Diagnostic) {
+					return errors.Join(recordExecutionFinding(ctx, tx, candidateID, "invalid_execution", "record"), decodeErr)
 				}
 				candidate.Compatibility = &compatibility.Diagnostic
-				blocked[candidateID] = candidate
+				blocked = append(blocked, blockedWork{id: candidateID, work: candidate})
 				unavailable = errors.Join(unavailable, decodeErr)
+				lastID = candidateID
 				continue
 			}
 			id, work, execution = candidateID, candidate, decoded
 			break
 		}
-		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-			return fmt.Errorf("list notification work: %w", err)
-		}
-		for blockedID, blockedWork := range blocked {
-			if err := saveNotification(ctx, tx, blockedID, blockedWork); err != nil {
+		for _, candidate := range blocked {
+			if err := saveNotification(ctx, tx, candidate.id, candidate.work); err != nil {
 				return err
 			}
 		}
@@ -297,24 +520,43 @@ func notificationClaim(ctx context.Context, tx *sql.Tx, lease transition.Notific
 		return notificationWork{}, errors.Join(err, transition.ErrStaleNotificationLease)
 	}
 	var work notificationWork
-	var data, executionData []byte
-	err := tx.QueryRowContext(ctx, `SELECT w.work, e.record FROM rff_notification_work AS w
-		JOIN rff_executions AS e ON e.id = w.execution_id WHERE w.execution_id = ?`, lease.ExecutionID).Scan(&data, &executionData)
+	var data []byte
+	var locator, revision int64
+	var projection notificationProjection
+	err := tx.QueryRowContext(ctx, `SELECT row_id, work, revision, completed, due_at_seconds, due_at_nanoseconds,
+		lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds
+		FROM rff_notification_work WHERE execution_id = ? FOR UPDATE`, lease.ExecutionID).Scan(
+		&locator, &data, &revision, &projection.completed, &projection.dueSeconds, &projection.dueNanoseconds,
+		&projection.leaseOwnerPresent, &projection.leaseExpiresAtSeconds, &projection.leaseExpiresAtNanosecs,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return work, transition.ErrStaleNotificationLease
 	}
 	if err != nil {
 		return work, fmt.Errorf("read notification claim: %w", err)
 	}
-	var execution diskRecord
+	if locator <= 0 || revision <= 0 {
+		return work, ErrUnsupportedSchema
+	}
+	quarantined, err := notificationQuarantined(ctx, tx, locator)
+	if err != nil {
+		return work, fmt.Errorf("check notification quarantine: %w", err)
+	}
+	if quarantined {
+		return work, transition.ErrIntegrity
+	}
 	if err := json.Unmarshal(data, &work); err != nil {
 		return work, fmt.Errorf("%w: decode notification work: %w", ErrUnsupportedSchema, err)
 	}
-	if err := json.Unmarshal(executionData, &execution); err != nil || execution.ID != lease.ExecutionID {
-		return work, errors.Join(fmt.Errorf("%w: invalid notification execution", ErrUnsupportedSchema), err)
+	if !notificationProjectionMatches(work, projection) {
+		return work, recordNotificationFinding(ctx, tx, locator, "projection_mismatch", "selection")
+	}
+	_, execution, err := loadNotificationExecution(ctx, tx, lease.ExecutionID, locator)
+	if err != nil {
+		return work, err
 	}
 	if err := validateNotification(execution, work); err != nil {
-		return work, err
+		return work, errors.Join(recordNotificationFinding(ctx, tx, locator, "invalid_notification", "record"), err)
 	}
 	if now.IsZero() || lease.Owner == "" || lease.Generation == 0 || work.Completed || work.Owner != lease.Owner ||
 		work.IntentID != lease.IntentID || work.Generation != lease.Generation || !now.Before(work.ExpiresAt) {

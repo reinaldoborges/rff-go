@@ -30,7 +30,9 @@ func TestUnsupportedSchemaFailsWithoutWriting(t *testing.T) {
 		{"unreadable hook work", `INSERT INTO rff_hook_work (
 			execution_id, work, dispatch_kind, started, completed, available_at_seconds, available_at_nanoseconds, lease_owner_present
 		) VALUES ('missing', X'ff', 'enter', 0, 0, 0, 0, 0)`},
-		{"unreadable notification work", `INSERT INTO rff_notification_work (execution_id, work) VALUES ('missing', X'ff')`},
+		{"unreadable notification work", `INSERT INTO rff_notification_work
+			(execution_id, work, completed, due_at_seconds, due_at_nanoseconds, lease_owner_present)
+			VALUES ('missing', X'ff', 0, 0, 0, 0)`},
 		{"unreadable timer", `INSERT INTO rff_timers (id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, record)
 			VALUES ('timer', 0, 0, 0, 0, X'ff')`},
 		{"new timer record in old adapter schema", `UPDATE rff_schema_version SET version = 8;

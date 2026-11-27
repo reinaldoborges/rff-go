@@ -511,6 +511,25 @@ sweep. Authorized resolution rebuilds projection fields from the current
 readable serialized timer; it cannot discover rows hidden by incorrect
 metadata. No latency improvement is claimed.
 
+### Notification selection integrity
+
+SQLite and MySQL select due, uncompleted notifications in full execution-ID
+byte order and compare each selected candidate's due, completion, and lease
+projection with its serialized work before claiming it. Due-time and lease
+expiry equality remain eligible. A prior compatibility diagnostic does not
+remove work from selection: incompatible candidates are rechecked in order,
+their diagnostics are persisted, and a later successful claim still succeeds.
+
+Notification projections are also only selection aids. Corrupt metadata can
+hide otherwise eligible work or change which notification appears globally
+first; validating selected candidates cannot detect rows filtered out by that
+metadata. This path does not promise global completeness under hidden
+projection corruption or run a mandatory full sweep. A detected mismatch
+quarantines that notification; execution and reservation findings also block
+dependent notification operations while independent work remains eligible.
+Authorized maintenance can rebuild a detected notification projection from
+its readable serialized work and record the repair in the audit history.
+
 Use `sqlite.OpenIntegrityMaintenance` or `mysql.OpenIntegrityMaintenance`
 with a host authorization callback to inspect and resolve findings without
 starting workers or initializing the normal store. Every inspection, audit

@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const adapterSchemaVersion = 8
+const adapterSchemaVersion = 9
 
 const (
 	schemaVersionDDL = `CREATE TABLE rff_schema_version (
@@ -67,7 +67,19 @@ const (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		execution_id VARBINARY(256) NOT NULL,
 		work LONGBLOB NOT NULL,
-		UNIQUE KEY rff_notification_execution_lookup (execution_id)
+		completed TINYINT UNSIGNED NOT NULL,
+		due_at_seconds BIGINT NOT NULL,
+		due_at_nanoseconds INT UNSIGNED NOT NULL,
+		lease_owner_present TINYINT UNSIGNED NOT NULL,
+		lease_expires_at_seconds BIGINT,
+		lease_expires_at_nanoseconds INT UNSIGNED,
+		revision BIGINT NOT NULL DEFAULT 1,
+		CONSTRAINT rff_notification_flags CHECK (completed IN (0, 1) AND lease_owner_present IN (0, 1)),
+		CONSTRAINT rff_notification_due CHECK (due_at_nanoseconds <= 999999999),
+		CONSTRAINT rff_notification_lease CHECK ((lease_owner_present = 0 AND lease_expires_at_seconds IS NULL AND lease_expires_at_nanoseconds IS NULL) OR
+			(lease_owner_present = 1 AND lease_expires_at_seconds IS NOT NULL AND lease_expires_at_nanoseconds IS NOT NULL AND lease_expires_at_nanoseconds <= 999999999)),
+		UNIQUE KEY rff_notification_execution_lookup (execution_id),
+		KEY rff_notification_ready_lookup (completed, execution_id, due_at_seconds, due_at_nanoseconds, lease_owner_present, lease_expires_at_seconds, lease_expires_at_nanoseconds)
 	) ENGINE=InnoDB`
 	timersDDL = `CREATE TABLE rff_timers (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -90,23 +102,27 @@ const (
 		UNIQUE KEY rff_timer_id_lookup (id),
 		KEY rff_timer_deadline_lookup (completed, compatibility_blocked, deadline_seconds, deadline_nanoseconds, id)
 	) ENGINE=InnoDB`
-	timerRevisionAction       = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
-	timerRevisionDDL          = `CREATE TRIGGER rff_timer_revision BEFORE UPDATE ON rff_timers FOR EACH ROW ` + timerRevisionAction
-	timerAllocationAction     = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'timer' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'timer locator was previously used'; END IF; END`
-	timerAllocationDDL        = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers FOR EACH ROW ` + timerAllocationAction
-	executionRevisionAction   = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
-	executionRevisionDDL      = `CREATE TRIGGER rff_execution_revision BEFORE UPDATE ON rff_executions FOR EACH ROW ` + executionRevisionAction
-	executionAllocationAction = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'execution' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'execution locator was previously used'; END IF; END`
-	executionAllocationDDL    = `CREATE TRIGGER rff_execution_allocation AFTER INSERT ON rff_executions FOR EACH ROW ` + executionAllocationAction
-	activeRevisionAction      = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
-	activeRevisionDDL         = `CREATE TRIGGER rff_active_revision BEFORE UPDATE ON rff_active FOR EACH ROW ` + activeRevisionAction
-	activeAllocationAction    = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'reservation' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'reservation locator was previously used'; END IF; END`
-	activeAllocationDDL       = `CREATE TRIGGER rff_active_allocation AFTER INSERT ON rff_active FOR EACH ROW ` + activeAllocationAction
-	hookRevisionAction        = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
-	hookRevisionDDL           = `CREATE TRIGGER rff_hook_revision BEFORE UPDATE ON rff_hook_work FOR EACH ROW ` + hookRevisionAction
-	hookAllocationAction      = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'hook' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hook locator was previously used'; END IF; END`
-	hookAllocationDDL         = `CREATE TRIGGER rff_hook_allocation AFTER INSERT ON rff_hook_work FOR EACH ROW ` + hookAllocationAction
-	integrityFindingsDDL      = `CREATE TABLE rff_integrity_findings (
+	timerRevisionAction          = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	timerRevisionDDL             = `CREATE TRIGGER rff_timer_revision BEFORE UPDATE ON rff_timers FOR EACH ROW ` + timerRevisionAction
+	timerAllocationAction        = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'timer' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'timer locator was previously used'; END IF; END`
+	timerAllocationDDL           = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers FOR EACH ROW ` + timerAllocationAction
+	executionRevisionAction      = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	executionRevisionDDL         = `CREATE TRIGGER rff_execution_revision BEFORE UPDATE ON rff_executions FOR EACH ROW ` + executionRevisionAction
+	executionAllocationAction    = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'execution' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'execution locator was previously used'; END IF; END`
+	executionAllocationDDL       = `CREATE TRIGGER rff_execution_allocation AFTER INSERT ON rff_executions FOR EACH ROW ` + executionAllocationAction
+	activeRevisionAction         = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	activeRevisionDDL            = `CREATE TRIGGER rff_active_revision BEFORE UPDATE ON rff_active FOR EACH ROW ` + activeRevisionAction
+	activeAllocationAction       = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'reservation' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'reservation locator was previously used'; END IF; END`
+	activeAllocationDDL          = `CREATE TRIGGER rff_active_allocation AFTER INSERT ON rff_active FOR EACH ROW ` + activeAllocationAction
+	hookRevisionAction           = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	hookRevisionDDL              = `CREATE TRIGGER rff_hook_revision BEFORE UPDATE ON rff_hook_work FOR EACH ROW ` + hookRevisionAction
+	hookAllocationAction         = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'hook' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hook locator was previously used'; END IF; END`
+	hookAllocationDDL            = `CREATE TRIGGER rff_hook_allocation AFTER INSERT ON rff_hook_work FOR EACH ROW ` + hookAllocationAction
+	notificationRevisionAction   = `SET NEW.revision = IF(NEW.row_id = OLD.row_id, OLD.revision + 1, NULL)`
+	notificationRevisionDDL      = `CREATE TRIGGER rff_notification_revision BEFORE UPDATE ON rff_notification_work FOR EACH ROW ` + notificationRevisionAction
+	notificationAllocationAction = `BEGIN IF EXISTS (SELECT 1 FROM rff_integrity_findings WHERE kind = 'notification' AND locator = NEW.row_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'notification locator was previously used'; END IF; END`
+	notificationAllocationDDL    = `CREATE TRIGGER rff_notification_allocation AFTER INSERT ON rff_notification_work FOR EACH ROW ` + notificationAllocationAction
+	integrityFindingsDDL         = `CREATE TABLE rff_integrity_findings (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		kind VARBINARY(16) NOT NULL,
 		locator BIGINT UNSIGNED NOT NULL,
@@ -115,9 +131,9 @@ const (
 		detected_at VARBINARY(64) NOT NULL,
 		resolved_at VARBINARY(64) NOT NULL,
 		open_marker BIGINT UNSIGNED NOT NULL,
-		CONSTRAINT rff_finding_kind CHECK (kind IN (_binary'timer', _binary'hook', _binary'execution', _binary'reservation')),
+		CONSTRAINT rff_finding_kind CHECK (kind IN (_binary'timer', _binary'hook', _binary'notification', _binary'execution', _binary'reservation')),
 		CONSTRAINT rff_finding_locator CHECK (locator > 0),
-		CONSTRAINT rff_finding_category CHECK (category IN (_binary'invalid_timer', _binary'projection_mismatch', _binary'invalid_execution', _binary'invalid_reservation', _binary'invalid_hook')),
+		CONSTRAINT rff_finding_category CHECK (category IN (_binary'invalid_timer', _binary'projection_mismatch', _binary'invalid_execution', _binary'invalid_reservation', _binary'invalid_hook', _binary'invalid_notification')),
 		CONSTRAINT rff_finding_field CHECK (field IN (_binary'record', _binary'selection', _binary'active')),
 		CONSTRAINT rff_finding_status CHECK ((open_marker = 0 AND resolved_at = _binary'') OR (open_marker > 0 AND resolved_at <> _binary'')),
 		UNIQUE KEY rff_integrity_open_lookup (kind, locator, open_marker),
@@ -127,7 +143,7 @@ const (
 		row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		finding_id BIGINT UNSIGNED NOT NULL,
 		revision BIGINT NOT NULL,
-		action VARBINARY(16) NOT NULL,
+		action VARBINARY(32) NOT NULL,
 		actor LONGBLOB NOT NULL,
 		reason LONGBLOB NOT NULL,
 		occurred_at VARBINARY(64) NOT NULL,
@@ -225,6 +241,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			hookWorkDDL,
 			hookRevisionDDL,
 			notificationWorkDDL,
+			notificationRevisionDDL,
 			timersDDL,
 			timerRevisionDDL,
 			integrityFindingsDDL,
@@ -232,6 +249,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			executionAllocationDDL,
 			activeAllocationDDL,
 			hookAllocationDDL,
+			notificationAllocationDDL,
 			timerAllocationDDL,
 			inputsDDL,
 			continuationsDDL,
@@ -352,10 +370,10 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 		"rff_active":             {{"row_id", "bigint unsigned"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"revision", "bigint"}},
 		"rff_transition_leases":  {{"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"owner", "longblob"}, {"generation", "bigint"}, {"expires_at", "varchar(64)"}},
 		"rff_hook_work":          {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"dispatch_kind", "varbinary(16)"}, {"started", "tinyint unsigned"}, {"completed", "tinyint unsigned"}, {"available_at_seconds", "bigint"}, {"available_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
-		"rff_notification_work":  {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}},
+		"rff_notification_work":  {{"row_id", "bigint unsigned"}, {"execution_id", "varbinary(256)"}, {"work", "longblob"}, {"completed", "tinyint unsigned"}, {"due_at_seconds", "bigint"}, {"due_at_nanoseconds", "int unsigned"}, {"lease_owner_present", "tinyint unsigned"}, {"lease_expires_at_seconds", "bigint"}, {"lease_expires_at_nanoseconds", "int unsigned"}, {"revision", "bigint"}},
 		"rff_timers":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"deadline_seconds", "bigint"}, {"deadline_nanoseconds", "int"}, {"completed", "tinyint"}, {"compatibility_blocked", "tinyint"}, {"lease_expires_seconds", "bigint"}, {"lease_expires_nanoseconds", "int"}, {"record", "longblob"}, {"revision", "bigint"}},
 		"rff_integrity_findings": {{"row_id", "bigint unsigned"}, {"kind", "varbinary(16)"}, {"locator", "bigint unsigned"}, {"category", "varbinary(32)"}, {"field", "varbinary(32)"}, {"detected_at", "varbinary(64)"}, {"resolved_at", "varbinary(64)"}, {"open_marker", "bigint unsigned"}},
-		"rff_integrity_audit":    {{"row_id", "bigint unsigned"}, {"finding_id", "bigint unsigned"}, {"revision", "bigint"}, {"action", "varbinary(16)"}, {"actor", "longblob"}, {"reason", "longblob"}, {"occurred_at", "varbinary(64)"}},
+		"rff_integrity_audit":    {{"row_id", "bigint unsigned"}, {"finding_id", "bigint unsigned"}, {"revision", "bigint"}, {"action", "varbinary(32)"}, {"actor", "longblob"}, {"reason", "longblob"}, {"occurred_at", "varbinary(64)"}},
 		"rff_inputs":             {{"row_id", "bigint unsigned"}, {"id", "varbinary(256)"}, {"record", "longblob"}},
 		"rff_continuations":      {{"digest", "binary(32)"}, {"record", "longblob"}},
 		"rff_successors":         {{"digest", "binary(32)"}, {"entity", "longblob"}, {"execution_id", "varbinary(256)"}, {"phase", "varbinary(16)"}, {"record", "longblob"}},
@@ -406,6 +424,7 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 			}
 			nullable := "NO"
 			if (table == "rff_hook_work" && (wanted[i].name == "lease_expires_at_seconds" || wanted[i].name == "lease_expires_at_nanoseconds")) ||
+				(table == "rff_notification_work" && (wanted[i].name == "lease_expires_at_seconds" || wanted[i].name == "lease_expires_at_nanoseconds")) ||
 				(table == "rff_timers" && (wanted[i].name == "lease_expires_seconds" || wanted[i].name == "lease_expires_nanoseconds")) {
 				nullable = "YES"
 			}
@@ -442,6 +461,8 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 		{"rff_active_allocation", activeAllocationAction, "AFTER", "INSERT", "rff_active"},
 		{"rff_hook_revision", hookRevisionAction, "BEFORE", "UPDATE", "rff_hook_work"},
 		{"rff_hook_allocation", hookAllocationAction, "AFTER", "INSERT", "rff_hook_work"},
+		{"rff_notification_revision", notificationRevisionAction, "BEFORE", "UPDATE", "rff_notification_work"},
+		{"rff_notification_allocation", notificationAllocationAction, "AFTER", "INSERT", "rff_notification_work"},
 	} {
 		var statement, timing, event, table string
 		if err := db.QueryRowContext(ctx, `SELECT action_statement, action_timing, event_manipulation, event_object_table
@@ -459,15 +480,18 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 		"rff_timer_completion":           {table: "rff_timers", clause: "(`completed` in (0,1))"},
 		"rff_timer_compatibility":        {table: "rff_timers", clause: "(`compatibility_blocked` in (0,1))"},
 		"rff_timer_lease_pair":           {table: "rff_timers", clause: "(((`lease_expires_seconds` is null) and (`lease_expires_nanoseconds` is null)) or ((`lease_expires_seconds` is not null) and (`lease_expires_nanoseconds` is not null) and (`lease_expires_nanoseconds` between 0 and 999999999)))"},
-		"rff_finding_kind":               {table: "rff_integrity_findings", clause: "(`kind` in (_binary\\'timer\\',_binary\\'hook\\',_binary\\'execution\\',_binary\\'reservation\\'))"},
+		"rff_finding_kind":               {table: "rff_integrity_findings", clause: "(`kind` in (_binary\\'timer\\',_binary\\'hook\\',_binary\\'notification\\',_binary\\'execution\\',_binary\\'reservation\\'))"},
 		"rff_finding_locator":            {table: "rff_integrity_findings", clause: "(`locator` > 0)"},
-		"rff_finding_category":           {table: "rff_integrity_findings", clause: "(`category` in (_binary\\'invalid_timer\\',_binary\\'projection_mismatch\\',_binary\\'invalid_execution\\',_binary\\'invalid_reservation\\',_binary\\'invalid_hook\\'))"},
+		"rff_finding_category":           {table: "rff_integrity_findings", clause: "(`category` in (_binary\\'invalid_timer\\',_binary\\'projection_mismatch\\',_binary\\'invalid_execution\\',_binary\\'invalid_reservation\\',_binary\\'invalid_hook\\',_binary\\'invalid_notification\\'))"},
 		"rff_finding_field":              {table: "rff_integrity_findings", clause: "(`field` in (_binary\\'record\\',_binary\\'selection\\',_binary\\'active\\'))"},
 		"rff_finding_status":             {table: "rff_integrity_findings", clause: "(((`open_marker` = 0) and (`resolved_at` = _binary\\'\\')) or ((`open_marker` > 0) and (`resolved_at` <> _binary\\'\\')))"},
 		"rff_hook_flags":                 {table: "rff_hook_work", clause: "((`started` in (0,1)) and (`completed` in (0,1)) and (`lease_owner_present` in (0,1)))"},
 		"rff_hook_dispatch":              {table: "rff_hook_work", clause: "(`dispatch_kind` in (_binary\\'enter\\',_binary\\'transition\\',_binary\\'retry\\',_binary\\'recover\\'))"},
 		"rff_hook_time":                  {table: "rff_hook_work", clause: "(`available_at_nanoseconds` <= 999999999)"},
 		"rff_hook_lease":                 {table: "rff_hook_work", clause: "(((`lease_owner_present` = 0) and (`lease_expires_at_seconds` is null) and (`lease_expires_at_nanoseconds` is null)) or ((`lease_owner_present` = 1) and (`lease_expires_at_seconds` is not null) and (`lease_expires_at_nanoseconds` is not null) and (`lease_expires_at_nanoseconds` <= 999999999)))"},
+		"rff_notification_flags":         {table: "rff_notification_work", clause: "((`completed` in (0,1)) and (`lease_owner_present` in (0,1)))"},
+		"rff_notification_due":           {table: "rff_notification_work", clause: "(`due_at_nanoseconds` <= 999999999)"},
+		"rff_notification_lease":         {table: "rff_notification_work", clause: "(((`lease_owner_present` = 0) and (`lease_expires_at_seconds` is null) and (`lease_expires_at_nanoseconds` is null)) or ((`lease_owner_present` = 1) and (`lease_expires_at_seconds` is not null) and (`lease_expires_at_nanoseconds` is not null) and (`lease_expires_at_nanoseconds` <= 999999999)))"},
 	} {
 		var clause, enforced string
 		err := db.QueryRowContext(ctx, `SELECT c.check_clause, t.enforced FROM information_schema.check_constraints c
@@ -477,7 +501,7 @@ func validateMySQLSchema(ctx context.Context, db schemaReader, timerOnly bool) e
 			return fmt.Errorf("%w: incompatible integrity constraint %s: clause=%q enforced=%q", ErrUnsupportedSchema, name, clause, enforced)
 		}
 	}
-	for _, table := range []string{"rff_timers", "rff_executions", "rff_active", "rff_hook_work"} {
+	for _, table := range []string{"rff_timers", "rff_executions", "rff_active", "rff_hook_work", "rff_notification_work"} {
 		var revisionDefault sql.NullString
 		if err := db.QueryRowContext(ctx, `SELECT column_default FROM information_schema.columns
 			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'revision'`, table).Scan(&revisionDefault); err != nil ||
@@ -507,9 +531,13 @@ func validateMySQLIndexes(ctx context.Context, db schemaReader, timerOnly bool) 
 			"rff_active_entity_lookup":    {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true},
 			"rff_active_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
 		},
-		"rff_transition_leases":  {"rff_lease_entity_lookup": {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true}},
-		"rff_hook_work":          {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}, "rff_hook_ready_lookup": {columns: []string{"completed", "started", "available_at_seconds", "available_at_nanoseconds", "execution_id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
-		"rff_notification_work":  {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}},
+		"rff_transition_leases": {"rff_lease_entity_lookup": {columns: []string{"entity"}, prefixLengths: []int{256}, nonUnique: true}},
+		"rff_hook_work":         {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_hook_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}}, "rff_hook_ready_lookup": {columns: []string{"completed", "started", "available_at_seconds", "available_at_nanoseconds", "execution_id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
+		"rff_notification_work": {
+			"PRIMARY":                           {columns: []string{"row_id"}, prefixLengths: []int{0}},
+			"rff_notification_execution_lookup": {columns: []string{"execution_id"}, prefixLengths: []int{0}},
+			"rff_notification_ready_lookup":     {columns: []string{"completed", "execution_id", "due_at_seconds", "due_at_nanoseconds", "lease_owner_present", "lease_expires_at_seconds", "lease_expires_at_nanoseconds"}, prefixLengths: []int{0, 0, 0, 0, 0, 0, 0}, nonUnique: true},
+		},
 		"rff_timers":             {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_timer_id_lookup": {columns: []string{"id"}, prefixLengths: []int{0}}, "rff_timer_deadline_lookup": {columns: []string{"completed", "compatibility_blocked", "deadline_seconds", "deadline_nanoseconds", "id"}, prefixLengths: []int{0, 0, 0, 0, 0}, nonUnique: true}},
 		"rff_integrity_findings": {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_open_lookup": {columns: []string{"kind", "locator", "open_marker"}, prefixLengths: []int{0, 0, 0}}, "rff_integrity_open_scope": {columns: []string{"kind", "open_marker", "locator"}, prefixLengths: []int{0, 0, 0}, nonUnique: true}},
 		"rff_integrity_audit":    {"PRIMARY": {columns: []string{"row_id"}, prefixLengths: []int{0}}, "rff_integrity_audit_lookup": {columns: []string{"finding_id", "row_id"}, prefixLengths: []int{0, 0}, nonUnique: true}},

@@ -112,7 +112,15 @@ func (s *Store[EntityID, StateID]) CommitAtomic(
 				if err != nil {
 					return fmt.Errorf("encode notification work: %w", err)
 				}
-				if _, err := tx.ExecContext(ctx, `INSERT INTO rff_notification_work (execution_id, work) VALUES (?, ?)`, stored.ID, data); err != nil {
+				projection, err := notificationProjectionFor(work)
+				if err != nil {
+					return err
+				}
+				args := append([]any{stored.ID, data}, notificationProjectionArgs(projection)...)
+				if _, err := tx.ExecContext(ctx, `INSERT INTO rff_notification_work
+					(execution_id, work, completed, due_at_seconds, due_at_nanoseconds, lease_owner_present,
+					 lease_expires_at_seconds, lease_expires_at_nanoseconds)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
 					return fmt.Errorf("create notification work: %w", err)
 				}
 			}

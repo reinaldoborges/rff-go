@@ -274,7 +274,8 @@ func (s *Store[EntityID, StateID]) hookTransaction(ctx context.Context, fn func(
 	}()
 	result := fn(tx)
 	var detected hookFindingError
-	if result != nil && !errors.As(result, &detected) {
+	var notificationDetected notificationFindingError
+	if result != nil && !errors.As(result, &detected) && !errors.As(result, &notificationDetected) {
 		return result
 	}
 	if err := tx.Commit(); err != nil {
