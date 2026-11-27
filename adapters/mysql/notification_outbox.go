@@ -453,6 +453,10 @@ func (o *NotificationOutbox[EntityID, StateID]) ClaimNotification(
 			if err != nil {
 				if errors.Is(err, transition.ErrIntegrity) {
 					unavailable = errors.Join(unavailable, err)
+					var finding hookFindingError
+					if errors.As(err, &finding) {
+						break
+					}
 					lastID = candidateID
 					continue
 				}

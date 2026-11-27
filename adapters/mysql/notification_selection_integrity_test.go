@@ -319,6 +319,48 @@ func TestNotificationClaimsQuarantineSharedExecutionAndReservationFindings(t *te
 	}
 }
 
+func TestNewNotificationExecutionFindingFailsBeforeLaterClaim(t *testing.T) {
+	ctx := context.Background()
+	admin, config := newMySQLDatabase(t)
+	store, err := mysql.Open[string, string](config.FormatDSN(), mysql.StringCodec{}, mysql.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	createMySQLNotificationWork(t, ctx, store, "a", "ready", now)
+	createMySQLNotificationWork(t, ctx, store, "b", "ready", now)
+	if _, err := admin.ExecContext(ctx, `UPDATE rff_executions SET record = X'00' WHERE id = 'a'`); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := mysql.NewNotificationOutbox(store, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := outbox.ClaimNotification(ctx, "delivery", func() time.Time { return now }, time.Minute)
+	if !errors.Is(err, transition.ErrIntegrity) || delivery.Intent.ID != "" {
+		t.Fatalf("new finding was hidden by a later claim: delivery=%+v error=%v", delivery, err)
+	}
+	maintenance, err := mysql.OpenIntegrityMaintenance(config.FormatDSN(), func(_ context.Context, action, actor, reason string, _, _ int64) error {
+		if action != "inspect" || actor != "authorized" || reason != "finding check" {
+			return errors.New("unauthorized integrity inspection")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+	findings, err := maintenance.Findings(ctx, "authorized", "finding check")
+	if err != nil || len(findings) != 1 || findings[0].Kind != "execution" {
+		t.Fatalf("new execution finding was not committed: %+v, %v", findings, err)
+	}
+	delivery, err = outbox.ClaimNotification(ctx, "delivery", func() time.Time { return now }, time.Minute)
+	if err != nil || delivery.Intent.ExecutionID != "b" {
+		t.Fatalf("known quarantine blocked independent notification work: delivery=%+v error=%v", delivery, err)
+	}
+}
+
 func TestCompetingNotificationClaimsHaveOneWinner(t *testing.T) {
 	ctx := context.Background()
 	_, config := newMySQLDatabase(t)

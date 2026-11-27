@@ -152,3 +152,52 @@ func TestLifecycleRetriesRecoverableIntegritySweepFailures(t *testing.T) {
 		t.Fatalf("recoverable sweep failure did not retry and recover: status=%+v batches=%d", status, batches.Load())
 	}
 }
+
+func TestLifecycleOverdueUsesProgressInsteadOfBatchAttemptTime(t *testing.T) {
+	runner, _, _ := newFailingHookRunner(t, errorHandler{enter: func(context.Context) error { return nil }})
+	stale := time.Now().Add(-time.Hour)
+	var batches atomic.Int64
+	retryStarted := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	var retryStartOnce, releaseOnce sync.Once
+	l, err := transition.NewLifecycle[string, string, string, int](
+		&lifecycleTestStore{}, runner, runner, lifecycleTestHost{},
+		transition.LifecycleConfig{
+			Coordinator: transition.CoordinatorConfig{ID: "coordinator", LeaseTTL: time.Second, Clock: time.Now},
+			Worker: transition.WorkerConfig{ID: "worker", Capacity: 1, LeaseTTL: time.Second,
+				RenewalInterval: time.Millisecond, Clock: transition.SystemWorkerClock{}},
+			PollInterval: 10 * time.Millisecond,
+			IntegritySweep: &transition.IntegritySweepConfig{
+				Interval: 5 * time.Millisecond, OverdueAfter: 30 * time.Millisecond,
+				RunBatch: func(context.Context) (transition.IntegritySweepProgress, error) {
+					if batches.Add(1) > 1 {
+						retryStartOnce.Do(func() { close(retryStarted) })
+						<-releaseRetry
+					}
+					return transition.IntegritySweepProgress{
+						SweepID: 1, StartedAt: stale, UpdatedAt: stale, Healthy: true,
+					}, nil
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		releaseOnce.Do(func() { close(releaseRetry) })
+		_ = l.Shutdown(context.Background())
+	}()
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sweep did not retry")
+	}
+	status := l.Status()
+	if status.IntegritySweep == nil || !status.IntegritySweep.Overdue {
+		t.Fatalf("batch attempt masked stale durable progress: %+v", status.IntegritySweep)
+	}
+}

@@ -112,11 +112,10 @@ type Lifecycle[EntityID comparable, StateID comparable, Event, Input any] struct
 	paths         []*lifecyclePath
 	notifications *lifecycleNotifications[EntityID, StateID]
 
-	integritySweepConfig       *IntegritySweepConfig
-	integritySweepStarted      time.Time
-	integritySweepBatchStarted time.Time
-	integritySweepProgress     IntegritySweepProgress
-	hasIntegritySweepProgress  bool
+	integritySweepConfig      *IntegritySweepConfig
+	integritySweepStarted     time.Time
+	integritySweepProgress    IntegritySweepProgress
+	hasIntegritySweepProgress bool
 }
 
 // NewLifecycle validates all dependencies and timing before any work starts.
@@ -174,9 +173,6 @@ func NewLifecycle[EntityID comparable, StateID comparable, Event, Input any](
 	}
 	if l.integritySweepConfig != nil {
 		add("integrity-sweep", false, func(ctx context.Context, _ func()) error {
-			l.mu.Lock()
-			l.integritySweepBatchStarted = time.Now()
-			l.mu.Unlock()
 			progress, err := l.integritySweepConfig.RunBatch(ctx)
 			l.recordIntegritySweepProgress(progress)
 			return err
@@ -522,9 +518,6 @@ func (l *Lifecycle[EntityID, StateID, Event, Input]) Status() LifecycleStatus {
 		}
 		if l.integritySweepConfig != nil && l.started && !l.stopping {
 			lastProgress := sweepStatus.Progress.UpdatedAt
-			if sweepPath.status.Running && l.integritySweepBatchStarted.After(lastProgress) {
-				lastProgress = l.integritySweepBatchStarted
-			}
 			if lastProgress.IsZero() {
 				lastProgress = l.integritySweepStarted
 			}

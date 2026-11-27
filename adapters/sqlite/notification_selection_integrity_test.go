@@ -263,6 +263,46 @@ func TestNotificationClaimsQuarantineSharedExecutionAndReservationFindings(t *te
 	}
 }
 
+func TestNewNotificationExecutionFindingFailsBeforeLaterClaim(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "notification-new-execution-finding.db")
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	createNotificationWork(t, ctx, store, "a", now)
+	createNotificationWork(t, ctx, store, "b", now)
+
+	admin, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.ExecContext(ctx, `UPDATE rff_executions SET record = X'00' WHERE id = 'a'`); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := sqlite.NewNotificationOutbox(store, fixedClock(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := outbox.ClaimNotification(ctx, "delivery", fixedClock(now), time.Minute)
+	if !errors.Is(err, transition.ErrIntegrity) || delivery.Intent.ID != "" {
+		t.Fatalf("new finding was hidden by a later claim: delivery=%+v error=%v", delivery, err)
+	}
+	maintenance := openSweepMaintenance(t, path)
+	defer maintenance.Close()
+	findings, err := maintenance.Findings(ctx, "authorized", "scheduled check")
+	if err != nil || len(findings) != 1 || findings[0].Kind != "execution" {
+		t.Fatalf("new execution finding was not committed: %+v, %v", findings, err)
+	}
+	delivery, err = outbox.ClaimNotification(ctx, "delivery", fixedClock(now), time.Minute)
+	if err != nil || delivery.Intent.ExecutionID != "b" {
+		t.Fatalf("known quarantine blocked independent notification work: delivery=%+v error=%v", delivery, err)
+	}
+}
+
 func TestCompetingNotificationClaimsHaveOneWinner(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open[string, string](filepath.Join(t.TempDir(), "notification-competition.db"), sqlite.StringCodec{}, sqlite.StringCodec{})

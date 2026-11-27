@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -13,12 +12,13 @@ import (
 	transition "github.com/reinaldoborges/rff-go/runtime"
 )
 
-var integritySweepKinds = []string{"execution", "reservation", "timer", "hook", "notification", "input"}
+// Execution and reservation rows are inspected only through linked work
+// projections; legacy checkpoints for their retired sweep kinds are ignored.
+var integritySweepKinds = []string{"timer", "hook", "notification", "input"}
 
 type integritySweepObservation struct {
 	locator int64
 	id      string
-	entity  []byte
 }
 
 // RunIntegritySweep advances one durable batch for each retained selection
@@ -172,10 +172,6 @@ func prepareIntegritySweep(ctx context.Context, tx *sql.Tx, now time.Time) (
 
 func integritySweepTable(kind string) string {
 	switch kind {
-	case "execution":
-		return "rff_executions"
-	case "reservation":
-		return "rff_active"
 	case "timer":
 		return "rff_timers"
 	case "hook":
@@ -206,10 +202,7 @@ func readIntegritySweepBatch(ctx context.Context, tx *sql.Tx, kind string, curso
 ) {
 	query := `SELECT row_id, id FROM ` + integritySweepTable(kind) +
 		` WHERE row_id > ? AND row_id <= ? ORDER BY row_id LIMIT ?`
-	if kind == "reservation" {
-		query = `SELECT row_id, execution_id, entity FROM rff_active
-			WHERE row_id > ? AND row_id <= ? ORDER BY row_id LIMIT ?`
-	} else if kind == "hook" || kind == "notification" {
+	if kind == "hook" || kind == "notification" {
 		query = `SELECT row_id, execution_id FROM ` + integritySweepTable(kind) +
 			` WHERE row_id > ? AND row_id <= ? ORDER BY row_id LIMIT ?`
 	}
@@ -224,12 +217,7 @@ func readIntegritySweepBatch(ctx context.Context, tx *sql.Tx, kind string, curso
 	}()
 	for rows.Next() {
 		var observation integritySweepObservation
-		if kind == "reservation" {
-			err = rows.Scan(&observation.locator, &observation.id, &observation.entity)
-		} else {
-			err = rows.Scan(&observation.locator, &observation.id)
-		}
-		if err != nil {
+		if err := rows.Scan(&observation.locator, &observation.id); err != nil {
 			return nil, fmt.Errorf("scan %s sweep batch: %w", kind, err)
 		}
 		if observation.locator <= cursor || observation.locator > highWater {
@@ -245,27 +233,6 @@ func readIntegritySweepBatch(ctx context.Context, tx *sql.Tx, kind string, curso
 
 func inspectIntegritySweepObservation(ctx context.Context, tx *sql.Tx, kind string, observation integritySweepObservation) (bool, error) {
 	switch kind {
-	case "execution":
-		if transition.ValidateDurableID(observation.id) != nil {
-			return false, recordExecutionFinding(ctx, tx, observation.id, "invalid_execution", "record")
-		}
-		record, err := loadHookExecution(ctx, tx, observation.id)
-		return record.Compatibility != nil, err
-	case "reservation":
-		if transition.ValidateDurableID(observation.id) != nil {
-			return false, recordReservationFinding(ctx, tx, observation.locator)
-		}
-		record, err := loadHookExecution(ctx, tx, observation.id)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, recordReservationFinding(ctx, tx, observation.locator)
-		}
-		if err != nil {
-			return false, err
-		}
-		if !bytes.Equal(observation.entity, record.Entity) {
-			return false, recordReservationFinding(ctx, tx, observation.locator)
-		}
-		return record.Compatibility != nil, nil
 	case "timer":
 		record, err := loadIntegrityTimer(ctx, tx, observation.id)
 		return record.Compatibility != nil, err
@@ -334,7 +301,8 @@ func inspectNotificationSweepObservation(ctx context.Context, tx *sql.Tx, observ
 func integritySweepComplete(ctx context.Context, tx *sql.Tx) (bool, error) {
 	var incomplete bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rff_integrity_sweep_progress
-		WHERE inspected_through < high_water_mark)`).Scan(&incomplete); err != nil {
+		WHERE kind IN ('timer', 'hook', 'notification', 'input')
+		AND inspected_through < high_water_mark)`).Scan(&incomplete); err != nil {
 		return false, fmt.Errorf("check integrity sweep completion: %w", err)
 	}
 	return !incomplete, nil
@@ -368,6 +336,13 @@ func readIntegritySweepProgress(
 		if coverage.HighWaterMark < 0 || coverage.InspectedThrough < 0 ||
 			coverage.InspectedThrough > coverage.HighWaterMark || coverage.Inspected < 0 {
 			return transition.IntegritySweepProgress{}, fmt.Errorf("%w: invalid integrity sweep coverage", ErrUnsupportedSchema)
+		}
+		switch coverage.Kind {
+		case "execution", "reservation":
+			continue
+		case "timer", "hook", "notification", "input":
+		default:
+			return transition.IntegritySweepProgress{}, fmt.Errorf("%w: unknown integrity sweep coverage", ErrUnsupportedSchema)
 		}
 		if _, exists := coverageByKind[coverage.Kind]; exists {
 			return transition.IntegritySweepProgress{}, fmt.Errorf("%w: duplicate integrity sweep coverage", ErrUnsupportedSchema)

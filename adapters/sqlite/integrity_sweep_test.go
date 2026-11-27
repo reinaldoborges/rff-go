@@ -114,6 +114,55 @@ func inputSweepCoverage(progress transition.IntegritySweepProgress) transition.I
 	return transition.IntegritySweepCoverage{}
 }
 
+func TestIntegritySweepIgnoresUnlinkedHistoricalExecutionAndReservation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "integrity-sweep-unlinked.db")
+	store, err := sqlite.Open[string, string](path, sqlite.StringCodec{}, sqlite.StringCodec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	createNotificationWork(t, ctx, store, "selected", now)
+	admin, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.ExecContext(ctx, `UPDATE rff_executions SET record = X'00' WHERE id = 'selected'`); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(`{"SchemaVersion":1,"ID":"historical","Entity":"AQ==","Key":"request","Status":"Complete"}`)
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_executions
+		(id, entity, request_key, record, selection_status, selection_compatibility)
+		VALUES ('historical', X'01', 'request', ?, 'Complete', 0)`, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.ExecContext(ctx, `INSERT INTO rff_active (entity, execution_id)
+		VALUES (X'03', 'historical')`); err != nil {
+		t.Fatal(err)
+	}
+
+	maintenance := openSweepMaintenance(t, path)
+	defer maintenance.Close()
+	progress, err := maintenance.RunIntegritySweep(ctx, "authorized", "scheduled check", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !progress.Complete || progress.Healthy {
+		t.Fatalf("linked corruption was not inspected or the sweep did not complete: %+v", progress)
+	}
+	for _, coverage := range progress.Coverage {
+		if coverage.Kind == "execution" || coverage.Kind == "reservation" {
+			t.Fatalf("sweep reported coverage outside selected work: %+v", progress.Coverage)
+		}
+	}
+	findings, err := maintenance.Findings(ctx, "authorized", "scheduled check")
+	if err != nil || len(findings) != 1 || findings[0].Kind != "execution" {
+		t.Fatalf("sweep did not limit findings to linked work: %+v, %v", findings, err)
+	}
+}
+
 func TestIntegritySweepCheckpointFailureDoesNotCommitFindingOrProgress(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "integrity-sweep-failure.db")
