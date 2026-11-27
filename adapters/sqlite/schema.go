@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	adapterSchemaVersion = 15
+	adapterSchemaVersion = 16
 	schemaVersionDDL     = `CREATE TABLE rff_schema_version (version INTEGER NOT NULL)`
 	executionsDDL        = `CREATE TABLE rff_executions (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), entity BLOB NOT NULL, request_key TEXT NOT NULL, record BLOB NOT NULL, selection_status TEXT NOT NULL DEFAULT 'Waiting', selection_compatibility INTEGER NOT NULL DEFAULT 0 CHECK(selection_compatibility IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0), UNIQUE(entity, request_key))`
 	activeDDL            = `CREATE TABLE rff_active (row_id INTEGER PRIMARY KEY AUTOINCREMENT, entity BLOB NOT NULL UNIQUE, execution_id TEXT NOT NULL UNIQUE REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
@@ -36,6 +36,7 @@ const (
 	)`
 	executionHookIndexDDL     = `CREATE INDEX rff_execution_hook_state_lookup ON rff_executions(selection_status, selection_compatibility, id)`
 	hookReadyIndexDDL         = `CREATE INDEX rff_hook_ready_lookup ON rff_hook_work(available_at_seconds, available_at_nanoseconds, execution_id) WHERE completed = 0 AND started = 0`
+	timerDeadlineIndexDDL     = `CREATE INDEX rff_timer_deadline_lookup ON rff_timers(deadline_seconds, deadline_nanoseconds, id) WHERE completed = 0 AND compatibility_blocked = 0`
 	executionRevisionDDL      = `CREATE TRIGGER rff_execution_revision AFTER UPDATE OF record, selection_status, selection_compatibility ON rff_executions BEGIN UPDATE rff_executions SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
 	executionRevisionGuardDDL = `CREATE TRIGGER rff_execution_revision_guard BEFORE UPDATE OF revision ON rff_executions WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'execution revision is monotonic'); END`
 	executionLocatorDDL       = `CREATE TRIGGER rff_execution_locator BEFORE UPDATE OF row_id ON rff_executions WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'execution locator is immutable'); END`
@@ -49,8 +50,8 @@ const (
 	hookLocatorDDL            = `CREATE TRIGGER rff_hook_locator BEFORE UPDATE OF row_id ON rff_hook_work WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'hook locator is immutable'); END`
 	hookAllocationDDL         = `CREATE TRIGGER rff_hook_allocation AFTER INSERT ON rff_hook_work WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'hook' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'hook locator was previously used'); END`
 	notificationWorkDDL       = `CREATE TABLE rff_notification_work (execution_id TEXT PRIMARY KEY NOT NULL REFERENCES rff_executions(id) CHECK(length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 256), work BLOB NOT NULL)`
-	timersDDL                 = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0))`
-	timerRevisionDDL          = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
+	timersDDL                 = `CREATE TABLE rff_timers (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE CHECK(length(CAST(id AS BLOB)) BETWEEN 1 AND 256), deadline_seconds INTEGER NOT NULL, deadline_nanoseconds INTEGER NOT NULL CHECK(deadline_nanoseconds BETWEEN 0 AND 999999999), completed INTEGER NOT NULL CHECK(completed IN (0, 1)), compatibility_blocked INTEGER NOT NULL CHECK(compatibility_blocked IN (0, 1)), lease_expires_seconds INTEGER, lease_expires_nanoseconds INTEGER, record BLOB NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0), CHECK((lease_expires_seconds IS NULL AND lease_expires_nanoseconds IS NULL) OR (lease_expires_seconds IS NOT NULL AND lease_expires_nanoseconds IS NOT NULL AND lease_expires_nanoseconds BETWEEN 0 AND 999999999)))`
+	timerRevisionDDL          = `CREATE TRIGGER rff_timer_revision AFTER UPDATE OF id, deadline_seconds, deadline_nanoseconds, completed, compatibility_blocked, lease_expires_seconds, lease_expires_nanoseconds, record ON rff_timers BEGIN UPDATE rff_timers SET revision = OLD.revision + 1 WHERE row_id = NEW.row_id; END`
 	timerRevisionGuardDDL     = `CREATE TRIGGER rff_timer_revision_guard BEFORE UPDATE OF revision ON rff_timers WHEN NEW.revision != OLD.revision + 1 BEGIN SELECT RAISE(ABORT, 'timer revision is monotonic'); END`
 	timerLocatorDDL           = `CREATE TRIGGER rff_timer_locator BEFORE UPDATE OF row_id ON rff_timers WHEN NEW.row_id != OLD.row_id BEGIN SELECT RAISE(ABORT, 'timer locator is immutable'); END`
 	timerAllocationDDL        = `CREATE TRIGGER rff_timer_allocation AFTER INSERT ON rff_timers WHEN EXISTS (SELECT 1 FROM rff_integrity_findings INDEXED BY rff_integrity_history_lookup WHERE kind = 'timer' AND locator = NEW.row_id) BEGIN SELECT RAISE(ABORT, 'timer locator was previously used'); END`
@@ -102,7 +103,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 		}
 		statements := []string{
 			schemaVersionDDL,
-			`INSERT INTO rff_schema_version (version) VALUES (15)`,
+			fmt.Sprintf(`INSERT INTO rff_schema_version (version) VALUES (%d)`, adapterSchemaVersion),
 			executionsDDL,
 			executionRevisionDDL,
 			executionRevisionGuardDDL,
@@ -118,6 +119,7 @@ func (s *Store[EntityID, StateID]) initialize(ctx context.Context) (err error) {
 			hookLocatorDDL,
 			notificationWorkDDL,
 			timersDDL,
+			timerDeadlineIndexDDL,
 			timerRevisionDDL,
 			timerRevisionGuardDDL,
 			integrityFindingsDDL,
